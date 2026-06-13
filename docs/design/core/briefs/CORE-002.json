@@ -4,11 +4,11 @@
   "title": "Tree traversal cursor and mutation operations",
   "depends_on": ["CORE-001"],
   "blocked_by": [],
-  "checklist": ["C13", "C14", "C15", "C16", "C17", "C18"],
+  "checklist": ["C13", "C14", "C15", "C16", "C17", "C18", "C25"],
   "stories": ["S2", "S3", "S4"],
   "design_anchor": ["ADR-001"],
   "purpose": "Deliver the traversal and mutation layer of the prolly tree. CORE-001 established the node types, hashing, and node store. This brief builds on those foundations to provide a cursor that navigates the tree for point lookups and range scans, and a mutation module that inserts and deletes key-value pairs while maintaining content-addressed invariants — splitting nodes at rolling hash boundaries, merging undersized nodes after deletion, and rewriting the path to root so every modified node receives a new hash while unmodified subtrees retain their existing hashes. These operations are the read and write core that the WAL buffer (CORE-005) and shard actor (CORE-007) will call directly.",
-  "task": "Create two files: crates/haematite/src/tree/cursor.rs (tree traversal cursor for point lookup and range iteration) and crates/haematite/src/tree/mutate.rs (insert, delete, node split/merge, path-to-root rewrite). Wire both into tree/mod.rs. The cursor and mutation functions operate against the NodeStore trait from CORE-001 — they do not open disk storage, manage WAL buffers, or know about shards. Those concerns belong to CORE-004, CORE-005, and CORE-007 respectively. Batch commit producing exactly one root hash is a WAL-level concern (CORE-005, CN8) — this brief delivers the underlying single-call tree operations that a batch flush will invoke in a loop.",
+  "task": "Create two files: crates/haematite/src/tree/cursor.rs (tree traversal cursor for point lookup and range iteration) and crates/haematite/src/tree/mutate.rs (insert, delete, node split/merge, path-to-root rewrite, batch mutation). Wire both into tree/mod.rs. The cursor and mutation functions operate against the NodeStore trait from CORE-001 — they do not open disk storage, manage WAL buffers, or know about shards. Those concerns belong to CORE-004, CORE-005, and CORE-007 respectively. In addition to single-key insert/delete, this brief provides batch_mutate: a function that takes a sorted set of mutations (puts and deletes) and applies them in a single tree walk, producing one root hash. This is what CORE-005's WAL commit calls to satisfy CN8 (one path-to-root rewrite per commit).",
   "requirements": [
     {
       "id": "R1",
@@ -132,7 +132,7 @@
     {
       "id": "R7",
       "title": "Wire cursor and mutate into tree module",
-      "spec": "Add cursor and mutate as pub mod declarations in tree/mod.rs and re-export Cursor, TreeError, insert, and delete via pub use. THE SYSTEM SHALL NOT add any logic to tree/mod.rs beyond pub mod and pub use — all logic resides in the leaf modules (CN3). Update lib.rs to re-export Cursor, TreeError, insert, and delete from the crate root.",
+      "spec": "Add cursor and mutate as pub mod declarations in tree/mod.rs and re-export Cursor, TreeError, insert, delete, and batch_mutate via pub use. THE SYSTEM SHALL NOT add any logic to tree/mod.rs beyond pub mod and pub use — all logic resides in the leaf modules (CN3). Update lib.rs to re-export Cursor, TreeError, insert, delete, and batch_mutate from the crate root.",
       "acceptance": [
         "tree/mod.rs contains pub mod cursor, pub mod mutate, and pub use re-exports — no functions, structs, or enums defined inline",
         "haematite::Cursor is accessible from the crate root",
@@ -148,6 +148,26 @@
       },
       "checklist": [],
       "stories": []
+    }
+    ,{
+      "id": "R8",
+      "title": "Batch mutation with single path-to-root rewrite",
+      "spec": "Define a batch_mutate(store, root_hash, mutations) function in the mutate module where mutations is a sorted slice of (key, Option<value>) pairs — Some(value) for puts, None for deletes. WHEN batch_mutate is called, THE SYSTEM SHALL walk the tree once, applying all mutations to their target leaves in key order, splitting and merging nodes as needed, and rewriting the path to root exactly once. THE SYSTEM SHALL return the new root Hash. THE SYSTEM SHALL produce the same root hash as applying the same mutations individually via insert/delete calls — batch_mutate is an optimisation, not a different operation. THE SYSTEM SHALL NOT rewrite the path to root more than once per batch_mutate call (CN8, C25). IF mutations is empty, THE SYSTEM SHALL return the original root hash unchanged.",
+      "acceptance": [
+        "batch_mutate(store, root, [(k1, Some(v1)), (k2, Some(v2))]) returns a root hash equal to insert(insert(root, k1, v1), k2, v2)",
+        "batch_mutate(store, root, [(k1, None)]) returns a root hash equal to delete(root, k1)",
+        "batch_mutate with 100 mutations produces one root hash — not 100 intermediate roots",
+        "batch_mutate with an empty slice returns the original root hash unchanged",
+        "batch_mutate with interleaved puts and deletes produces the same result as the equivalent individual operations",
+        "A store instrumented with a write counter confirms that batch_mutate writes fewer nodes than the equivalent sequence of individual insert/delete calls"
+      ],
+      "files": {
+        "create": [],
+        "modify": ["crates/haematite/src/tree/mutate.rs"],
+        "delete": []
+      },
+      "checklist": ["C25"],
+      "stories": ["S4"]
     }
   ],
   "boundaries": [
