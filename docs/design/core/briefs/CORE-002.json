@@ -1,0 +1,170 @@
+{
+  "id": "CORE-002",
+  "cluster": "core",
+  "title": "Tree traversal cursor and mutation operations",
+  "depends_on": ["CORE-001"],
+  "blocked_by": [],
+  "checklist": ["C13", "C14", "C15", "C16", "C17", "C18"],
+  "stories": ["S2", "S3", "S4"],
+  "design_anchor": ["ADR-001"],
+  "purpose": "Deliver the traversal and mutation layer of the prolly tree. CORE-001 established the node types, hashing, and node store. This brief builds on those foundations to provide a cursor that navigates the tree for point lookups and range scans, and a mutation module that inserts and deletes key-value pairs while maintaining content-addressed invariants — splitting nodes at rolling hash boundaries, merging undersized nodes after deletion, and rewriting the path to root so every modified node receives a new hash while unmodified subtrees retain their existing hashes. These operations are the read and write core that the WAL buffer (CORE-005) and shard actor (CORE-007) will call directly.",
+  "task": "Create two files: crates/haematite/src/tree/cursor.rs (tree traversal cursor for point lookup and range iteration) and crates/haematite/src/tree/mutate.rs (insert, delete, node split/merge, path-to-root rewrite). Wire both into tree/mod.rs. The cursor and mutation functions operate against the NodeStore trait from CORE-001 — they do not open disk storage, manage WAL buffers, or know about shards. Those concerns belong to CORE-004, CORE-005, and CORE-007 respectively. Batch commit producing exactly one root hash is a WAL-level concern (CORE-005, CN8) — this brief delivers the underlying single-call tree operations that a batch flush will invoke in a loop.",
+  "requirements": [
+    {
+      "id": "R1",
+      "title": "Cursor type for tree traversal",
+      "spec": "Define a Cursor struct that holds a reference to a NodeStore and a root Hash. THE SYSTEM SHALL initialise a Cursor via Cursor::new(store, root_hash). THE SYSTEM SHALL NOT allocate the full path to root at construction time — path state is accumulated lazily during traversal. THE SYSTEM SHALL NOT hold a mutable borrow on the store — the cursor is a read-only view.",
+      "acceptance": [
+        "Cursor::new(store, root_hash) compiles where store: &impl NodeStore",
+        "Cursor holds the root hash and a store reference, not a cloned store",
+        "Cursor does not mutate the store — it takes a shared reference",
+        "Cursor implements Debug",
+        "Cursor<'_> compiles with an explicit lifetime on the store reference"
+      ],
+      "files": {
+        "create": ["crates/haematite/src/tree/cursor.rs"],
+        "modify": [],
+        "delete": []
+      },
+      "checklist": ["C13"],
+      "stories": []
+    },
+    {
+      "id": "R2",
+      "title": "Point lookup via cursor",
+      "spec": "WHEN get(key) is called on a Cursor, THE SYSTEM SHALL traverse the tree from root to the appropriate leaf by comparing keys against InternalNode child separators at each level, then search the LeafNode entries for an exact key match and return Some(value) or None. IF any node hash in the traversal path is missing from the store, THEN THE SYSTEM SHALL return a TreeError::MissingNode error. THE SYSTEM SHALL NOT load sibling nodes during a point lookup — only the nodes on the key's direct path are fetched.",
+      "acceptance": [
+        "Cursor::get(key) returns Ok(Some(value)) when the key exists in the leaf",
+        "Cursor::get(key) returns Ok(None) when the key is absent from the tree",
+        "Cursor::get(key) returns Err(TreeError::MissingNode) when a node hash is not in the store",
+        "get on a tree of depth 3 fetches exactly 3 nodes (root + one internal + one leaf)",
+        "get on an empty tree (empty root LeafNode) returns Ok(None)"
+      ],
+      "files": {
+        "create": [],
+        "modify": ["crates/haematite/src/tree/cursor.rs"],
+        "delete": []
+      },
+      "checklist": ["C13"],
+      "stories": ["S2"]
+    },
+    {
+      "id": "R3",
+      "title": "Range scan via cursor",
+      "spec": "WHEN range(from, to) is called on a Cursor, THE SYSTEM SHALL return an iterator that yields (key, value) pairs in ascending key order for all keys K satisfying from <= K < to. THE SYSTEM SHALL descend to the leftmost leaf in range at the first call to next(), then advance through leaves by following the implicit sorted order of the prolly tree. THE SYSTEM SHALL NOT buffer all results in memory before returning the first item — the iterator must be lazy. IF to is less than or equal to from, THE SYSTEM SHALL return an empty iterator without error.",
+      "acceptance": [
+        "range(b\"a\", b\"z\") returns all keys in [a, z) in ascending order",
+        "range(b\"a\", b\"a\") returns an empty iterator",
+        "range(b\"z\", b\"a\") returns an empty iterator",
+        "range with from and to spanning a leaf boundary returns entries from both leaves in sorted order",
+        "The iterator yields the first item without loading all matching leaves first (lazy descent)",
+        "range(b\"\", b\"\\xff\") returns every key-value pair in the tree in sorted order"
+      ],
+      "files": {
+        "create": [],
+        "modify": ["crates/haematite/src/tree/cursor.rs"],
+        "delete": []
+      },
+      "checklist": ["C16"],
+      "stories": ["S3"]
+    },
+    {
+      "id": "R4",
+      "title": "Insert with node splitting and path-to-root rewrite",
+      "spec": "Define an insert(store, root_hash, key, value) function in the mutate module. WHEN insert is called, THE SYSTEM SHALL traverse to the target leaf, insert the key-value pair in sorted position, apply rolling hash boundary detection across the leaf's key stream, and split the leaf into two or more nodes wherever a boundary falls. THE SYSTEM SHALL propagate any new child separators up through internal nodes, splitting internal nodes that exceed their boundary as well, until the path to root is rewritten with new hashes for every modified node. THE SYSTEM SHALL return the new root Hash. IF the root itself splits, THE SYSTEM SHALL create a new InternalNode with two children and return its hash as the new root. THE SYSTEM SHALL NOT modify node objects already in the store — every modified node is a new node with a new hash (P1). THE SYSTEM SHALL NOT alter unmodified sibling subtrees — their existing hashes propagate unchanged into the rewritten internal nodes (P4, C18).",
+      "acceptance": [
+        "insert(store, root_hash, key, value) returns a new root Hash distinct from the old one",
+        "A Cursor on the new root can get(key) and returns the inserted value",
+        "Inserting the same key twice returns a new root where get(key) returns the second value",
+        "When a leaf split occurs, both resulting leaves are stored in the store under their new hashes",
+        "When a root split occurs, the returned hash points to a new InternalNode with exactly two children",
+        "Unmodified sibling subtrees appear in the new InternalNode with their original child hashes unchanged",
+        "Inserting keys in different orders into an empty tree produces the same root hash (history-independence, CN5, C17)"
+      ],
+      "files": {
+        "create": ["crates/haematite/src/tree/mutate.rs"],
+        "modify": [],
+        "delete": []
+      },
+      "checklist": ["C14", "C17", "C18"],
+      "stories": ["S2", "S4"]
+    },
+    {
+      "id": "R5",
+      "title": "Delete with node merging and path-to-root rewrite",
+      "spec": "Define a delete(store, root_hash, key) function in the mutate module. WHEN delete is called and the key exists, THE SYSTEM SHALL remove the entry from the target leaf and rewrite the path to root with new hashes. IF the resulting leaf is empty and is not the root, THE SYSTEM SHALL remove the leaf and its separator from the parent internal node. IF the resulting internal node has only one child after separator removal, THE SYSTEM SHALL collapse it by promoting the single child to replace the parent. THE SYSTEM SHALL return the new root Hash. WHEN delete is called and the key does not exist, THE SYSTEM SHALL return the original root hash unchanged — delete is idempotent. THE SYSTEM SHALL NOT modify or delete nodes already stored in the store — only new nodes are written (P1). THE SYSTEM SHALL NOT merge nodes purely based on size; merging is triggered only by emptiness, not by a minimum-fill threshold.",
+      "acceptance": [
+        "delete(store, root_hash, existing_key) returns a new root Hash distinct from the old one",
+        "A Cursor on the new root returns Ok(None) for the deleted key",
+        "delete(store, root_hash, absent_key) returns the original root hash unchanged",
+        "Deleting the last entry from a leaf removes the leaf's separator from the parent",
+        "Deleting all entries from a single-leaf tree returns the hash of an empty LeafNode",
+        "delete followed by insert of the same key produces a root hash equal to a fresh insert into a tree without the delete"
+      ],
+      "files": {
+        "create": [],
+        "modify": ["crates/haematite/src/tree/mutate.rs"],
+        "delete": []
+      },
+      "checklist": ["C15", "C18"],
+      "stories": ["S2"]
+    },
+    {
+      "id": "R6",
+      "title": "TreeError error type",
+      "spec": "Define a TreeError enum in cursor.rs covering at minimum TreeError::MissingNode { hash: Hash } for store lookup failures and TreeError::InvalidNode for deserialisation failures. THE SYSTEM SHALL implement std::error::Error and std::fmt::Display for TreeError. THE SYSTEM SHALL NOT use .unwrap() or .expect() in cursor.rs or mutate.rs — all fallible operations must propagate errors via Result<T, TreeError>. Both insert and delete must also return Result<Hash, TreeError>.",
+      "acceptance": [
+        "TreeError implements std::error::Error",
+        "TreeError implements std::fmt::Display with a human-readable message naming the hash for MissingNode",
+        "Cursor::get returns Result<Option<Value>, TreeError>",
+        "insert returns Result<Hash, TreeError>",
+        "delete returns Result<Hash, TreeError>",
+        "grep -r 'unwrap()\\|expect(' crates/haematite/src/tree/cursor.rs crates/haematite/src/tree/mutate.rs finds no matches (CN2)"
+      ],
+      "files": {
+        "create": [],
+        "modify": ["crates/haematite/src/tree/cursor.rs"],
+        "delete": []
+      },
+      "checklist": [],
+      "stories": []
+    },
+    {
+      "id": "R7",
+      "title": "Wire cursor and mutate into tree module",
+      "spec": "Add cursor and mutate as pub mod declarations in tree/mod.rs and re-export Cursor, TreeError, insert, and delete via pub use. THE SYSTEM SHALL NOT add any logic to tree/mod.rs beyond pub mod and pub use — all logic resides in the leaf modules (CN3). Update lib.rs to re-export Cursor, TreeError, insert, and delete from the crate root.",
+      "acceptance": [
+        "tree/mod.rs contains pub mod cursor, pub mod mutate, and pub use re-exports — no functions, structs, or enums defined inline",
+        "haematite::Cursor is accessible from the crate root",
+        "haematite::TreeError is accessible from the crate root",
+        "haematite::insert is accessible from the crate root",
+        "haematite::delete is accessible from the crate root",
+        "cargo check -p haematite succeeds after wiring"
+      ],
+      "files": {
+        "create": [],
+        "modify": ["crates/haematite/src/tree/mod.rs", "crates/haematite/src/lib.rs"],
+        "delete": []
+      },
+      "checklist": [],
+      "stories": []
+    }
+  ],
+  "boundaries": [
+    "SHALL NOT implement disk storage, compression, or on-disk node persistence — that is CORE-004",
+    "SHALL NOT implement WAL buffer, durable writes, or batch commit — those are CORE-005",
+    "SHALL NOT implement the structural tree diff between two root hashes — that is CORE-003",
+    "SHALL NOT implement shard actors, shard routing, or message dispatch — those are CORE-007 and CORE-008",
+    "SHALL NOT implement branching, merging, or fork operations — those are covered by the branching cluster",
+    "SHALL NOT produce more than one root hash per insert or delete call — batch commit is the WAL's responsibility (CN8), not the tree mutation layer's"
+  ],
+  "verification": [
+    "cargo check -p haematite succeeds with no errors",
+    "cargo test -p haematite --lib passes all tests",
+    "cargo clippy -p haematite produces no errors",
+    "grep -r 'unwrap()\\|expect(' crates/haematite/src/tree/cursor.rs crates/haematite/src/tree/mutate.rs finds no matches",
+    "No file in crates/haematite/src/tree/ exceeds 500 lines (CN1)",
+    "tree/mod.rs contains no struct, enum, fn, or impl definitions — only pub mod and pub use",
+    "Insert the same 100 keys in two different orders into an empty MemoryStore tree and assert the root hashes are equal (CN5, C17)"
+  ]
+}

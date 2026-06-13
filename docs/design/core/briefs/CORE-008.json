@@ -1,0 +1,126 @@
+{
+  "id": "CORE-008",
+  "cluster": "core",
+  "title": "Shard router: hash-based key-to-shard mapping",
+  "depends_on": ["CORE-007"],
+  "blocked_by": [],
+  "checklist": ["C33", "C34"],
+  "stories": ["S2", "S10"],
+  "design_anchor": ["ADR-004"],
+  "purpose": "Deliver the ShardRouter — the component that maps arbitrary byte keys to the correct shard actor PID. The design (ADR-004) specifies hash-based routing: shard(K) = BLAKE3(K) % N, where N is fixed at database creation and immutable thereafter. Without a router, the shard actors built in CORE-007 are isolated processes with no way for the database handle (CORE-009) or callers to locate the shard that owns a given key. The router is intentionally minimal: it holds a Vec<beamr::Pid> indexed by shard number and provides both a direct lookup (for callers that want to send themselves) and a forward path (for callers that want to delegate routing). Using BLAKE3 for routing keeps the hash function consistent with the content-addressing used throughout the tree, avoiding a second hashing dependency.",
+  "task": "Create crates/haematite/src/shard/router.rs. Define a ShardRouter struct that holds a Vec<beamr::Pid> of shard actor PIDs (one per shard, indexed by shard number) and a shard_count: usize. Implement ShardRouter::new(pids: Vec<beamr::Pid>) which captures the PID list and derives shard_count from its length. Implement two routing APIs: ShardRouter::shard_for(key: &[u8]) -> usize which returns the shard index (BLAKE3(key) as u64 % shard_count), and ShardRouter::pid_for(key: &[u8]) -> beamr::Pid which returns the PID of the shard actor that owns the key. The shard count is immutable after construction — ShardRouter provides no method to add, remove, or replace PIDs (ADR-004). Wire the new file into shard/mod.rs (which already exists from CORE-007) and re-export ShardRouter from the crate root via lib.rs. This brief does NOT implement the Database handle that constructs the router — that is CORE-009. It does NOT implement read replicas or rebalancing.",
+  "requirements": [
+    {
+      "id": "R1",
+      "title": "ShardRouter struct with immutable PID table",
+      "spec": "Define a ShardRouter struct that holds pids: Vec<beamr::Pid> and shard_count: usize. Implement ShardRouter::new(pids: Vec<beamr::Pid>) -> Result<ShardRouter, RouterError> which returns an error if pids is empty, otherwise constructs the router with shard_count set to pids.len(). Define a RouterError type that implements std::error::Error and Debug. THE SYSTEM SHALL NOT expose pids or shard_count as mutable fields or provide any method that adds, removes, or replaces entries after construction — shard count is immutable after database creation (ADR-004, C34). ShardRouter SHALL implement Debug.",
+      "acceptance": [
+        "ShardRouter::new(vec![]) returns Err(RouterError) — an empty PID list is rejected",
+        "ShardRouter::new(pids) with a non-empty pids slice returns Ok(ShardRouter) with shard_count == pids.len()",
+        "ShardRouter implements Debug",
+        "RouterError implements std::error::Error",
+        "ShardRouter exposes no pub mut fields, no add_shard, remove_shard, or replace_pid methods",
+        "cargo check -p haematite succeeds with ShardRouter defined"
+      ],
+      "files": {
+        "create": ["crates/haematite/src/shard/router.rs"],
+        "modify": [],
+        "delete": []
+      },
+      "checklist": ["C34"],
+      "stories": []
+    },
+    {
+      "id": "R2",
+      "title": "BLAKE3 key-to-shard index mapping",
+      "spec": "WHEN ShardRouter::shard_for(key) is called with a byte-slice key, THE SYSTEM SHALL compute the BLAKE3 hash of the key bytes, interpret the first 8 bytes of the hash output as a little-endian u64, and return (hash_u64 % shard_count) as the shard index. THE SYSTEM SHALL NOT use any other hash function — BLAKE3 is the project-wide content-addressing function (ADR-002). THE SYSTEM SHALL NOT use the key's length, byte sum, or any non-cryptographic function in place of BLAKE3. THE SYSTEM SHALL return a value in [0, shard_count) for any non-empty key.",
+      "acceptance": [
+        "ShardRouter::shard_for(key) returns a value in [0, shard_count) for any key",
+        "ShardRouter::shard_for(key) is deterministic: the same key and the same shard_count always produce the same index",
+        "ShardRouter::shard_for(b\"a\") and ShardRouter::shard_for(b\"b\") produce the same index only by coincidence of the modulus — not structurally",
+        "A test with shard_count=256 and 1000 random keys confirms all 256 shards receive at least one key (uniform distribution)",
+        "The implementation uses the blake3 crate, not a custom hash — confirmed by grep for blake3::hash in router.rs"
+      ],
+      "files": {
+        "create": [],
+        "modify": ["crates/haematite/src/shard/router.rs"],
+        "delete": []
+      },
+      "checklist": ["C33"],
+      "stories": ["S10"]
+    },
+    {
+      "id": "R3",
+      "title": "PID lookup API for direct shard sends",
+      "spec": "WHEN ShardRouter::pid_for(key) is called, THE SYSTEM SHALL return a clone of the beamr::Pid at index shard_for(key) in the internal PID table. This gives callers a direct handle to the shard actor that owns the key, enabling them to send messages without going through the router each time. THE SYSTEM SHALL NOT return a PID outside the table — the returned index is always in [0, shard_count) so the Vec index is always valid. ShardRouter SHALL also expose shard_count(&self) -> usize returning the fixed shard count.",
+      "acceptance": [
+        "ShardRouter::pid_for(key) returns the same Pid as pids[shard_for(key)]",
+        "ShardRouter::pid_for(key) is deterministic: the same key returns the same Pid",
+        "ShardRouter::shard_count() returns pids.len() as passed to ShardRouter::new",
+        "pid_for never panics for any non-empty key — the Vec index is always in bounds",
+        "A test constructs a router with 4 known Pids, asserts pid_for routes distinct keys to the correct Pid by comparing with shard_for"
+      ],
+      "files": {
+        "create": [],
+        "modify": ["crates/haematite/src/shard/router.rs"],
+        "delete": []
+      },
+      "checklist": ["C33"],
+      "stories": ["S2"]
+    },
+    {
+      "id": "R4",
+      "title": "Wire ShardRouter into shard module and crate root",
+      "spec": "Add pub mod router and pub use router::{ShardRouter, RouterError} to crates/haematite/src/shard/mod.rs. Add pub use shard::{ShardRouter, RouterError} to crates/haematite/src/lib.rs alongside the existing shard re-exports. shard/mod.rs SHALL NOT contain any logic beyond pub mod and pub use declarations (CN3). THE SYSTEM SHALL NOT introduce a new mod.rs or alter the module hierarchy — shard/mod.rs already exists from CORE-007 and is extended here.",
+      "acceptance": [
+        "haematite::ShardRouter is accessible from the crate root after wiring",
+        "haematite::RouterError is accessible from the crate root after wiring",
+        "grep for fn, struct, enum, impl in shard/mod.rs — excluding any pub use lines — returns no matches",
+        "cargo check -p haematite succeeds with ShardRouter wired in",
+        "cargo test -p haematite --lib passes all tests in shard::router"
+      ],
+      "files": {
+        "create": [],
+        "modify": ["crates/haematite/src/shard/mod.rs", "crates/haematite/src/lib.rs"],
+        "delete": []
+      },
+      "checklist": [],
+      "stories": []
+    },
+    {
+      "id": "R5",
+      "title": "Routing correctness and uniformity tests",
+      "spec": "THE SYSTEM SHALL include unit tests in crates/haematite/src/shard/router.rs that verify: (a) routing is deterministic across calls, (b) all shard indices are in bounds, (c) key distribution across shards is approximately uniform for random keys, and (d) ShardRouter::new rejects an empty PID list. Tests SHALL NOT use unwrap() or expect() outside #[cfg(test)] blocks. THE SYSTEM SHALL NOT depend on any test-only crate beyond what is already in Cargo.toml.",
+      "acceptance": [
+        "A #[test] asserts shard_for(key) == shard_for(key) for the same key called twice",
+        "A #[test] asserts shard_for(key) < shard_count for 100 distinct keys with shard_count=16",
+        "A #[test] constructs a router with 256 shards, routes 2560 random keys, and asserts every shard index in 0..256 appears at least once",
+        "A #[test] asserts ShardRouter::new(vec![]) returns Err",
+        "cargo test -p haematite --lib shard::router passes with no failures"
+      ],
+      "files": {
+        "create": [],
+        "modify": ["crates/haematite/src/shard/router.rs"],
+        "delete": []
+      },
+      "checklist": ["C33", "C34"],
+      "stories": ["S2", "S10"]
+    }
+  ],
+  "boundaries": [
+    "SHALL NOT implement the Database handle (CORE-009) that constructs ShardRouter by spawning shard actors — the router accepts pre-spawned Pids",
+    "SHALL NOT implement consistent hashing or virtual nodes for resharding — ADR-004 explicitly defers dynamic resharding to a future phase",
+    "SHALL NOT implement read replicas or secondary shard processes — deferred to a future phase",
+    "SHALL NOT implement any message forwarding logic inside the router — routing is a lookup, not a proxy; callers send directly using pid_for",
+    "SHALL NOT define ShardActor or any shard actor message handling — those live in shard/actor.rs (CORE-007)"
+  ],
+  "verification": [
+    "cargo check -p haematite succeeds with no errors",
+    "cargo test -p haematite --lib passes all tests in the shard::router module",
+    "cargo clippy -p haematite -- -D warnings produces no warnings",
+    "grep -rn 'unwrap()\\|expect(' crates/haematite/src/shard/router.rs produces no matches outside #[cfg(test)] blocks",
+    "crates/haematite/src/shard/router.rs does not exceed 500 lines",
+    "grep -n '.' crates/haematite/src/shard/mod.rs | grep -v 'pub mod\\|pub use\\|^[[:space:]]*$\\|//' produces no output — mod.rs contains only declarations",
+    "haematite::ShardRouter and haematite::RouterError are importable from the crate root in a doc-test or integration test"
+  ]
+}
