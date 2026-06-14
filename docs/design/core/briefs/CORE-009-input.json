@@ -1,0 +1,419 @@
+{
+  "repo_root": "/Users/tom/Developer/ablative/haematite",
+  "brief_id": "CORE-009",
+  "reviewers": [
+    "Danger Mouse"
+  ],
+  "base_ref": "main",
+  "placement": "local",
+  "isolation": "worktree",
+  "brief_document": {
+    "id": "CORE-009",
+    "cluster": "core",
+    "title": "Database handle: create, open, and public API over shard actors",
+    "depends_on": [
+      "CORE-007",
+      "CORE-008"
+    ],
+    "blocked_by": [],
+    "checklist": [
+      "C35",
+      "C36",
+      "C37",
+      "C38"
+    ],
+    "stories": [
+      "S1",
+      "S2",
+      "S3",
+      "S4",
+      "S5",
+      "S6",
+      "S7",
+      "S8",
+      "S9"
+    ],
+    "design_anchor": [
+      "ADR-004"
+    ],
+    "purpose": "Deliver the Database handle \u2014 the top-level public API that callers actually use. CORE-007 and CORE-008 provide shard actors and the router that maps keys to them, but nothing yet ties those components together behind a single ergonomic entry point. This brief closes that gap. Database::create(config) initialises a new database on disk: it validates the required config fields, creates the directory structure, persists the config, spawns N ShardActors (one per shard), and constructs a ShardRouter over their PIDs. Database::open(path) opens an existing database: it reads the persisted config, restarts each ShardActor from its persisted state with WAL recovery, and rebuilds the router. The public operations \u2014 get, put, delete, commit, and range \u2014 route through the ShardRouter to the correct shard actor and await the reply. No caller ever touches a ShardActor or ShardRouter directly; the Database is the sole public interface. This is the capstone brief for the core cluster: when it lands, a developer can create a haematite database, write to it, read from it, and rely on crash recovery \u2014 without knowing anything about prolly trees, WAL buffers, or shard routing.",
+    "task": "Create crates/haematite/src/db.rs. Define a DatabaseConfig struct with two required fields: data_dir: PathBuf and shard_count: usize \u2014 no optional fields, no defaults (P6, C38). Define a DatabaseError enum covering all failure modes (config missing, invalid shard count, IO errors, shard errors) that implements std::error::Error and Debug. Define a Database struct that holds a ShardRouter and the resolved config (data_dir, shard_count). Implement Database::create(config: DatabaseConfig) -> Result<Database, DatabaseError>: validates that shard_count >= 1, creates the data_dir if absent, persists the config as config.json inside data_dir, spawns shard_count ShardActors (passing each one its data subdirectory and an initial empty root), constructs a ShardRouter from the resulting PIDs, and returns the Database handle. Implement Database::open(path: PathBuf) -> Result<Database, DatabaseError>: reads config.json from path, validates it, restarts shard_count ShardActors from their persisted DurableWal state with WAL recovery, constructs a ShardRouter, and returns the handle. Implement the five public operations \u2014 get, put, delete, commit, and range \u2014 each routing via ShardRouter to the owning shard actor and awaiting the reply. Implement Drop (or a close() method \u2014 see boundaries) to gracefully shut down all shard actors. Wire db.rs into lib.rs: add pub mod db and re-export Database, DatabaseConfig, and DatabaseError from the crate root. Additionally, implement Database::append(key, entries, expected_seq) for Aion's EventStore API (S6, S9): this extends the ShardActor with an Append message type that atomically appends event entries with optimistic concurrency. S7 (read full history) maps to get, and S8 (read from sequence) maps to range \u2014 no new operations needed for those stories. This brief does NOT implement branching, merging, cross-shard transactions, read replicas, or dynamic resharding.",
+    "requirements": [
+      {
+        "id": "R1",
+        "title": "DatabaseConfig struct and DatabaseError type",
+        "spec": "Define a DatabaseConfig struct with exactly two fields: data_dir: PathBuf and shard_count: usize. THE SYSTEM SHALL NOT provide Default for DatabaseConfig \u2014 callers must supply both fields explicitly (P6, C38). Define a DatabaseError enum with variants covering: DirectoryCreate(io::Error), ConfigWrite(io::Error), ConfigRead(io::Error), ConfigParse(String), InvalidShardCount, ShardSpawn(String), ShardError(String), and IoError(io::Error). DatabaseConfig SHALL implement Debug and Clone. DatabaseError SHALL implement std::error::Error, Debug, and Display.",
+        "acceptance": [
+          "DatabaseConfig has exactly two fields: data_dir: PathBuf and shard_count: usize \u2014 confirmed by grep for 'struct DatabaseConfig' in db.rs",
+          "DatabaseConfig does not implement Default \u2014 DatabaseConfig::default() fails to compile",
+          "DatabaseError implements std::error::Error \u2014 confirmed by a #[test] that calls let _: &dyn std::error::Error = &err for each variant",
+          "DatabaseError implements Debug and Display \u2014 all variants format without panicking",
+          "DatabaseError::InvalidShardCount exists and is returned when shard_count == 0",
+          "cargo check -p haematite succeeds with DatabaseConfig and DatabaseError defined"
+        ],
+        "files": {
+          "create": [
+            "crates/haematite/src/db.rs"
+          ],
+          "modify": [],
+          "delete": []
+        },
+        "checklist": [
+          "C38"
+        ],
+        "stories": []
+      },
+      {
+        "id": "R2",
+        "title": "Database::create \u2014 initialise a new database on disk",
+        "spec": "WHEN Database::create(config) is called, THE SYSTEM SHALL validate that config.shard_count >= 1, returning DatabaseError::InvalidShardCount otherwise. THE SYSTEM SHALL create config.data_dir (and any missing parents) if it does not already exist. THE SYSTEM SHALL create one subdirectory per shard named shard-{n} (zero-indexed) inside data_dir for shard actor storage. THE SYSTEM SHALL serialise config to JSON and write it to data_dir/config.json. THE SYSTEM SHALL spawn config.shard_count ShardActors, one per shard subdirectory, with an initial empty root hash. THE SYSTEM SHALL construct a ShardRouter from the resulting PIDs. THE SYSTEM SHALL return a Database holding the router and the resolved config. IF any step fails (directory creation, config write, actor spawn), THE SYSTEM SHALL return a DatabaseError and SHALL NOT leave a partially-initialised database silently accessible.",
+        "acceptance": [
+          "Database::create(config) with shard_count == 0 returns Err(DatabaseError::InvalidShardCount)",
+          "Database::create(config) with a valid config creates data_dir on disk",
+          "After Database::create, data_dir/config.json exists and contains valid JSON with data_dir and shard_count fields",
+          "After Database::create with shard_count == 4, four shard-{0..3} subdirectories exist under data_dir",
+          "Database::create returns Ok(Database) when all steps succeed",
+          "Database::create with an unwritable data_dir parent returns Err \u2014 no partial state is left behind"
+        ],
+        "files": {
+          "create": [],
+          "modify": [
+            "crates/haematite/src/db.rs"
+          ],
+          "delete": []
+        },
+        "checklist": [
+          "C35"
+        ],
+        "stories": [
+          "S1"
+        ]
+      },
+      {
+        "id": "R3",
+        "title": "Database::open \u2014 reopen an existing database with WAL recovery",
+        "spec": "WHEN Database::open(path) is called, THE SYSTEM SHALL read and parse data_dir/config.json from path, returning DatabaseError::ConfigRead if the file is absent and DatabaseError::ConfigParse if it is malformed. THE SYSTEM SHALL validate that the parsed shard_count >= 1. THE SYSTEM SHALL restart shard_count ShardActors from their persisted shard-{n} subdirectories; each actor calls WalRecovery::recover on startup before entering its message loop, reconstructing any pre-crash buffer state (C36, S5). THE SYSTEM SHALL construct a ShardRouter from the restarted PIDs and return the Database handle. THE SYSTEM SHALL NOT reinitialise (overwrite) a shard's DurableWal or committed root on open \u2014 open is restoral, not recreation.",
+        "acceptance": [
+          "Database::open(path) with a missing config.json returns Err(DatabaseError::ConfigRead)",
+          "Database::open(path) with a malformed config.json returns Err(DatabaseError::ConfigParse)",
+          "Database::open(path) for a database created with shard_count == 4 restarts exactly 4 ShardActors",
+          "After Database::open, a key that was put-and-committed before the process exited is retrievable via get \u2014 confirming tree state persisted",
+          "After a simulated crash followed by Database::open, a key that was put-to-WAL but not committed before the crash is retrievable via get \u2014 confirming WAL replay reconstructed the buffer",
+          "Database::open does not overwrite or truncate any existing DurableWal or node store file"
+        ],
+        "files": {
+          "create": [],
+          "modify": [
+            "crates/haematite/src/db.rs"
+          ],
+          "delete": []
+        },
+        "checklist": [
+          "C36"
+        ],
+        "stories": [
+          "S1",
+          "S5"
+        ]
+      },
+      {
+        "id": "R4",
+        "title": "Public get, put, delete operations routed via ShardRouter",
+        "spec": "WHEN Database::get(key: &[u8]) is called, THE SYSTEM SHALL route to the shard actor at ShardRouter::pid_for(key), send ShardMessage::Get, and return the result as Result<Option<Vec<u8>>, DatabaseError>. WHEN Database::put(key: Vec<u8>, value: Vec<u8>) is called, THE SYSTEM SHALL route to the owning shard actor, send ShardMessage::Put, await ShardReply::Ack, and return Result<(), DatabaseError>. WHEN Database::delete(key: Vec<u8>) is called, THE SYSTEM SHALL route to the owning shard actor, send ShardMessage::Delete, await ShardReply::Ack, and return Result<(), DatabaseError>. THE SYSTEM SHALL NOT send a get, put, or delete to any shard other than the one determined by ShardRouter for that key. THE SYSTEM SHALL NOT expose ShardMessage, ShardReply, ShardRouter, or ShardActor in the return types of these methods \u2014 callers interact with DatabaseError only.",
+        "acceptance": [
+          "Database::get(key) returns Ok(None) for a key that was never written",
+          "Database::get(key) returns Ok(Some(value)) immediately after Database::put(key, value) \u2014 even before commit",
+          "Database::put(key, value) returns Ok(()) on success",
+          "Database::delete(key) followed by Database::get(key) returns Ok(None) \u2014 the buffer shadows the deletion",
+          "A put and a get for the same key always route to the same shard \u2014 confirmed by checking shard_for(key) returns the same index each time",
+          "The return types of get, put, and delete do not reference ShardMessage, ShardReply, ShardRouter, or beamr::Pid"
+        ],
+        "files": {
+          "create": [],
+          "modify": [
+            "crates/haematite/src/db.rs"
+          ],
+          "delete": []
+        },
+        "checklist": [
+          "C37"
+        ],
+        "stories": [
+          "S2",
+          "S7"
+        ]
+      },
+      {
+        "id": "R5",
+        "title": "Database::commit \u2014 flush all shard buffers atomically",
+        "spec": "WHEN Database::commit() is called, THE SYSTEM SHALL send ShardMessage::Commit to every shard actor in parallel, await all ShardReply::Committed(hash) responses, and return Result<Vec<Hash>, DatabaseError> where the Vec contains one committed root hash per shard in shard-index order. THE SYSTEM SHALL NOT commit only a subset of shards \u2014 commit is an all-shards operation. IF any shard returns an error, THE SYSTEM SHALL return DatabaseError::ShardError for that failure; remaining committed hashes are not returned. THE SYSTEM SHALL NOT block other shards while awaiting a slow shard's commit \u2014 sends are parallel, not serial.",
+        "acceptance": [
+          "Database::commit() after N puts returns Ok(hashes) with hashes.len() == shard_count",
+          "Database::commit() on an empty (no buffered writes) database returns Ok(hashes) \u2014 committing zero mutations is valid",
+          "The hash at index i in the result corresponds to shard i \u2014 i.e. hashes[ShardRouter::shard_for(key)] is the new root hash for the shard that owns key",
+          "A test confirms commit sends to all shards in parallel rather than sequentially \u2014 measured by checking that two shards' commit handlers are invoked concurrently",
+          "After commit, a subsequent put-then-get still returns the new value (buffer still operational post-commit)",
+          "If one shard's commit fails, Database::commit() returns Err(DatabaseError::ShardError)"
+        ],
+        "files": {
+          "create": [],
+          "modify": [
+            "crates/haematite/src/db.rs"
+          ],
+          "delete": []
+        },
+        "checklist": [
+          "C37"
+        ],
+        "stories": [
+          "S4"
+        ]
+      },
+      {
+        "id": "R6",
+        "title": "Database::range \u2014 sorted key scan routed to the owning shard",
+        "spec": "WHEN Database::range(from: &[u8], to: &[u8]) is called, THE SYSTEM SHALL route the range query to the single shard actor that owns keys in [from, to) \u2014 determined by ShardRouter::shard_for(from). THE SYSTEM SHALL send ShardMessage::Range to that shard actor, collect all ShardReply::RangeEntry { key, value } replies until ShardReply::RangeDone, and return them as Result<Vec<(Vec<u8>, Vec<u8>)>, DatabaseError> in ascending key order. THE SYSTEM SHALL NOT contact multiple shard actors for a single range call \u2014 for this release, range is a single-shard operation. IF from >= to, THE SYSTEM SHALL return Ok(vec![]) \u2014 an empty range is not an error. THE SYSTEM SHALL NOT guarantee cross-shard ordering for range queries \u2014 each shard returns its own sorted results independently.",
+        "acceptance": [
+          "Database::range(from, to) where from >= to returns Ok(vec![])",
+          "Database::range(from, to) returns all (key, value) pairs with from <= key < to in ascending key order",
+          "Database::range includes buffered (uncommitted) entries: keys put but not yet committed appear in results",
+          "A deleted key does not appear in Database::range results",
+          "Database::range routes only to a single shard actor \u2014 confirmed by checking that only one ShardMessage::Range is sent per call",
+          "Database::range returns Ok(vec![]) when no keys fall in the requested range",
+          "Range queries on a hash-sharded database return results within each shard independently \u2014 cross-shard ordered ranges are not supported in Phase 1"
+        ],
+        "files": {
+          "create": [],
+          "modify": [
+            "crates/haematite/src/db.rs"
+          ],
+          "delete": []
+        },
+        "checklist": [
+          "C37"
+        ],
+        "stories": [
+          "S3"
+        ]
+      },
+      {
+        "id": "R7",
+        "title": "Database shutdown via Drop",
+        "spec": "THE SYSTEM SHALL implement Drop for Database such that dropping the handle sends a graceful shutdown signal to all shard actors, allowing them to flush any in-flight state before the process exits. THE SYSTEM SHALL NOT use unwrap() or expect() in the Drop implementation \u2014 if shutdown message delivery fails (e.g. the actor already crashed), Drop SHALL log or ignore the failure silently rather than panicking. THE SYSTEM SHALL NOT expose a separate close() method as the public API \u2014 Drop is the single shutdown path.",
+        "acceptance": [
+          "Database implements Drop \u2014 confirmed by grep for 'impl Drop for Database' in db.rs",
+          "Dropping a Database handle does not panic, even if a shard actor has already crashed",
+          "A test creates a Database, writes to it, then drops it \u2014 no panic occurs and all shard PIDs are no longer responsive after the drop",
+          "Drop does not call unwrap() or expect() \u2014 confirmed by grep for 'unwrap()\\|expect(' in the Drop impl block"
+        ],
+        "files": {
+          "create": [],
+          "modify": [
+            "crates/haematite/src/db.rs"
+          ],
+          "delete": []
+        },
+        "checklist": [],
+        "stories": []
+      },
+      {
+        "id": "R8",
+        "title": "Wire Database into crate root and end-to-end integration test",
+        "spec": "Add pub mod db to crates/haematite/src/lib.rs and re-export Database, DatabaseConfig, and DatabaseError from the crate root. THE SYSTEM SHALL include an integration test in db.rs (under #[cfg(test)]) that: creates a Database with shard_count == 4 in a temp directory, puts 100 key-value pairs, calls commit, calls get on each key and asserts the value matches, calls range over the full key space and asserts 100 results are returned in sorted order, drops the Database, re-opens it with Database::open, and asserts the same 100 keys are still retrievable. This test proves the full create-write-commit-close-open-read cycle (S1 through S5).",
+        "acceptance": [
+          "haematite::Database, haematite::DatabaseConfig, and haematite::DatabaseError are importable from the crate root after wiring",
+          "The integration test creates a Database with shard_count == 4 and puts 100 key-value pairs without error",
+          "The integration test calls commit and receives Ok(hashes) with hashes.len() == 4",
+          "The integration test calls get for each of the 100 keys and receives the correct value",
+          "The integration test calls range and receives exactly 100 entries in ascending key order",
+          "The integration test drops the Database, re-opens it with Database::open, and retrieves all 100 keys correctly \u2014 confirming persistence",
+          "cargo test -p haematite --lib db passes with no failures"
+        ],
+        "files": {
+          "create": [],
+          "modify": [
+            "crates/haematite/src/db.rs",
+            "crates/haematite/src/lib.rs"
+          ],
+          "delete": []
+        },
+        "checklist": [
+          "C35",
+          "C36",
+          "C37",
+          "C38"
+        ],
+        "stories": [
+          "S1",
+          "S2",
+          "S3",
+          "S4",
+          "S5",
+          "S6",
+          "S7",
+          "S8",
+          "S9"
+        ]
+      },
+      {
+        "id": "R9",
+        "title": "Database::append \u2014 optimistic concurrency append for event sourcing",
+        "spec": "WHEN Database::append(key, entries, expected_seq) is called, THE SYSTEM SHALL route to the owning shard actor, send an Append message containing the key, a Vec of value entries, and the expected sequence number. THE SYSTEM SHALL store each event as an individual tree entry keyed by key + 0x00 separator + 8-byte big-endian sequence number, enabling range reads over a key's event history (S8). THE SYSTEM SHALL maintain a sequence counter per key stored under a metadata key (key + 0xFF + b\"seq\"). THE SYSTEM SHALL atomically append all entries if the current sequence matches expected_seq, returning the new sequence number. IF the current sequence does not match expected_seq, THE SYSTEM SHALL return Err(DatabaseError::SequenceConflict { expected, actual }) without modifying any data. THE SYSTEM SHALL NOT allow partial appends \u2014 either all entries are appended or none are. WHEN multiple entries are appended in one call, THE SYSTEM SHALL buffer all mutations and commit once (CN8). Database::read_events(key) SHALL return all events in sequence order via range scan over the key prefix (S7). Database::read_events_from(key, from_seq) SHALL return events from from_seq onwards via range scan starting at key + 0x00 + big-endian from_seq (S8).",
+        "acceptance": [
+          "Database::append(key, [e1, e2, e3], 0) stores 3 tree entries with sequenced keys and returns Ok(3)",
+          "Database::append(key, entries, wrong_seq) returns Err(DatabaseError::SequenceConflict { expected: wrong_seq, actual: current_seq })",
+          "Two concurrent appends to the same key with the same expected_seq: one succeeds, the other returns SequenceConflict",
+          "Database::read_events(key) returns all events in sequence order",
+          "Database::read_events_from(key, 2) returns only events from sequence 2 onwards \u2014 confirms per-event indexing (S8)",
+          "Database::append with 3 entries produces exactly one commit \u2014 not 3",
+          "Database::append(key, vec![], expected_seq) with empty entries is a no-op that returns Ok(expected_seq)"
+        ],
+        "files": {
+          "create": [],
+          "modify": [
+            "crates/haematite/src/db.rs",
+            "crates/haematite/src/shard/actor.rs"
+          ],
+          "delete": []
+        },
+        "checklist": [
+          "C37"
+        ],
+        "stories": [
+          "S6",
+          "S9"
+        ]
+      }
+    ],
+    "boundaries": [
+      "SHALL NOT implement branching, forking, or merging operations \u2014 those are covered by the branching cluster",
+      "SHALL NOT implement cross-shard transactions or two-phase commit \u2014 serialisability is per-shard only, as specified in design non-goals",
+      "SHALL NOT implement read replicas or secondary shard processes \u2014 deferred to a future phase",
+      "SHALL NOT implement dynamic resharding or allow shard_count to change after Database::create \u2014 ADR-004 fixes shard count at creation",
+      "SHALL NOT implement secondary indexes or query planning \u2014 scan with predicate covers current needs per design non-goals",
+      "SHALL NOT expose ShardActor, ShardMessage, ShardReply, or ShardRouter in the public API surface \u2014 Database is the sole entry point",
+      "SHALL NOT add silent defaults to DatabaseConfig \u2014 both data_dir and shard_count are required and must be supplied by the caller (P6)"
+    ],
+    "verification": [
+      "cargo check -p haematite succeeds with no errors",
+      "cargo test -p haematite --lib passes all tests including the end-to-end integration test in db.rs",
+      "cargo clippy -p haematite -- -D warnings produces no warnings",
+      "grep -rn 'unwrap()\\|expect(' crates/haematite/src/db.rs produces no matches outside #[cfg(test)] blocks",
+      "crates/haematite/src/db.rs does not exceed 500 lines",
+      "grep -n 'impl Default for DatabaseConfig' crates/haematite/src/db.rs returns no matches \u2014 DatabaseConfig has no Default impl",
+      "haematite::Database, haematite::DatabaseConfig, and haematite::DatabaseError are importable from the crate root",
+      "A round-trip test: Database::create, put 10 keys, commit, drop, Database::open, get all 10 keys \u2014 each returns the correct value"
+    ]
+  },
+  "resolved_context": {
+    "adrs": [
+      {
+        "id": "ADR-004",
+        "title": "Actor-per-shard with fixed shard count at creation",
+        "decision": "Actor-per-shard on beamr with fixed shard count at creation, over single-writer and lock-per-shard, because the actor model eliminates locks entirely \u2014 each shard is a single-writer beamr process with no shared mutable state. Fixed shard count over dynamic resharding because resharding is operationally complex and can be deferred: 256 or 1024 shards covers any reasonable single-node deployment for Aion's workload (one key per workflow_id).",
+        "quote": "",
+        "decided_by": "Bono, Frodo Baggins"
+      }
+    ],
+    "checklist": [
+      {
+        "id": "C35",
+        "text": "Database::create() initialises a new database with a configured shard count."
+      },
+      {
+        "id": "C36",
+        "text": "Database::open() opens an existing database and restarts shard actors from persisted state."
+      },
+      {
+        "id": "C37",
+        "text": "Database exposes get/put/delete/commit/range that route through the shard router."
+      },
+      {
+        "id": "C38",
+        "text": "No configuration has silent defaults \u2014 shard count, data directory, and commit policy are all required (P6)."
+      }
+    ],
+    "stories": [
+      {
+        "id": "S1",
+        "text": "As an application developer, I want to create a haematite database with a single function call so that I do not need to manage shard actors, WAL files, or tree structures manually."
+      },
+      {
+        "id": "S2",
+        "text": "As an application developer, I want to put and get key-value pairs without thinking about which shard owns them so that the sharding is transparent."
+      },
+      {
+        "id": "S3",
+        "text": "As an application developer, I want range queries to return results in sorted key order so that I can scan sequential data efficiently."
+      },
+      {
+        "id": "S4",
+        "text": "As an application developer, I want to batch multiple writes into a single atomic commit so that my data is always in a consistent state."
+      },
+      {
+        "id": "S5",
+        "text": "As an application developer, I want the database to recover automatically from crashes so that I do not need to write recovery logic."
+      },
+      {
+        "id": "S6",
+        "text": "As the Aion engine, I want to append events to a workflow key with optimistic concurrency (expected_seq) so that two concurrent appends to the same workflow are detected and one is rejected."
+      },
+      {
+        "id": "S7",
+        "text": "As the Aion engine, I want to read a workflow's full event history in sequence order so that I can replay it for recovery."
+      },
+      {
+        "id": "S8",
+        "text": "As the Aion engine, I want to read events from a specific sequence number forward so that I can resume replay without re-reading the entire history."
+      },
+      {
+        "id": "S9",
+        "text": "As the Aion engine, I want to batch-append WorkflowStarted and SearchAttributesUpdated atomically so that a crash between them never leaves an orphaned workflow."
+      }
+    ],
+    "constraints": [
+      {
+        "id": "CN1",
+        "text": "No file over 500 lines. If a module approaches this limit, extract into submodules."
+      },
+      {
+        "id": "CN2",
+        "text": "No panics in production code. .unwrap() and .expect() only in tests."
+      },
+      {
+        "id": "CN3",
+        "text": "mod.rs contains ONLY pub mod declarations and pub use re-exports. No logic."
+      },
+      {
+        "id": "CN4",
+        "text": "All public types implement Debug. All error types implement std::error::Error."
+      },
+      {
+        "id": "CN5",
+        "text": "The prolly tree root hash for a given key-value set must be deterministic and history-independent: the same keys and values always produce the same root hash regardless of insertion order."
+      },
+      {
+        "id": "CN6",
+        "text": "WAL buffer reads must shadow tree reads: a key written to the buffer but not yet committed must be returned by get, not the stale tree value."
+      },
+      {
+        "id": "CN7",
+        "text": "Shard actor crash must not affect other shards. Supervision restarts only the failed shard."
+      },
+      {
+        "id": "CN8",
+        "text": "Batch append (multiple key-value pairs in one call) must produce exactly one tree commit, not N individual commits."
+      }
+    ],
+    "intention": "Haematite's core is a storage engine where concurrency is free and branching is structural. When this cluster is complete, a developer can open a haematite database, write to it from hundreds of concurrent actors without any locking discipline, fork it instantly by sharing a hash, and merge two forks by walking only the nodes that differ. The experience should feel like working with an in-memory data structure that happens to be durable \u2014 no connection pools, no transaction coordinators, no lock managers. The content-addressed prolly tree is what makes branching zero-friction; the actor-per-shard model is what makes concurrency zero-contention; the WAL buffer is what makes writes fast despite the content-addressing overhead. All three are load-bearing.",
+    "design_path": "docs/design/core",
+    "provenance": {
+      "requested_by": "Tom",
+      "quote": "Haematite's core is a storage engine where concurrency is free and branching is structural. When this cluster is complete, a developer can open a haematite database, write to it from hundreds of concu"
+    }
+  },
+  "verify_fix_cap": 3,
+  "review_cap": 1,
+  "round_backoff_ms": 2000,
+  "review_deadline_ms": 300000
+}

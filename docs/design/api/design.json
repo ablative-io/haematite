@@ -1,0 +1,143 @@
+{
+  "cluster": "api",
+  "title": "EventStore API, General KV API, and TTL Expiry",
+  "intention": "The API cluster is the contract between haematite and every application that embeds it. When this cluster is complete, Aion can use haematite as its EventStore backend with append/read/read_from/scan/cas operations, the messaging bus can use general KV operations for durable channel state, and both get built-in TTL expiry without application-level sweep logic. The API should feel like a thin, honest surface \u2014 every operation maps directly to the underlying shard actor, nothing is hidden behind clever abstractions, and the cost model is transparent. A caller who understands the shard model should be able to predict the performance of any API call.",
+  "problem": "Aion currently requires an EventStore trait implementation with specific semantics: append with optimistic concurrency (expected_seq), sequential reads, range reads from a sequence number, scan with predicate, and compare-and-swap. These operations must map cleanly to haematite's shard actor model without impedance mismatch \u2014 an API that hides the shard boundary will produce surprising latency when operations span shards.\n\nThe messaging bus needs general key-value operations (get/put/delete/range) for durable conversation state and consumer cursors. TTL expiry is needed by both: Aion for eventual history compaction (HistoryCompacted error code), and the messaging bus for ephemeral-to-durable channel lifecycle.\n\nNo existing embedded database provides all three (event store, KV, TTL) as first-class APIs backed by an actor-per-shard concurrency model.",
+  "solution": "The API cluster defines three layers:\n\n1. EventStore API\n\nMaps directly to Aion's EventStore trait. Each operation routes to a shard actor by key hash:\n\n- append(key, events, expected_seq): atomically appends events to the key's event stream. If the current sequence number does not match expected_seq, returns SequenceConflict. The batch append is committed as a single tree mutation (one path-to-root rewrite per ADR-003). This is the optimistic concurrency primitive.\n\n- read(key): returns the full event stream for the key, in sequence order. For a workflow key, this is the complete event history.\n\n- read_from(key, from_seq): returns events from the specified sequence number forward. This is the resume-replay operation \u2014 Aion uses it to continue recovery without re-reading the full history.\n\n- scan(predicate): walks all shards, applying the predicate to each key's metadata. Returns matching entries. This is the search-attribute query path \u2014 not optimised for high-frequency use, but correct.\n\n- cas(key, expected, new): compare-and-swap on a single key. Atomic at the shard level.\n\nEvent streams are stored as ordered key-value entries within the shard's prolly tree. The key format encodes both the stream key and the sequence number, so range queries on the tree yield events in order.\n\n2. General KV API\n\nThe foundational operations exposed by the database handle, routing through the shard router:\n\n- get(key): returns Option<Value>. Checks the shard's WAL buffer first, then the tree.\n- put(key, value): appends to the shard's WAL buffer.\n- delete(key): appends a tombstone to the shard's WAL buffer.\n- range(from, to): merges buffer and tree entries in sorted order across the target shard.\n- commit(): flushes all shard WAL buffers and returns per-shard root hashes.\n\nThese are the same operations the core cluster's shard actor handles; the API cluster wraps them with routing, error handling, and the public type surface.\n\n3. TTL and Expiry\n\nPer-key TTL is set at write time via an optional ttl parameter on put and append. The TTL is stored alongside the value in the tree.\n\nExpiry is handled by a per-shard sweep actor \u2014 a supervised beamr process that periodically scans its shard's tree for expired entries and deletes them. The sweep actor is cheap: it is just another beamr process on the scheduler, subject to preemptive scheduling, and it does not block the shard actor's writes.\n\nExpired entries are not returned by get or read operations, even before the sweep actor has physically removed them. Reads filter at query time.\n\nThe sweep interval is configurable per-database. The sweep actor maps to Aion's HistoryCompacted lifecycle: when a workflow's history is compacted, future reads return a HistoryCompacted error rather than stale data.",
+  "principles": [
+    {
+      "id": "P1",
+      "text": "One operation, one shard. Every API call routes to exactly one shard actor by key hash. Operations that would span shards are explicit multi-calls, not hidden fan-outs."
+    },
+    {
+      "id": "P2",
+      "text": "The API hides the tree, not the shard. Callers should not think about prolly tree nodes, but they should understand that keys route to shards and that cross-shard operations are multiple round-trips."
+    },
+    {
+      "id": "P3",
+      "text": "Optimistic concurrency is the only concurrency control. append with expected_seq and cas with expected value are the conflict detection primitives. No pessimistic locks."
+    },
+    {
+      "id": "P4",
+      "text": "Expired entries are invisible at read time. A get or read on an expired key returns None/empty, regardless of whether the sweep actor has physically removed it."
+    },
+    {
+      "id": "P5",
+      "text": "Batch operations are atomic within a shard. A batch append of N events either all succeed or all fail. No partial appends."
+    }
+  ],
+  "decisions": [
+    "ADR-003",
+    "ADR-004",
+    "ADR-005"
+  ],
+  "goals": [
+    "Aion's EventStore trait can be implemented by delegating to haematite's append/read/read_from/scan/cas operations with no impedance mismatch.",
+    "Batch append of N events produces exactly one tree commit per shard (ADR-003).",
+    "append with a stale expected_seq returns SequenceConflict without modifying the stream.",
+    "read_from(key, seq) returns only events from seq forward, without reading the full history.",
+    "TTL-expired entries are not returned by get/read/range, even before the sweep actor has removed them.",
+    "The sweep actor runs as a supervised beamr process and does not block the shard actor's write path."
+  ],
+  "non_goals": [
+    {
+      "text": "Cross-shard transactions",
+      "reason": "Each shard is independent per ADR-004. Cross-shard atomicity adds coordination cost that conflicts with the zero-contention model."
+    },
+    {
+      "text": "Secondary indexes for scan optimisation",
+      "reason": "Scan with predicate is correct but O(n). Secondary indexes deferred until real query patterns are understood."
+    },
+    {
+      "text": "Query language or SQL-like interface",
+      "reason": "The API is programmatic. A query layer would be a separate crate built on top of these primitives."
+    },
+    {
+      "text": "Streaming or subscription API",
+      "reason": "Push-based event delivery is a distribution-layer concern. The API cluster provides pull-based read operations."
+    },
+    {
+      "text": "Ephemeral channel bypass",
+      "reason": "High-throughput ephemeral messaging bypasses the tree entirely via beamr mailbox delivery. This is a messaging bus concern, not an API concern."
+    }
+  ],
+  "structure": [
+    {
+      "path": "crates/haematite/src/lib.rs",
+      "note": "Crate root \u2014 pre-existing, modified to re-export api module",
+      "brief": ""
+    },
+    {
+      "path": "crates/haematite/src/api/mod.rs",
+      "note": "API module root \u2014 pub mod declarations only",
+      "brief": "API-001"
+    },
+    {
+      "path": "crates/haematite/src/api/event_store.rs",
+      "note": "EventStore API: append, read, read_from, scan, cas",
+      "brief": "API-001"
+    },
+    {
+      "path": "crates/haematite/src/api/kv.rs",
+      "note": "General KV API: get, put, delete, range, commit",
+      "brief": "API-002"
+    },
+    {
+      "path": "crates/haematite/src/api/types.rs",
+      "note": "Public API types: Event, SequenceConflict, CasMismatch, ScanResult",
+      "brief": "API-001"
+    },
+    {
+      "path": "crates/haematite/src/api/error.rs",
+      "note": "API error types: EventStoreError, KvError, TtlError",
+      "brief": "API-001"
+    },
+    {
+      "path": "crates/haematite/src/ttl/mod.rs",
+      "note": "TTL module root",
+      "brief": "API-003"
+    },
+    {
+      "path": "crates/haematite/src/ttl/entry.rs",
+      "note": "TTL metadata: expiry timestamp stored alongside values",
+      "brief": "API-003"
+    },
+    {
+      "path": "crates/haematite/src/ttl/sweep.rs",
+      "note": "Per-shard sweep actor: periodic scan for expired entries",
+      "brief": "API-003"
+    },
+    {
+      "path": "crates/haematite/src/ttl/filter.rs",
+      "note": "Read-time expiry filter: checks TTL before returning values",
+      "brief": "API-003"
+    }
+  ],
+  "inventory": [],
+  "constraints": [
+    {
+      "id": "CN1",
+      "text": "append with expected_seq must be atomic: the sequence check and the append happen within the shard actor's message handler with no interleaving."
+    },
+    {
+      "id": "CN2",
+      "text": "Batch append of N events must produce exactly one tree commit, not N individual commits."
+    },
+    {
+      "id": "CN3",
+      "text": "Expired entries must never be returned by get, read, read_from, range, or scan \u2014 regardless of sweep actor state."
+    },
+    {
+      "id": "CN4",
+      "text": "The sweep actor must not block the shard actor's write path. Sweep runs as a separate supervised process."
+    },
+    {
+      "id": "CN5",
+      "text": "scan traverses all shards. The caller must understand this is O(total entries across all shards), not O(entries in one shard)."
+    },
+    {
+      "id": "CN6",
+      "text": "cas is atomic within a shard but provides no cross-shard guarantees."
+    }
+  ]
+}

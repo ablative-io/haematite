@@ -1,0 +1,216 @@
+{
+  "project": "haematite",
+  "updated": "2026-06-13",
+  "items": [
+    {
+      "id": "RM-001",
+      "title": "Prolly tree core data structure",
+      "status": "idea",
+      "kind": "feature",
+      "summary": "Implement the content-addressed probabilistic B-tree (prolly tree) with BLAKE3 hashing, history-independent node boundaries, and the fundamental get/put/delete/range operations. This is the foundational data structure everything else builds on.",
+      "provenance": {
+        "requested_by": "Bono, Sir Patick Stewart, Frodo Baggins",
+        "date": "2026-06-13",
+        "quote": "",
+        "context": "Three-way design session converged on content-addressed prolly tree over B+ tree because branching/merging/sync must be structural, not overlaid. Sir Patick Stewart proposed; Bono and Frodo endorsed after analysis of O(differences) merge vs O(branch-writes) WAL replay."
+      },
+      "links": {
+        "cluster": "core",
+        "decisions": ["ADR-001", "ADR-002"],
+        "briefs": [],
+        "commits": []
+      },
+      "depends_on": [],
+      "notes": ""
+    },
+    {
+      "id": "RM-002",
+      "title": "WAL buffer and commit protocol",
+      "status": "idea",
+      "kind": "feature",
+      "summary": "Per-shard write-ahead log buffer that batches mutations and flushes to the prolly tree as atomic commits. Amortizes the path-to-root rewrite cost of content-addressing. Crash recovery by WAL replay.",
+      "provenance": {
+        "requested_by": "Bono",
+        "date": "2026-06-13",
+        "quote": "",
+        "context": "Proposed as the synthesis between Sir Patick Stewart's prolly tree (correct for branching) and the write amplification concern. WAL buffer batches N writes into one path-to-root rewrite. Frodo confirmed Aion's recorder already works in batches, so amortization aligns."
+      },
+      "links": {
+        "cluster": "core",
+        "decisions": ["ADR-003"],
+        "briefs": [],
+        "commits": []
+      },
+      "depends_on": ["RM-001"],
+      "notes": ""
+    },
+    {
+      "id": "RM-003",
+      "title": "Actor-per-shard architecture",
+      "status": "idea",
+      "kind": "feature",
+      "summary": "Partition the keyspace into N shards, each owned by a single beamr process. Shard routing via consistent hashing. Multiple concurrent writers with zero lock contention. Supervision for automatic shard recovery.",
+      "provenance": {
+        "requested_by": "Bono",
+        "date": "2026-06-13",
+        "quote": "",
+        "context": "The fundamental architecture decision. BEAM's actor model eliminates the single-writer lock problem that every embedded database has. Each shard is a single-writer process — no locks needed because there is no shared mutable state."
+      },
+      "links": {
+        "cluster": "core",
+        "decisions": ["ADR-004"],
+        "briefs": [],
+        "commits": []
+      },
+      "depends_on": ["RM-001", "RM-002"],
+      "notes": ""
+    },
+    {
+      "id": "RM-004",
+      "title": "Branching and merging",
+      "status": "idea",
+      "kind": "feature",
+      "summary": "Fork a database by sharing a root hash. Merge via three-way structural diff proportional to differences, not total writes. Configurable conflict resolution: last-write-wins, vector-clock, custom Gleam merge function.",
+      "provenance": {
+        "requested_by": "Tom",
+        "date": "2026-06-13",
+        "quote": "why can't you have a database that you're sort of able to function almost like it was a kind of a git repository right",
+        "context": "Tom proposed branchable/graftable databases during the product vision discussion. The content-addressed prolly tree makes this O(1) fork, O(differences) merge — genuinely zero-friction, not bolted-on."
+      },
+      "links": {
+        "cluster": "branching",
+        "decisions": ["ADR-001"],
+        "briefs": [],
+        "commits": []
+      },
+      "depends_on": ["RM-001", "RM-003"],
+      "notes": ""
+    },
+    {
+      "id": "RM-005",
+      "title": "EventStore API for Aion",
+      "status": "idea",
+      "kind": "feature",
+      "summary": "Implement the append/read/read_from/scan/cas API that Aion's EventStore trait requires. Atomic batch appends. Optimistic concurrency via expected_seq.",
+      "provenance": {
+        "requested_by": "Frodo Baggins",
+        "date": "2026-06-13",
+        "quote": "",
+        "context": "Frodo specified the EventStore API from Aion's perspective. The shard actor boundary hides the internal representation. Batch append is critical: Aion's recorder batches WorkflowStarted + SearchAttributesUpdated atomically."
+      },
+      "links": {
+        "cluster": "api",
+        "decisions": [],
+        "briefs": [],
+        "commits": []
+      },
+      "depends_on": ["RM-003"],
+      "notes": ""
+    },
+    {
+      "id": "RM-006",
+      "title": "Persistence and crash recovery",
+      "status": "idea",
+      "kind": "feature",
+      "summary": "Durable storage of prolly tree nodes and WAL entries to disk. Crash recovery: replay uncommitted WAL entries, reconstruct shard state from persisted tree nodes. Node storage with zstd compression.",
+      "provenance": {
+        "requested_by": "Bono, Frodo Baggins",
+        "date": "2026-06-13",
+        "quote": "",
+        "context": "Persistence is the durability boundary. Content-addressed nodes are written lazily; the WAL is the crash-recovery mechanism. zstd per-node compression agreed by all three contributors."
+      },
+      "links": {
+        "cluster": "persistence",
+        "decisions": [],
+        "briefs": [],
+        "commits": []
+      },
+      "depends_on": ["RM-001", "RM-002"],
+      "notes": ""
+    },
+    {
+      "id": "RM-007",
+      "title": "Distribution and sync",
+      "status": "idea",
+      "kind": "feature",
+      "summary": "Multi-node replication via hash-based sync: compare root hashes, exchange missing content-addressed nodes. Uses beamr's existing distribution protocol. Eventual consistency by default, strong consistency per-operation.",
+      "provenance": {
+        "requested_by": "Sir Patick Stewart",
+        "date": "2026-06-13",
+        "quote": "",
+        "context": "Content-addressed structure enables sync-by-hash-negotiation between arbitrary nodes — no WAL coordination, no replication log management. Same mechanism as git fetch/push applied to a key-value tree."
+      },
+      "links": {
+        "cluster": "distribution",
+        "decisions": ["ADR-001"],
+        "briefs": [],
+        "commits": []
+      },
+      "depends_on": ["RM-003", "RM-006"],
+      "notes": ""
+    },
+    {
+      "id": "RM-008",
+      "title": "Time-travel and snapshots",
+      "status": "idea",
+      "kind": "feature",
+      "summary": "Name any committed root hash to get that exact database state. Random-access to historical state without sequential replay. Snapshot listing and pruning.",
+      "provenance": {
+        "requested_by": "Sir Patick Stewart, Frodo Baggins",
+        "date": "2026-06-13",
+        "quote": "",
+        "context": "Content-addressed roots are permanent verifiable snapshots. Frodo flagged the Aion debugging use case: fork a workflow's history for what-if replay. Sir Patick Stewart noted this is random-access (name a hash) vs sequential (replay WAL)."
+      },
+      "links": {
+        "cluster": "branching",
+        "decisions": [],
+        "briefs": [],
+        "commits": []
+      },
+      "depends_on": ["RM-004"],
+      "notes": ""
+    },
+    {
+      "id": "RM-009",
+      "title": "TTL expiry and compaction",
+      "status": "idea",
+      "kind": "feature",
+      "summary": "Built-in key expiry via per-shard sweep actors. Maps to Aion's eventual history compaction. Sweep actor is a supervised beamr process, cheap to run.",
+      "provenance": {
+        "requested_by": "Bono, Frodo Baggins",
+        "date": "2026-06-13",
+        "quote": "",
+        "context": "Agreed as built-in rather than application-level. Maps to Aion's HistoryCompacted error code. The sweep actor is just another supervised process."
+      },
+      "links": {
+        "cluster": "api",
+        "decisions": [],
+        "briefs": [],
+        "commits": []
+      },
+      "depends_on": ["RM-003"],
+      "notes": ""
+    },
+    {
+      "id": "RM-010",
+      "title": "WASM compilation target",
+      "status": "idea",
+      "kind": "feature",
+      "summary": "Compile haematite to WASM for browser/edge deployment. Same API, same actor model, IndexedDB or OPFS as backing store. Content-addressed nodes are portable across backends.",
+      "provenance": {
+        "requested_by": "Tom",
+        "date": "2026-06-13",
+        "quote": "having something that you could compile to WASM and have it running in the browser kind of thing again multiple readers multiple writers would be amazing",
+        "context": "Tom explicitly called out WASM compilation for browser-side embedded databases. beamr-wasm already exists as precedent."
+      },
+      "links": {
+        "cluster": "wasm",
+        "decisions": [],
+        "briefs": [],
+        "commits": []
+      },
+      "depends_on": ["RM-003", "RM-006"],
+      "notes": ""
+    }
+  ]
+}

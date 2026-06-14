@@ -1,0 +1,49 @@
+{
+  "cluster": "api",
+  "sections": [
+    {
+      "name": "EventStore API",
+      "items": [
+        {"id": "C1", "text": "append(key, events, expected_seq) atomically appends events to the key's stream if expected_seq matches the current sequence number.", "done": false},
+        {"id": "C2", "text": "append returns SequenceConflict without modifying the stream when expected_seq does not match.", "done": false},
+        {"id": "C3", "text": "Batch append of N events produces exactly one tree commit per shard (CN2).", "done": false},
+        {"id": "C4", "text": "read(key) returns the full event stream in sequence order.", "done": false},
+        {"id": "C5", "text": "read_from(key, from_seq) returns only events from from_seq forward without reading the full history.", "done": false},
+        {"id": "C6", "text": "scan(predicate) walks all shards and returns entries matching the predicate.", "done": false},
+        {"id": "C7", "text": "cas(key, expected, new) atomically replaces the value if it matches expected, returns CasMismatch otherwise.", "done": false},
+        {"id": "C8", "text": "Event stream key format encodes both the stream key and sequence number so that tree range queries yield events in order.", "done": false}
+      ]
+    },
+    {
+      "name": "General KV API",
+      "items": [
+        {"id": "C9", "text": "get(key) returns Option<Value>, checking the shard's WAL buffer first, then the tree.", "done": false},
+        {"id": "C10", "text": "put(key, value) appends to the shard's WAL buffer.", "done": false},
+        {"id": "C11", "text": "delete(key) appends a tombstone to the shard's WAL buffer.", "done": false},
+        {"id": "C12", "text": "range(from, to) merges buffer and tree entries in sorted order.", "done": false},
+        {"id": "C13", "text": "commit() flushes all shard WAL buffers and returns per-shard root hashes.", "done": false}
+      ]
+    },
+    {
+      "name": "API Types and Errors",
+      "items": [
+        {"id": "C14", "text": "Event type represents a single event in a stream with sequence number and payload.", "done": false},
+        {"id": "C15", "text": "SequenceConflict error includes the expected and actual sequence numbers.", "done": false},
+        {"id": "C16", "text": "CasMismatch error includes the expected and actual values.", "done": false},
+        {"id": "C17", "text": "All error types implement std::error::Error and Debug.", "done": false}
+      ]
+    },
+    {
+      "name": "TTL and Expiry",
+      "items": [
+        {"id": "C18", "text": "put and append accept an optional TTL parameter that sets the expiry timestamp for the entry.", "done": false},
+        {"id": "C19", "text": "TTL is stored alongside the value in the tree as expiry metadata.", "done": false},
+        {"id": "C20", "text": "get, read, read_from, range, and scan filter expired entries at read time — expired entries are never returned (CN3).", "done": false},
+        {"id": "C21", "text": "Per-shard sweep actor periodically scans for and deletes expired entries.", "done": false},
+        {"id": "C22", "text": "Sweep actor is a supervised beamr process that does not block the shard actor's write path (CN4).", "done": false},
+        {"id": "C23", "text": "Sweep interval is configurable per-database.", "done": false},
+        {"id": "C24", "text": "Expired workflow history returns a HistoryCompacted-equivalent error on subsequent reads.", "done": false}
+      ]
+    }
+  ]
+}

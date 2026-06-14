@@ -1,0 +1,40 @@
+{
+  "cluster": "wasm",
+  "personas": [
+    {
+      "name": "Frontend Developer",
+      "role": "Using haematite in a browser application",
+      "stories": [
+        {"id": "S1", "text": "As a frontend developer, I want to use the same haematite API in the browser as on the server so that I do not need to learn a separate client-side storage library."},
+        {"id": "S2", "text": "As a frontend developer, I want the WASM binary to be under 2MB gzipped so that my application's initial load time is not dominated by the database engine."},
+        {"id": "S3", "text": "As a frontend developer, I want haematite to run in a web worker so that database operations do not block the UI thread."},
+        {"id": "S4", "text": "As a frontend developer, I want to fork and merge databases in the browser so that I can implement offline editing with later sync."}
+      ]
+    },
+    {
+      "name": "Application Developer",
+      "role": "Building offline-capable applications",
+      "stories": [
+        {"id": "S5", "text": "As an application developer, I want the browser haematite instance to sync with the server by exchanging content-addressed nodes so that offline changes merge cleanly when connectivity returns."},
+        {"id": "S6", "text": "As an application developer, I want content-addressed hashes to be identical between the server and browser so that sync works by hash comparison without translation."},
+        {"id": "S7", "text": "As an application developer, I want the WAL to use OPFS when available and fall back to IndexedDB when it is not so that durability is best-effort without configuration."}
+      ]
+    },
+    {
+      "name": "Edge Developer",
+      "role": "Running haematite in edge compute environments",
+      "stories": [
+        {"id": "S8", "text": "As an edge developer, I want haematite to run in Cloudflare Workers or Deno Deploy so that I can embed a branchable database at the edge."},
+        {"id": "S9", "text": "As an edge developer, I want the WASM build to have no native-only dependencies so that it runs in any WASM-capable runtime."}
+      ]
+    },
+    {
+      "name": "Operations Engineer",
+      "role": "Deploying and monitoring WASM haematite",
+      "stories": [
+        {"id": "S10", "text": "As an operations engineer, I want to verify that the WASM build produces identical hashes to the native build so that sync between native and WASM nodes is reliable."},
+        {"id": "S11", "text": "As an operations engineer, I want the WASM build to gracefully degrade when browser APIs (OPFS, web workers) are unavailable so that the database is functional in constrained environments."}
+      ]
+    }
+  ]
+}

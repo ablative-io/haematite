@@ -1,0 +1,57 @@
+{
+  "cluster": "branching",
+  "sections": [
+    {
+      "name": "Branch Handle and Fork",
+      "items": [
+        {"id": "C1", "text": "BranchHandle type holds the fork-point root hash, current root hash, and per-shard WAL buffer references.", "done": false},
+        {"id": "C2", "text": "fork() records the current root hash as the fork-point and allocates empty per-shard WAL buffers without copying any tree nodes.", "done": false},
+        {"id": "C3", "text": "Fork completes in O(1) time regardless of database size (CN1).", "done": false},
+        {"id": "C4", "text": "A forked branch can be read and written independently of the parent — mutations on one do not affect the other.", "done": false},
+        {"id": "C5", "text": "Branch reads check the branch's WAL buffer first, then fall through to the shared content-addressed tree.", "done": false},
+        {"id": "C6", "text": "Fork operates per-shard: each shard's tree gets an independent fork-point and branch WAL buffer (CN5).", "done": false}
+      ]
+    },
+    {
+      "name": "Three-Way Merge",
+      "items": [
+        {"id": "C7", "text": "merge() takes two diverged root hashes and their common ancestor and produces a merged tree.", "done": false},
+        {"id": "C8", "text": "Merge skips subtrees where all three hashes (ancestor, parent, branch) are identical (CN2).", "done": false},
+        {"id": "C9", "text": "Clean merges (only one side changed relative to ancestor) are applied automatically without invoking conflict resolution.", "done": false},
+        {"id": "C10", "text": "True conflicts (both sides changed the same key relative to ancestor) are routed to the conflict resolution policy.", "done": false},
+        {"id": "C11", "text": "Merge produces its output as a single batch commit to the tree — one path-to-root rewrite, not per-entry rewrites.", "done": false},
+        {"id": "C12", "text": "Merge operates per-shard: each shard's tree is merged independently (CN5).", "done": false}
+      ]
+    },
+    {
+      "name": "Conflict Resolution",
+      "items": [
+        {"id": "C13", "text": "LWW policy resolves conflicts by taking the branch value over the parent value.", "done": false},
+        {"id": "C14", "text": "Vector-clock policy tracks per-key version vectors and distinguishes true conflicts (concurrent) from dominated updates (one causally after the other).", "done": false},
+        {"id": "C15", "text": "True conflicts under vector-clock policy are surfaced to the caller as unresolved — they are not silently dropped (CN3).", "done": false},
+        {"id": "C16", "text": "Custom merge function receives (key, ancestor_value, parent_value, branch_value) and returns the resolved value.", "done": false},
+        {"id": "C17", "text": "Conflict resolution policy is specified at merge time, not at fork time.", "done": false}
+      ]
+    },
+    {
+      "name": "Snapshots and Time-Travel",
+      "items": [
+        {"id": "C18", "text": "Snapshot registry maintains a mapping from human-readable names to root hashes.", "done": false},
+        {"id": "C19", "text": "Snapshot registry maintains a commit log of all root hashes in commit order.", "done": false},
+        {"id": "C20", "text": "snapshot(name) records the current committed root hash under the given name.", "done": false},
+        {"id": "C21", "text": "checkout(root_hash) opens a read-only view at the specified root hash without WAL replay (CN6).", "done": false},
+        {"id": "C22", "text": "Read-only checkout view supports get and range operations but rejects put/delete/commit.", "done": false},
+        {"id": "C23", "text": "Snapshot listing returns all named snapshots with their root hashes and commit timestamps.", "done": false}
+      ]
+    },
+    {
+      "name": "Snapshot Pruning",
+      "items": [
+        {"id": "C24", "text": "prune(name) removes a named snapshot from the registry.", "done": false},
+        {"id": "C25", "text": "Pruning walks the node store's reference graph to identify nodes no longer referenced by any active branch or named snapshot.", "done": false},
+        {"id": "C26", "text": "Pruning never deletes nodes referenced by an active branch or named snapshot (CN4).", "done": false},
+        {"id": "C27", "text": "Pruning reports the number of nodes and bytes reclaimed.", "done": false}
+      ]
+    }
+  ]
+}

@@ -1,0 +1,197 @@
+{
+  "id": "BRANCH-001",
+  "cluster": "branching",
+  "title": "Branch handle type and fork operation",
+  "depends_on": [
+    "CORE-001",
+    "CORE-002",
+    "CORE-005"
+  ],
+  "blocked_by": [],
+  "checklist": [
+    "C1",
+    "C2",
+    "C3",
+    "C4",
+    "C5",
+    "C6"
+  ],
+  "stories": [
+    "S1",
+    "S5",
+    "S6",
+    "S15",
+    "S16"
+  ],
+  "design_anchor": [
+    "ADR-001"
+  ],
+  "purpose": "Deliver the BranchHandle type and the fork operation that creates it. A fork records the current root hash as the fork-point and allocates empty per-shard WAL buffers, sharing the parent's content-addressed tree nodes. This is the foundation for all branching operations \u2014 merge, time-travel, and pruning all build on the handle this brief creates.",
+  "task": "Define the BranchHandle type holding fork-point root hash, current root hash, and per-shard WAL buffer references. Implement fork() that records the current root hash and allocates empty WAL buffers without copying any tree nodes. Fork operates per-shard: each shard gets its own fork-point and branch buffer. Branch reads check the branch WAL buffer first, then the shared tree. This brief builds the fork primitive only \u2014 merge is BRANCH-002, snapshots are BRANCH-003.",
+  "requirements": [
+    {
+      "id": "R1",
+      "title": "Branch module structure",
+      "spec": "Create the branch module with mod.rs containing only pub mod declarations and pub use re-exports. Create handle.rs and fork.rs as sub-modules.",
+      "acceptance": [
+        "crates/haematite/src/branch/mod.rs exists with only pub mod and pub use statements",
+        "crates/haematite/src/branch/handle.rs exists",
+        "crates/haematite/src/branch/fork.rs exists",
+        "cargo check -p haematite succeeds"
+      ],
+      "files": {
+        "create": [
+          "crates/haematite/src/branch/mod.rs",
+          "crates/haematite/src/branch/handle.rs",
+          "crates/haematite/src/branch/fork.rs"
+        ],
+        "modify": [
+          "crates/haematite/src/lib.rs"
+        ],
+        "delete": []
+      },
+      "checklist": [],
+      "stories": []
+    },
+    {
+      "id": "R2",
+      "title": "BranchHandle type",
+      "spec": "THE SYSTEM SHALL define a BranchHandle type that holds: the fork-point root hash (the common ancestor), the current root hash (initially equal to fork-point), and per-shard WAL buffer references for the branch's own writes. THE SYSTEM SHALL implement Debug and Clone for BranchHandle. THE SYSTEM SHALL NOT store copies of tree nodes \u2014 the handle references the shared content-addressed store.",
+      "acceptance": [
+        "BranchHandle has a fork_point() method returning the fork-point root hash",
+        "BranchHandle has a current_root() method returning the current root hash",
+        "BranchHandle has a shard_buffer(shard_id) method returning a reference to the branch's WAL buffer for that shard",
+        "On creation, current_root() equals fork_point()",
+        "BranchHandle implements Debug and Clone"
+      ],
+      "files": {
+        "create": [],
+        "modify": [
+          "crates/haematite/src/branch/handle.rs"
+        ],
+        "delete": []
+      },
+      "checklist": [
+        "C1"
+      ],
+      "stories": [
+        "S1"
+      ]
+    },
+    {
+      "id": "R3",
+      "title": "Fork operation",
+      "spec": "WHEN fork() is called on a database or shard, THE SYSTEM SHALL record the current committed root hash as the fork-point and allocate empty per-shard WAL buffers for the branch. THE SYSTEM SHALL complete in O(1) time regardless of database size \u2014 no tree node copying. THE SYSTEM SHALL return a BranchHandle.",
+      "acceptance": [
+        "fork() returns a BranchHandle with fork_point equal to the current committed root hash",
+        "fork() allocates one empty WAL buffer per shard",
+        "fork() does not read or copy any tree nodes",
+        "fork() on a database with 1 million entries completes in constant time (no O(n) work)"
+      ],
+      "files": {
+        "create": [],
+        "modify": [
+          "crates/haematite/src/branch/fork.rs"
+        ],
+        "delete": []
+      },
+      "checklist": [
+        "C2",
+        "C3"
+      ],
+      "stories": [
+        "S1",
+        "S15"
+      ]
+    },
+    {
+      "id": "R4",
+      "title": "Independent branch read-write",
+      "spec": "WHILE a branch exists, THE SYSTEM SHALL allow reads and writes to the branch without affecting the parent. Writes append to the branch's per-shard WAL buffers. Reads check the branch WAL buffer first and fall through to the shared tree if the key is not in the buffer. THE SYSTEM SHALL NOT propagate branch mutations to the parent's WAL buffer or tree.",
+      "acceptance": [
+        "A put on the branch does not appear in a get on the parent",
+        "A put on the parent after fork does not appear in a get on the branch",
+        "A get on the branch returns the branch buffer value for keys written after fork",
+        "A get on the branch returns the parent tree value for keys not written after fork"
+      ],
+      "files": {
+        "create": [],
+        "modify": [
+          "crates/haematite/src/branch/handle.rs"
+        ],
+        "delete": []
+      },
+      "checklist": [
+        "C4",
+        "C5"
+      ],
+      "stories": [
+        "S5",
+        "S6",
+        "S16"
+      ]
+    },
+    {
+      "id": "R5",
+      "title": "Per-shard fork independence",
+      "spec": "THE SYSTEM SHALL fork each shard independently: each shard gets its own fork-point root hash and its own branch WAL buffer. THE SYSTEM SHALL NOT create cross-shard coordination during fork. THE SYSTEM SHALL coordinate per-shard forks through the BranchHandle so callers interact with the branch as a single logical database.",
+      "acceptance": [
+        "Each shard in the branch has an independent fork-point root hash",
+        "Each shard in the branch has an independent WAL buffer",
+        "A write to shard 3 on the branch does not affect shard 5 on the branch",
+        "BranchHandle routes gets/puts to the correct shard's branch buffer"
+      ],
+      "files": {
+        "create": [],
+        "modify": [
+          "crates/haematite/src/branch/fork.rs",
+          "crates/haematite/src/branch/handle.rs"
+        ],
+        "delete": []
+      },
+      "checklist": [
+        "C6"
+      ],
+      "stories": [
+        "S15"
+      ]
+    },
+    {
+      "id": "R6",
+      "title": "BranchRegistry for tracking active branch roots",
+      "spec": "Define a BranchRegistry type that maintains a HashSet of active branch root hashes. WHEN a BranchHandle is created via fork(), THE SYSTEM SHALL register its root hash in the registry. WHEN a BranchHandle is dropped, THE SYSTEM SHALL deregister its root hash. THE SYSTEM SHALL expose a live_roots() method returning the set of all active branch root hashes for use by the pruner (BRANCH-004).",
+      "acceptance": [
+        "BranchRegistry::new() creates an empty registry",
+        "Forking a database registers the branch root in the registry",
+        "Dropping a BranchHandle deregisters its root",
+        "live_roots() returns all currently active branch root hashes",
+        "BranchRegistry is thread-safe (Arc<Mutex<HashSet<Hash>>> or equivalent)"
+      ],
+      "files": {
+        "create": [
+          "crates/haematite/src/branch/registry.rs"
+        ],
+        "modify": [
+          "crates/haematite/src/branch/mod.rs"
+        ],
+        "delete": []
+      },
+      "checklist": [],
+      "stories": []
+    }
+  ],
+  "boundaries": [
+    "SHALL NOT implement merge or conflict resolution \u2014 those are BRANCH-002",
+    "SHALL NOT implement snapshot registry or time-travel \u2014 those are BRANCH-003",
+    "SHALL NOT implement snapshot pruning \u2014 that is BRANCH-004",
+    "SHALL NOT copy tree nodes during fork \u2014 fork is O(1) via shared content-addressed store",
+    "SHALL NOT implement branch commit (flushing branch WAL to tree) \u2014 that is part of merge in BRANCH-002"
+  ],
+  "verification": [
+    "cargo check -p haematite succeeds with no errors",
+    "cargo test -p haematite --lib passes all tests",
+    "cargo clippy -p haematite produces no errors",
+    "grep -r 'unwrap()\\|expect(' crates/haematite/src/branch/ --include='*.rs' -l finds no non-test files",
+    "No file in crates/haematite/src/branch/ exceeds 500 lines"
+  ]
+}

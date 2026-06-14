@@ -1,0 +1,287 @@
+{
+  "repo_root": "/Users/tom/Developer/ablative/haematite",
+  "brief_id": "API-003",
+  "reviewers": [
+    "Danger Mouse"
+  ],
+  "base_ref": "main",
+  "placement": "local",
+  "isolation": "worktree",
+  "brief_document": {
+    "id": "API-003",
+    "cluster": "api",
+    "title": "TTL expiry with per-shard sweep actors",
+    "depends_on": [
+      "API-001",
+      "API-002"
+    ],
+    "blocked_by": [],
+    "checklist": [
+      "C18",
+      "C19",
+      "C20",
+      "C21",
+      "C22",
+      "C23",
+      "C24"
+    ],
+    "stories": [
+      "S6",
+      "S9",
+      "S14",
+      "S15",
+      "S16"
+    ],
+    "design_anchor": [
+      "ADR-004"
+    ],
+    "purpose": "Deliver per-key TTL expiry with read-time filtering and per-shard sweep actors. Expired entries are invisible at read time regardless of sweep state. The sweep actor is a supervised beamr process that physically removes expired entries without blocking the shard actor's write path. Maps to Aion's HistoryCompacted lifecycle.",
+    "task": "Add an optional TTL parameter to put and append. Store expiry timestamps alongside values in the tree. Implement read-time expiry filtering on get/read/read_from/range/scan \u2014 expired entries return None/empty even before sweep removes them. Implement a per-shard sweep actor as a supervised beamr process that periodically scans for and deletes expired entries. Configurable sweep interval. Expired workflow histories return HistoryCompacted-equivalent error.",
+    "requirements": [
+      {
+        "id": "R1",
+        "title": "TTL entry metadata",
+        "spec": "THE SYSTEM SHALL store an optional expiry timestamp alongside each value in the tree. WHEN put or append is called with a TTL parameter, THE SYSTEM SHALL compute the expiry timestamp as now + TTL and store it with the entry. THE SYSTEM SHALL store entries without TTL as never-expiring.",
+        "acceptance": [
+          "put(key, value, ttl=60s) stores the value with an expiry timestamp 60 seconds from now",
+          "put(key, value) with no TTL stores the value as never-expiring",
+          "append(key, events, expected_seq, ttl=3600s) stores events with expiry",
+          "The expiry timestamp is persisted alongside the value in the tree"
+        ],
+        "files": {
+          "create": [
+            "crates/haematite/src/ttl/mod.rs",
+            "crates/haematite/src/ttl/entry.rs"
+          ],
+          "modify": [
+            "crates/haematite/src/lib.rs"
+          ],
+          "delete": []
+        },
+        "checklist": [
+          "C18",
+          "C19"
+        ],
+        "stories": [
+          "S9",
+          "S14"
+        ]
+      },
+      {
+        "id": "R2",
+        "title": "Read-time expiry filtering",
+        "spec": "WHEN get, read, read_from, range, or scan encounters an entry with an expiry timestamp in the past, THE SYSTEM SHALL exclude it from the result. THE SYSTEM SHALL filter expired entries regardless of whether the sweep actor has physically removed them. THE SYSTEM SHALL NOT return expired entries under any circumstances.",
+        "acceptance": [
+          "get on an expired key returns None",
+          "read on a stream with some expired events returns only non-expired events",
+          "range excludes expired entries from results",
+          "scan excludes expired entries from results",
+          "An entry written with TTL=1s returns correctly at t=0 and returns None at t=2s"
+        ],
+        "files": {
+          "create": [
+            "crates/haematite/src/ttl/filter.rs"
+          ],
+          "modify": [
+            "crates/haematite/src/api/kv.rs",
+            "crates/haematite/src/api/event_store.rs"
+          ],
+          "delete": []
+        },
+        "checklist": [
+          "C20"
+        ],
+        "stories": [
+          "S9"
+        ]
+      },
+      {
+        "id": "R3",
+        "title": "Per-shard sweep actor",
+        "spec": "THE SYSTEM SHALL spawn a per-shard sweep actor as a supervised beamr process. THE SYSTEM SHALL have the sweep actor periodically scan its shard's tree for entries with expired TTL and delete them. THE SYSTEM SHALL NOT block the shard actor's write path during sweep. THE SYSTEM SHALL run the sweep actor on the normal beamr scheduler, subject to preemptive scheduling.",
+        "acceptance": [
+          "Each shard has a corresponding sweep actor process",
+          "The sweep actor is supervised \u2014 a crash restarts it",
+          "The sweep actor scans and deletes expired entries",
+          "Writes to the shard actor are not blocked during sweep",
+          "The sweep actor runs on the normal scheduler, not a dedicated thread"
+        ],
+        "files": {
+          "create": [
+            "crates/haematite/src/ttl/sweep.rs"
+          ],
+          "modify": [],
+          "delete": []
+        },
+        "checklist": [
+          "C21",
+          "C22"
+        ],
+        "stories": [
+          "S15",
+          "S16"
+        ]
+      },
+      {
+        "id": "R4",
+        "title": "Configurable sweep interval",
+        "spec": "THE SYSTEM SHALL accept a sweep interval configuration per-database. THE SYSTEM SHALL default to no implicit interval \u2014 the interval must be explicitly configured (P6 from core: no silent defaults).",
+        "acceptance": [
+          "Database configuration includes a sweep_interval field",
+          "Creating a database without specifying sweep_interval is an error if TTL is used",
+          "The sweep actor fires at the configured interval"
+        ],
+        "files": {
+          "create": [],
+          "modify": [
+            "crates/haematite/src/ttl/sweep.rs"
+          ],
+          "delete": []
+        },
+        "checklist": [
+          "C23"
+        ],
+        "stories": [
+          "S15"
+        ]
+      },
+      {
+        "id": "R5",
+        "title": "HistoryCompacted error for expired workflow history",
+        "spec": "WHEN read or read_from is called on a workflow key whose entire history has expired, THE SYSTEM SHALL return a HistoryCompacted error. THE SYSTEM SHALL NOT return an empty result \u2014 the caller must be able to distinguish a compacted workflow from a non-existent one.",
+        "acceptance": [
+          "read on a workflow whose entire history expired returns HistoryCompacted error",
+          "read on a non-existent key returns empty (not HistoryCompacted)",
+          "read on a workflow with some expired and some live events returns only live events (not HistoryCompacted)",
+          "HistoryCompacted implements std::error::Error and Debug"
+        ],
+        "files": {
+          "create": [],
+          "modify": [
+            "crates/haematite/src/api/error.rs",
+            "crates/haematite/src/api/event_store.rs"
+          ],
+          "delete": []
+        },
+        "checklist": [
+          "C24"
+        ],
+        "stories": [
+          "S6"
+        ]
+      }
+    ],
+    "boundaries": [
+      "SHALL NOT implement EventStore operations \u2014 those are API-001",
+      "SHALL NOT implement general KV operations \u2014 those are API-002",
+      "SHALL NOT implement automatic TTL for all entries \u2014 TTL is opt-in per write",
+      "SHALL NOT implement sweep scheduling beyond a configurable interval \u2014 cron-like scheduling is application-level"
+    ],
+    "verification": [
+      "cargo check -p haematite succeeds with no errors",
+      "cargo test -p haematite --lib passes all tests",
+      "cargo clippy -p haematite produces no errors",
+      "grep -r 'unwrap()\\|expect(' crates/haematite/src/ttl/ --include='*.rs' -l finds no non-test files",
+      "No file in crates/haematite/src/ttl/ exceeds 500 lines"
+    ]
+  },
+  "resolved_context": {
+    "adrs": [
+      {
+        "id": "ADR-004",
+        "title": "Actor-per-shard with fixed shard count at creation",
+        "decision": "Actor-per-shard on beamr with fixed shard count at creation, over single-writer and lock-per-shard, because the actor model eliminates locks entirely \u2014 each shard is a single-writer beamr process with no shared mutable state. Fixed shard count over dynamic resharding because resharding is operationally complex and can be deferred: 256 or 1024 shards covers any reasonable single-node deployment for Aion's workload (one key per workflow_id).",
+        "quote": "",
+        "decided_by": "Bono, Frodo Baggins"
+      }
+    ],
+    "checklist": [
+      {
+        "id": "C18",
+        "text": "put and append accept an optional TTL parameter that sets the expiry timestamp for the entry."
+      },
+      {
+        "id": "C19",
+        "text": "TTL is stored alongside the value in the tree as expiry metadata."
+      },
+      {
+        "id": "C20",
+        "text": "get, read, read_from, range, and scan filter expired entries at read time \u2014 expired entries are never returned (CN3)."
+      },
+      {
+        "id": "C21",
+        "text": "Per-shard sweep actor periodically scans for and deletes expired entries."
+      },
+      {
+        "id": "C22",
+        "text": "Sweep actor is a supervised beamr process that does not block the shard actor's write path (CN4)."
+      },
+      {
+        "id": "C23",
+        "text": "Sweep interval is configurable per-database."
+      },
+      {
+        "id": "C24",
+        "text": "Expired workflow history returns a HistoryCompacted-equivalent error on subsequent reads."
+      }
+    ],
+    "stories": [
+      {
+        "id": "S6",
+        "text": "As the Aion engine, I want expired workflow histories to return a HistoryCompacted error so that I can distinguish compacted workflows from missing ones."
+      },
+      {
+        "id": "S9",
+        "text": "As the messaging bus, I want to set a TTL on consumer cursors so that abandoned cursors are automatically cleaned up without application-level sweep logic."
+      },
+      {
+        "id": "S14",
+        "text": "As an application developer, I want to set TTL at write time so that I do not need to build my own expiry system."
+      },
+      {
+        "id": "S15",
+        "text": "As an operations engineer, I want to configure the sweep interval per-database so that I can balance cleanup frequency against scan cost."
+      },
+      {
+        "id": "S16",
+        "text": "As an operations engineer, I want the sweep actor to be independently supervised so that a sweep crash does not affect the shard actor's write availability."
+      }
+    ],
+    "constraints": [
+      {
+        "id": "CN1",
+        "text": "append with expected_seq must be atomic: the sequence check and the append happen within the shard actor's message handler with no interleaving."
+      },
+      {
+        "id": "CN2",
+        "text": "Batch append of N events must produce exactly one tree commit, not N individual commits."
+      },
+      {
+        "id": "CN3",
+        "text": "Expired entries must never be returned by get, read, read_from, range, or scan \u2014 regardless of sweep actor state."
+      },
+      {
+        "id": "CN4",
+        "text": "The sweep actor must not block the shard actor's write path. Sweep runs as a separate supervised process."
+      },
+      {
+        "id": "CN5",
+        "text": "scan traverses all shards. The caller must understand this is O(total entries across all shards), not O(entries in one shard)."
+      },
+      {
+        "id": "CN6",
+        "text": "cas is atomic within a shard but provides no cross-shard guarantees."
+      }
+    ],
+    "intention": "The API cluster is the contract between haematite and every application that embeds it. When this cluster is complete, Aion can use haematite as its EventStore backend with append/read/read_from/scan/cas operations, the messaging bus can use general KV operations for durable channel state, and both get built-in TTL expiry without application-level sweep logic. The API should feel like a thin, honest surface \u2014 every operation maps directly to the underlying shard actor, nothing is hidden behind clever abstractions, and the cost model is transparent. A caller who understands the shard model should be able to predict the performance of any API call.",
+    "design_path": "docs/design/api",
+    "provenance": {
+      "requested_by": "Tom",
+      "quote": "The API cluster is the contract between haematite and every application that embeds it. When this cluster is complete, Aion can use haematite as its EventStore backend with append/read/read_from/scan/"
+    }
+  },
+  "verify_fix_cap": 3,
+  "review_cap": 1,
+  "round_backoff_ms": 2000,
+  "review_deadline_ms": 300000
+}

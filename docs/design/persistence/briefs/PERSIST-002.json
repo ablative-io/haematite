@@ -1,0 +1,117 @@
+{
+  "id": "PERSIST-002",
+  "cluster": "persistence",
+  "title": "Durable WAL writer with CRC32 checksums and fsync policy",
+  "depends_on": ["CORE-005"],
+  "blocked_by": [],
+  "checklist": ["C9", "C10", "C11", "C12", "C13", "C14"],
+  "stories": ["S3", "S4"],
+  "design_anchor": ["ADR-003"],
+  "purpose": "Deliver the durable WAL writer that backs each shard actor's WAL buffer with an append-only file on disk. Mutations are written to disk before acknowledgment. CRC32 checksums enable corruption detection during recovery. Configurable fsync policy lets callers trade latency for durability.",
+  "task": "Implement the durable WAL writer backed by an append-only file. Define the WAL entry format (operation type, key, value, CRC32 checksum). Mutations are written to the durable WAL before the shard actor acknowledges. Implement configurable fsync policy: per-write, every N writes, or commit-only. On commit, truncate the WAL with a truncation marker recording the committed root hash. Truncation must be atomic. Does not implement crash recovery replay (PERSIST-003).",
+  "requirements": [
+    {
+      "id": "R1",
+      "title": "WAL entry format",
+      "spec": "THE SYSTEM SHALL define a WAL entry format containing: operation type (Put or Delete), key bytes, value bytes (empty for Delete), and a CRC32 checksum of the preceding fields. THE SYSTEM SHALL use a length-prefixed binary format for deterministic serialisation.",
+      "acceptance": [
+        "WalEntry::Put has operation_type, key, value, and crc32 fields",
+        "WalEntry::Delete has operation_type, key, and crc32 fields",
+        "The CRC32 covers operation_type + key + value",
+        "Serialising and deserialising a WalEntry round-trips correctly",
+        "WalEntry implements Debug"
+      ],
+      "files": {
+        "create": ["crates/haematite/src/wal/entry.rs"],
+        "modify": ["crates/haematite/src/wal/mod.rs"],
+        "delete": []
+      },
+      "checklist": ["C10"],
+      "stories": []
+    },
+    {
+      "id": "R2",
+      "title": "Append-only WAL file",
+      "spec": "THE SYSTEM SHALL back each shard actor's WAL buffer with an append-only file. WHEN a mutation is appended to the buffer, THE SYSTEM SHALL write the corresponding WalEntry to the file. THE SYSTEM SHALL NOT overwrite existing entries — the file is append-only.",
+      "acceptance": [
+        "DurableWal::new(path) opens or creates the WAL file",
+        "DurableWal::append(entry) writes the entry to the end of the file",
+        "Multiple appends produce sequential entries in the file",
+        "The file grows monotonically"
+      ],
+      "files": {
+        "create": [],
+        "modify": ["crates/haematite/src/wal/durable.rs"],
+        "delete": []
+      },
+      "checklist": ["C9"],
+      "stories": ["S4"]
+    },
+    {
+      "id": "R3",
+      "title": "Write-before-acknowledge",
+      "spec": "THE SYSTEM SHALL write the WAL entry to the durable file before the shard actor acknowledges the mutation to the caller. THE SYSTEM SHALL NOT acknowledge a write until the WAL entry is on disk.",
+      "acceptance": [
+        "A put that crashes after WAL write but before tree commit can be recovered",
+        "The shard actor does not return Ok until the WAL entry is written",
+        "The WAL file contains the entry even if the process is killed immediately after acknowledgment"
+      ],
+      "files": {
+        "create": [],
+        "modify": ["crates/haematite/src/wal/durable.rs"],
+        "delete": []
+      },
+      "checklist": ["C11"],
+      "stories": ["S4"]
+    },
+    {
+      "id": "R4",
+      "title": "Configurable fsync policy",
+      "spec": "THE SYSTEM SHALL accept a fsync policy on construction: PerWrite (fsync after every write), Batched(n) (fsync every n writes), or CommitOnly (fsync only on commit). THE SYSTEM SHALL NOT have a default policy — the caller must choose explicitly.",
+      "acceptance": [
+        "FsyncPolicy::PerWrite fsyncs after every append",
+        "FsyncPolicy::Batched(5) fsyncs after every 5th append",
+        "FsyncPolicy::CommitOnly fsyncs only when commit is called",
+        "Creating a DurableWal without a policy is a compilation error"
+      ],
+      "files": {
+        "create": [],
+        "modify": ["crates/haematite/src/wal/durable.rs"],
+        "delete": []
+      },
+      "checklist": ["C12"],
+      "stories": ["S3"]
+    },
+    {
+      "id": "R5",
+      "title": "WAL truncation on commit",
+      "spec": "WHEN the WAL buffer is committed (flushed to tree), THE SYSTEM SHALL truncate the WAL file and write a truncation marker containing the committed root hash. THE SYSTEM SHALL make truncation atomic: the marker and root hash are written together so that a crash during truncation does not lose the commit reference.",
+      "acceptance": [
+        "After commit, the WAL file contains only the truncation marker",
+        "The truncation marker contains the committed root hash",
+        "A crash during truncation leaves either the old WAL (recoverable) or the new marker (committed)",
+        "Reading the WAL file after truncation yields zero replay entries and the committed root hash"
+      ],
+      "files": {
+        "create": [],
+        "modify": ["crates/haematite/src/wal/durable.rs"],
+        "delete": []
+      },
+      "checklist": ["C13", "C14"],
+      "stories": []
+    }
+  ],
+  "boundaries": [
+    "SHALL NOT implement crash recovery replay — that is PERSIST-003",
+    "SHALL NOT implement the disk node store — that is PERSIST-001",
+    "SHALL NOT implement WAL archival or WAL shipping",
+    "SHALL NOT implement a default fsync policy — the caller must choose explicitly"
+  ],
+  "verification": [
+    "cargo check -p haematite succeeds with no errors",
+    "cargo test -p haematite --lib passes all tests",
+    "cargo clippy -p haematite produces no errors",
+    "grep -r 'unwrap()\\|expect(' crates/haematite/src/wal/ --include='*.rs' -l finds no non-test files (excluding buffer.rs from CORE-005)",
+    "No file in crates/haematite/src/wal/ exceeds 500 lines"
+  ]
+}

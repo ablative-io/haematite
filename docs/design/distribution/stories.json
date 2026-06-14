@@ -1,0 +1,41 @@
+{
+  "cluster": "distribution",
+  "personas": [
+    {
+      "name": "Operations Engineer",
+      "role": "Managing a multi-node haematite deployment",
+      "stories": [
+        {"id": "S1", "text": "As an operations engineer, I want to add a new node to the cluster and have it sync automatically so that scaling out does not require manual data migration."},
+        {"id": "S2", "text": "As an operations engineer, I want to choose a sync topology (full-mesh, ring, custom) so that I can balance sync traffic against convergence speed."},
+        {"id": "S3", "text": "As an operations engineer, I want to configure the sync interval so that I can trade freshness against network bandwidth."},
+        {"id": "S4", "text": "As an operations engineer, I want a failed sync to be retryable without risk of data corruption so that network glitches do not require manual intervention."}
+      ]
+    },
+    {
+      "name": "Aion Engine",
+      "role": "Running workflows across multiple nodes for availability",
+      "stories": [
+        {"id": "S5", "text": "As the Aion engine, I want workflow event histories to be replicated across nodes so that a node failure does not lose workflow state."},
+        {"id": "S6", "text": "As the Aion engine, I want to request strong consistency for critical writes so that quorum acknowledgment guarantees the event survives any single node failure."},
+        {"id": "S7", "text": "As the Aion engine, I want eventual consistency for non-critical reads so that read latency is not penalised by sync round-trips."}
+      ]
+    },
+    {
+      "name": "Application Developer",
+      "role": "Building applications on distributed haematite",
+      "stories": [
+        {"id": "S8", "text": "As an application developer, I want to read from any node and get eventually-consistent data so that I can distribute reads across the cluster for throughput."},
+        {"id": "S9", "text": "As an application developer, I want divergent writes to be merged automatically so that I do not need to implement my own conflict resolution for multi-writer scenarios."},
+        {"id": "S10", "text": "As an application developer, I want to choose the conflict resolution policy per-operation so that different data types can use different merge strategies."}
+      ]
+    },
+    {
+      "name": "Debugging Developer",
+      "role": "Diagnosing sync and replication issues",
+      "stories": [
+        {"id": "S11", "text": "As a debugging developer, I want to compare root hashes between two nodes for a specific shard so that I can verify whether they are in sync."},
+        {"id": "S12", "text": "As a debugging developer, I want sync operations to report how many nodes were transferred so that I can understand the magnitude of divergence."}
+      ]
+    }
+  ]
+}

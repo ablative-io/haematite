@@ -1,0 +1,33 @@
+{
+  "cluster": "persistence",
+  "personas": [
+    {
+      "name": "Application Developer",
+      "role": "Expecting durable storage from haematite",
+      "stories": [
+        {"id": "S1", "text": "As an application developer, I want committed data to survive a process crash so that I do not need to implement my own durability layer."},
+        {"id": "S2", "text": "As an application developer, I want the database to recover automatically on restart so that I do not need to write recovery logic or run repair tools."},
+        {"id": "S3", "text": "As an application developer, I want to choose the fsync policy (per-write, batched, commit-only) so that I can trade latency for durability based on my workload."}
+      ]
+    },
+    {
+      "name": "Aion Engine",
+      "role": "Relying on haematite for workflow event durability",
+      "stories": [
+        {"id": "S4", "text": "As the Aion engine, I want acknowledged event appends to be durable so that a workflow crash does not lose events the recorder believes are persisted."},
+        {"id": "S5", "text": "As the Aion engine, I want crash recovery to replay uncommitted WAL entries so that events appended but not yet tree-committed are not lost."},
+        {"id": "S6", "text": "As the Aion engine, I want each shard to recover independently so that a slow-recovering shard does not block workflows on other shards."}
+      ]
+    },
+    {
+      "name": "Operations Engineer",
+      "role": "Managing haematite storage and recovery",
+      "stories": [
+        {"id": "S7", "text": "As an operations engineer, I want corrupted WAL entries to be detected and skipped during recovery so that a partial disk failure does not prevent the database from starting."},
+        {"id": "S8", "text": "As an operations engineer, I want the disk node store to handle millions of nodes without filesystem performance degradation so that I do not need to tune directory structures."},
+        {"id": "S9", "text": "As an operations engineer, I want the LRU cache size to be configurable so that I can tune memory usage based on available RAM and access patterns."},
+        {"id": "S10", "text": "As an operations engineer, I want recovery to log what it replayed so that I can audit what happened during an unclean shutdown."}
+      ]
+    }
+  ]
+}

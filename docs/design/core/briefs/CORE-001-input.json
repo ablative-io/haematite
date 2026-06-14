@@ -1,0 +1,362 @@
+{
+  "repo_root": "/Users/tom/Developer/ablative/haematite",
+  "brief_id": "CORE-001",
+  "reviewers": [
+    "Danger Mouse"
+  ],
+  "base_ref": "main",
+  "placement": "local",
+  "isolation": "worktree",
+  "brief_document": {
+    "id": "CORE-001",
+    "cluster": "core",
+    "title": "Crate scaffold, prolly tree node types, and in-memory node store",
+    "depends_on": [],
+    "blocked_by": [],
+    "checklist": [
+      "C1",
+      "C2",
+      "C3",
+      "C4",
+      "C5",
+      "C6",
+      "C7",
+      "C8",
+      "C9",
+      "C10"
+    ],
+    "stories": [
+      "S1"
+    ],
+    "design_anchor": [
+      "ADR-001",
+      "ADR-002"
+    ],
+    "purpose": "Establish the haematite crate with the foundational prolly tree data structures. This brief delivers the node types (leaf and internal), deterministic serialisation, BLAKE3 content hashing, rolling hash boundary detection, the NodeStore trait, and an in-memory store for testing. Everything else in the core cluster builds on these types.",
+    "task": "Create the haematite crate with Cargo.toml (blake3, zstd, beamr dependencies). Define LeafNode and InternalNode types with deterministic serialisation and BLAKE3 hashing. Implement rolling hash boundary detection with configurable target node size. Define the NodeStore trait and implement MemoryStore as an in-memory HashMap<Hash, Node>. The lib.rs re-exports public API types. This brief builds the representation layer only \u2014 tree traversal and mutation operations are CORE-002.",
+    "requirements": [
+      {
+        "id": "R1",
+        "title": "Crate manifest and module structure",
+        "spec": "Create the haematite crate with Cargo.toml listing blake3, zstd, and beamr as dependencies. Create lib.rs with public API re-exports. Create tree/mod.rs and store/mod.rs as module roots containing only pub mod declarations and pub use re-exports.",
+        "acceptance": [
+          "crates/haematite/Cargo.toml exists with blake3, zstd, beamr in [dependencies]",
+          "crates/haematite/src/lib.rs compiles and re-exports tree and store modules",
+          "tree/mod.rs contains only pub mod and pub use \u2014 no logic",
+          "store/mod.rs contains only pub mod and pub use \u2014 no logic",
+          "cargo check -p haematite succeeds"
+        ],
+        "files": {
+          "create": [
+            "crates/haematite/Cargo.toml",
+            "crates/haematite/src/lib.rs",
+            "crates/haematite/src/tree/mod.rs",
+            "crates/haematite/src/store/mod.rs"
+          ],
+          "modify": [],
+          "delete": []
+        },
+        "checklist": [
+          "C1",
+          "C2"
+        ],
+        "stories": [
+          "S1"
+        ]
+      },
+      {
+        "id": "R2",
+        "title": "LeafNode type with sorted key-value pairs",
+        "spec": "THE SYSTEM SHALL define a LeafNode type that holds a sorted Vec of (key, value) pairs where keys are byte vectors and values are byte vectors. THE SYSTEM SHALL enforce sort order on construction \u2014 constructing a LeafNode with unsorted keys is an error. THE SYSTEM SHALL NOT allow duplicate keys within a single LeafNode.",
+        "acceptance": [
+          "LeafNode::new(entries) returns Ok when entries are sorted by key",
+          "LeafNode::new(entries) returns Err when entries are unsorted",
+          "LeafNode::new(entries) returns Err when entries contain duplicate keys",
+          "LeafNode::entries() returns the pairs in sorted key order",
+          "LeafNode implements Debug"
+        ],
+        "files": {
+          "create": [
+            "crates/haematite/src/tree/node.rs"
+          ],
+          "modify": [],
+          "delete": []
+        },
+        "checklist": [
+          "C3"
+        ],
+        "stories": []
+      },
+      {
+        "id": "R3",
+        "title": "InternalNode type with sorted key-childHash pairs",
+        "spec": "THE SYSTEM SHALL define an InternalNode type that holds a sorted Vec of (key, child_hash) pairs where keys are byte vectors and child_hash values are 32-byte BLAKE3 hashes. THE SYSTEM SHALL enforce sort order on construction. THE SYSTEM SHALL NOT allow duplicate keys within a single InternalNode.",
+        "acceptance": [
+          "InternalNode::new(children) returns Ok when children are sorted by key",
+          "InternalNode::new(children) returns Err when children are unsorted",
+          "InternalNode::children() returns entries in sorted key order",
+          "Child hash values are [u8; 32]",
+          "InternalNode implements Debug"
+        ],
+        "files": {
+          "create": [],
+          "modify": [
+            "crates/haematite/src/tree/node.rs"
+          ],
+          "delete": []
+        },
+        "checklist": [
+          "C4"
+        ],
+        "stories": []
+      },
+      {
+        "id": "R4",
+        "title": "Deterministic node serialisation",
+        "spec": "THE SYSTEM SHALL serialise LeafNode and InternalNode to a canonical byte sequence that is deterministic: the same node contents always produce the same bytes. THE SYSTEM SHALL use a simple length-prefixed binary format (not serde/bincode) to guarantee byte-level determinism across Rust compiler versions. THE SYSTEM SHALL NOT depend on HashMap iteration order or any non-deterministic source.",
+        "acceptance": [
+          "Serialising the same LeafNode twice produces identical byte sequences",
+          "Serialising the same InternalNode twice produces identical byte sequences",
+          "Deserialising a serialised node produces an equal node (round-trip)",
+          "Serialisation format is length-prefixed, not relying on serde"
+        ],
+        "files": {
+          "create": [],
+          "modify": [
+            "crates/haematite/src/tree/node.rs"
+          ],
+          "delete": []
+        },
+        "checklist": [
+          "C5"
+        ],
+        "stories": []
+      },
+      {
+        "id": "R5",
+        "title": "BLAKE3 content hashing for nodes",
+        "spec": "WHEN a node is serialised, THE SYSTEM SHALL compute its BLAKE3 hash from the serialised byte sequence and return it as a 32-byte Hash type. THE SYSTEM SHALL define Hash as a newtype over [u8; 32] with Display (hex), Debug, Clone, Copy, PartialEq, Eq, Hash, and Ord. THE SYSTEM SHALL NOT use any input other than the serialised bytes to compute the hash \u2014 content is identity (P1).",
+        "acceptance": [
+          "Hash is a newtype over [u8; 32]",
+          "Hash implements Display as hex string",
+          "Hash implements Eq, Ord, std::hash::Hash for use as HashMap key",
+          "LeafNode::hash() returns the BLAKE3 hash of LeafNode::serialise()",
+          "InternalNode::hash() returns the BLAKE3 hash of InternalNode::serialise()",
+          "Two nodes with identical contents produce identical hashes",
+          "Two nodes with different contents produce different hashes"
+        ],
+        "files": {
+          "create": [],
+          "modify": [
+            "crates/haematite/src/tree/node.rs"
+          ],
+          "delete": []
+        },
+        "checklist": [
+          "C6"
+        ],
+        "stories": []
+      },
+      {
+        "id": "R6",
+        "title": "Rolling hash boundary detection",
+        "spec": "THE SYSTEM SHALL implement a rolling hash function over the key stream that determines node boundaries. WHEN the rolling hash of a key meets a configurable threshold, THE SYSTEM SHALL place a boundary (split point) at that key. THE SYSTEM SHALL parameterise the threshold by a target node size (default: 4KB). THE SYSTEM SHALL NOT use random or time-dependent inputs \u2014 boundary detection must be history-independent (CN5, C8).",
+        "acceptance": [
+          "BoundaryDetector::new(target_size) creates a detector with the given target",
+          "BoundaryDetector::is_boundary(key) returns true when the rolling hash meets the threshold",
+          "The same key sequence always produces the same boundary positions",
+          "Changing the target size changes where boundaries fall",
+          "A stream of 1000 random keys produces boundaries at roughly target_size intervals"
+        ],
+        "files": {
+          "create": [
+            "crates/haematite/src/tree/boundary.rs"
+          ],
+          "modify": [],
+          "delete": []
+        },
+        "checklist": [
+          "C7",
+          "C8"
+        ],
+        "stories": []
+      },
+      {
+        "id": "R7",
+        "title": "NodeStore trait and MemoryStore implementation",
+        "spec": "THE SYSTEM SHALL define a NodeStore trait with get(hash) -> Option<Node> and put(node) -> Hash methods. THE SYSTEM SHALL implement MemoryStore as a HashMap<Hash, serialised_bytes> that satisfies NodeStore. THE SYSTEM SHALL NOT require NodeStore implementations to handle compression \u2014 that is the DiskStore's concern (CORE-004).",
+        "acceptance": [
+          "NodeStore trait has get(&self, hash: &Hash) -> Option<Node>",
+          "NodeStore trait has put(&mut self, node: &Node) -> Hash",
+          "MemoryStore::put stores a node and returns its BLAKE3 hash",
+          "MemoryStore::get retrieves a node by its hash",
+          "MemoryStore::get returns None for unknown hashes",
+          "MemoryStore implements Debug"
+        ],
+        "files": {
+          "create": [
+            "crates/haematite/src/store/memory.rs"
+          ],
+          "modify": [
+            "crates/haematite/src/store/mod.rs"
+          ],
+          "delete": []
+        },
+        "checklist": [
+          "C9",
+          "C10"
+        ],
+        "stories": []
+      },
+      {
+        "id": "R8",
+        "title": "Node enum and public type exports",
+        "spec": "THE SYSTEM SHALL define a Node enum with Leaf(LeafNode) and Internal(InternalNode) variants. THE SYSTEM SHALL implement hash() and serialise()/deserialise() on the Node enum delegating to the inner type. THE SYSTEM SHALL export Hash, Node, LeafNode, InternalNode, NodeStore, MemoryStore, and BoundaryDetector from the crate root via lib.rs.",
+        "acceptance": [
+          "Node::Leaf(leaf) delegates hash() to LeafNode::hash()",
+          "Node::Internal(internal) delegates hash() to InternalNode::hash()",
+          "Node round-trips through serialise/deserialise",
+          "All public types are accessible from haematite::* in lib.rs"
+        ],
+        "files": {
+          "create": [],
+          "modify": [
+            "crates/haematite/src/tree/node.rs",
+            "crates/haematite/src/lib.rs"
+          ],
+          "delete": []
+        },
+        "checklist": [
+          "C2"
+        ],
+        "stories": [
+          "S1"
+        ]
+      }
+    ],
+    "boundaries": [
+      "SHALL NOT implement tree traversal or mutation \u2014 those are CORE-002",
+      "SHALL NOT implement disk storage or compression \u2014 that is CORE-004",
+      "SHALL NOT implement WAL buffer or durable writes \u2014 those are CORE-005",
+      "SHALL NOT use serde or bincode for node serialisation \u2014 determinism requires a controlled binary format",
+      "SHALL NOT implement branching, merging, or fork operations"
+    ],
+    "verification": [
+      "cargo check -p haematite succeeds with no errors",
+      "cargo test -p haematite --lib passes all tests",
+      "cargo clippy -p haematite produces no errors",
+      "grep -r 'unwrap()\\|expect(' crates/haematite/src/ --include='*.rs' -l finds no non-test files",
+      "No file in crates/haematite/src/ exceeds 500 lines"
+    ]
+  },
+  "resolved_context": {
+    "adrs": [
+      {
+        "id": "ADR-001",
+        "title": "Content-addressed prolly tree over B+ tree with WAL overlay",
+        "decision": "Content-addressed prolly tree over B+ tree with WAL overlay, because branching/merging/sync is the headline feature and must be structural (O(differences), history-independent) rather than overlaid (O(branch-writes), order-dependent). The rejected alternative (B+ tree + WAL overlay) makes branching an afterthought \u2014 functional but O(branch-writes) for merge and requiring WAL coordination for replication.",
+        "quote": "",
+        "decided_by": "Bono, Frodo Baggins, Sir Patick Stewart"
+      },
+      {
+        "id": "ADR-002",
+        "title": "BLAKE3 for content addressing",
+        "decision": "BLAKE3 over SHA-256 and BLAKE2b, because BLAKE3 is the fastest cryptographic hash available with SIMD acceleration, its 32-byte output is compact enough for node keys, and its tree-hashing mode enables parallel hashing of large nodes. SHA-256 is 3-5x slower on modern hardware. BLAKE2b is fast but BLAKE3 matches or exceeds it while being newer and better optimized.",
+        "quote": "",
+        "decided_by": "Sir Patick Stewart"
+      }
+    ],
+    "checklist": [
+      {
+        "id": "C1",
+        "text": "crates/haematite/Cargo.toml exists with blake3, zstd, and beamr dependencies."
+      },
+      {
+        "id": "C2",
+        "text": "crates/haematite/src/lib.rs re-exports the public API types."
+      },
+      {
+        "id": "C3",
+        "text": "LeafNode type holds sorted key-value pairs and computes its BLAKE3 hash from serialised contents."
+      },
+      {
+        "id": "C4",
+        "text": "InternalNode type holds sorted key-childHash pairs and computes its BLAKE3 hash from serialised contents."
+      },
+      {
+        "id": "C5",
+        "text": "Node serialisation is deterministic: the same node contents always produce the same byte sequence."
+      },
+      {
+        "id": "C6",
+        "text": "Node hash is the BLAKE3 hash of the serialised byte sequence \u2014 content is identity (P1)."
+      },
+      {
+        "id": "C7",
+        "text": "Rolling hash boundary detection splits nodes at content-determined positions with a configurable target size."
+      },
+      {
+        "id": "C8",
+        "text": "Boundary detection is history-independent: the same key set produces the same boundaries regardless of insertion order."
+      },
+      {
+        "id": "C9",
+        "text": "NodeStore trait defines get(hash) -> Option<Node> and put(node) -> Hash."
+      },
+      {
+        "id": "C10",
+        "text": "MemoryStore implements NodeStore as HashMap<Hash, Node> for testing."
+      }
+    ],
+    "stories": [
+      {
+        "id": "S1",
+        "text": "As an application developer, I want to create a haematite database with a single function call so that I do not need to manage shard actors, WAL files, or tree structures manually."
+      }
+    ],
+    "constraints": [
+      {
+        "id": "CN1",
+        "text": "No file over 500 lines. If a module approaches this limit, extract into submodules."
+      },
+      {
+        "id": "CN2",
+        "text": "No panics in production code. .unwrap() and .expect() only in tests."
+      },
+      {
+        "id": "CN3",
+        "text": "mod.rs contains ONLY pub mod declarations and pub use re-exports. No logic."
+      },
+      {
+        "id": "CN4",
+        "text": "All public types implement Debug. All error types implement std::error::Error."
+      },
+      {
+        "id": "CN5",
+        "text": "The prolly tree root hash for a given key-value set must be deterministic and history-independent: the same keys and values always produce the same root hash regardless of insertion order."
+      },
+      {
+        "id": "CN6",
+        "text": "WAL buffer reads must shadow tree reads: a key written to the buffer but not yet committed must be returned by get, not the stale tree value."
+      },
+      {
+        "id": "CN7",
+        "text": "Shard actor crash must not affect other shards. Supervision restarts only the failed shard."
+      },
+      {
+        "id": "CN8",
+        "text": "Batch append (multiple key-value pairs in one call) must produce exactly one tree commit, not N individual commits."
+      }
+    ],
+    "intention": "Haematite's core is a storage engine where concurrency is free and branching is structural. When this cluster is complete, a developer can open a haematite database, write to it from hundreds of concurrent actors without any locking discipline, fork it instantly by sharing a hash, and merge two forks by walking only the nodes that differ. The experience should feel like working with an in-memory data structure that happens to be durable \u2014 no connection pools, no transaction coordinators, no lock managers. The content-addressed prolly tree is what makes branching zero-friction; the actor-per-shard model is what makes concurrency zero-contention; the WAL buffer is what makes writes fast despite the content-addressing overhead. All three are load-bearing.",
+    "design_path": "docs/design/core",
+    "provenance": {
+      "requested_by": "Tom",
+      "quote": "Haematite's core is a storage engine where concurrency is free and branching is structural. When this cluster is complete, a developer can open a haematite database, write to it from hundreds of concu"
+    }
+  },
+  "verify_fix_cap": 3,
+  "review_cap": 1,
+  "round_backoff_ms": 2000,
+  "review_deadline_ms": 300000
+}

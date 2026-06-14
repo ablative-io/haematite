@@ -1,0 +1,151 @@
+{
+  "id": "PERSIST-001",
+  "cluster": "persistence",
+  "title": "Disk node store with zstd compression and LRU cache",
+  "depends_on": ["CORE-001"],
+  "blocked_by": [],
+  "checklist": ["C1", "C2", "C3", "C4", "C5", "C6", "C7", "C8"],
+  "stories": ["S1", "S8", "S9"],
+  "design_anchor": ["ADR-001", "ADR-006"],
+  "purpose": "Deliver the disk-backed NodeStore implementation that persists content-addressed tree nodes with zstd compression and an LRU cache for fast reads. This is the durability layer for the prolly tree — without it, tree nodes exist only in memory.",
+  "task": "Implement DiskStore implementing the NodeStore trait. Nodes are stored as files in a content-addressed directory layout (first 2 hex bytes of hash as directory, remaining as filename). Nodes are compressed with zstd before writing. Reads decompress on load. An LRU cache holds recently-accessed decompressed nodes in memory. Node writes are idempotent — writing a hash that already exists is a no-op. Expose a delete-by-hash method for snapshot pruning coordination. Does not implement WAL durability (PERSIST-002) or crash recovery (PERSIST-003).",
+  "requirements": [
+    {
+      "id": "R1",
+      "title": "DiskStore type implementing NodeStore",
+      "spec": "THE SYSTEM SHALL define a DiskStore type implementing the NodeStore trait (get/put). THE SYSTEM SHALL accept a base directory path on construction. THE SYSTEM SHALL create the base directory if it does not exist.",
+      "acceptance": [
+        "DiskStore::new(path) creates the store with the given base directory",
+        "DiskStore implements NodeStore (get and put methods)",
+        "The base directory is created if absent",
+        "DiskStore implements Debug"
+      ],
+      "files": {
+        "create": ["crates/haematite/src/store/disk.rs"],
+        "modify": ["crates/haematite/src/store/mod.rs"],
+        "delete": []
+      },
+      "checklist": ["C1"],
+      "stories": ["S1"]
+    },
+    {
+      "id": "R2",
+      "title": "Content-addressed directory layout",
+      "spec": "THE SYSTEM SHALL store each node at a path determined by its BLAKE3 hash: the first 2 hex bytes as a subdirectory, the remaining hex bytes as the filename. THE SYSTEM SHALL create subdirectories on demand. THE SYSTEM SHALL support at least 10 million nodes without filesystem performance degradation.",
+      "acceptance": [
+        "A node with hash 'ab12cd...' is stored at base_dir/ab/12cd...",
+        "Subdirectories are created on first write to that prefix",
+        "get(hash) reads from the correct path",
+        "The layout produces 256 subdirectories (00-ff), each holding up to ~39,000 files per million nodes"
+      ],
+      "files": {
+        "create": [],
+        "modify": ["crates/haematite/src/store/disk.rs"],
+        "delete": []
+      },
+      "checklist": ["C2"],
+      "stories": ["S8"]
+    },
+    {
+      "id": "R3",
+      "title": "Zstd compression on write",
+      "spec": "WHEN put(node) is called, THE SYSTEM SHALL serialise the node, compress the bytes with zstd, and write the compressed bytes to disk. THE SYSTEM SHALL NOT write uncompressed node bytes to disk.",
+      "acceptance": [
+        "The file on disk is smaller than the serialised node bytes (for non-trivial nodes)",
+        "The file on disk starts with the zstd magic bytes (0x28B52FFD)",
+        "put followed by reading the raw file and decompressing produces the original serialised bytes"
+      ],
+      "files": {
+        "create": [],
+        "modify": ["crates/haematite/src/store/disk.rs"],
+        "delete": []
+      },
+      "checklist": ["C3"],
+      "stories": []
+    },
+    {
+      "id": "R4",
+      "title": "Decompression on read with LRU cache",
+      "spec": "WHEN get(hash) is called, THE SYSTEM SHALL first check the LRU cache. IF the node is cached, THE SYSTEM SHALL return the decompressed node from cache. IF not cached, THE SYSTEM SHALL read the compressed bytes from disk, decompress with zstd, insert the decompressed node into the cache, and return it. THE SYSTEM SHALL NOT store compressed bytes in the cache.",
+      "acceptance": [
+        "get on a cached node returns without disk I/O",
+        "get on an uncached node reads from disk, decompresses, and caches",
+        "The cache stores decompressed nodes, not compressed bytes",
+        "A second get on the same hash hits the cache"
+      ],
+      "files": {
+        "create": ["crates/haematite/src/store/cache.rs"],
+        "modify": ["crates/haematite/src/store/disk.rs", "crates/haematite/src/store/mod.rs"],
+        "delete": []
+      },
+      "checklist": ["C4", "C6"],
+      "stories": ["S9"]
+    },
+    {
+      "id": "R5",
+      "title": "Idempotent writes",
+      "spec": "WHEN put(node) is called for a hash that already exists on disk, THE SYSTEM SHALL return the hash without writing. THE SYSTEM SHALL NOT error or overwrite — content addressing guarantees the content is identical.",
+      "acceptance": [
+        "put(node) twice returns the same hash both times",
+        "The second put does not perform a disk write",
+        "No error is produced for duplicate puts"
+      ],
+      "files": {
+        "create": [],
+        "modify": ["crates/haematite/src/store/disk.rs"],
+        "delete": []
+      },
+      "checklist": ["C5"],
+      "stories": []
+    },
+    {
+      "id": "R6",
+      "title": "Cache configuration and eviction",
+      "spec": "THE SYSTEM SHALL accept a configurable maximum cache size. WHEN the cache exceeds the maximum, THE SYSTEM SHALL evict the least-recently-used entry. Cache eviction SHALL NOT affect correctness — a miss falls through to disk read.",
+      "acceptance": [
+        "LruCache::new(max_entries) creates a cache with the given capacity",
+        "Inserting beyond capacity evicts the LRU entry",
+        "get on an evicted entry still works (falls through to disk read)",
+        "Cache size never exceeds the configured maximum"
+      ],
+      "files": {
+        "create": [],
+        "modify": ["crates/haematite/src/store/cache.rs"],
+        "delete": []
+      },
+      "checklist": ["C6", "C7"],
+      "stories": ["S9"]
+    },
+    {
+      "id": "R7",
+      "title": "Delete by hash for pruning",
+      "spec": "THE SYSTEM SHALL expose a delete(hash) method that removes a node's file from disk and evicts it from the cache. THE SYSTEM SHALL return Ok even if the hash does not exist on disk (idempotent delete).",
+      "acceptance": [
+        "delete(hash) removes the file from disk",
+        "delete(hash) evicts the entry from the LRU cache",
+        "get(hash) returns None after delete",
+        "delete(unknown_hash) returns Ok"
+      ],
+      "files": {
+        "create": ["crates/haematite/src/store/gc.rs"],
+        "modify": ["crates/haematite/src/store/mod.rs"],
+        "delete": []
+      },
+      "checklist": ["C8"],
+      "stories": []
+    }
+  ],
+  "boundaries": [
+    "SHALL NOT implement WAL durability — that is PERSIST-002",
+    "SHALL NOT implement crash recovery — that is PERSIST-003",
+    "SHALL NOT implement node compression algorithms other than zstd",
+    "SHALL NOT initiate node deletion on its own — deletion is triggered by snapshot pruning (BRANCH-004)"
+  ],
+  "verification": [
+    "cargo check -p haematite succeeds with no errors",
+    "cargo test -p haematite --lib passes all tests",
+    "cargo clippy -p haematite produces no errors",
+    "grep -r 'unwrap()\\|expect(' crates/haematite/src/store/ --include='*.rs' -l finds no non-test files (excluding memory.rs from CORE-001)",
+    "No file in crates/haematite/src/store/ exceeds 500 lines"
+  ]
+}

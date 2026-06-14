@@ -1,0 +1,115 @@
+{
+  "cluster": "wasm",
+  "sections": [
+    {
+      "name": "WASM Build Target",
+      "items": [
+        {
+          "id": "C1",
+          "text": "haematite compiles to wasm32-unknown-unknown with a wasm feature flag.",
+          "done": false
+        },
+        {
+          "id": "C2",
+          "text": "Filesystem-only code (DiskStore, native durable WAL) is cfg-gated out of the WASM build (CN1).",
+          "done": false
+        },
+        {
+          "id": "C3",
+          "text": "BLAKE3 uses the portable (non-SIMD) implementation on WASM and produces identical hashes to native (CN2).",
+          "done": false
+        },
+        {
+          "id": "C4",
+          "text": "WASM binary size stays under 2MB gzipped with wasm-opt size optimisation (CN3).",
+          "done": false
+        },
+        {
+          "id": "C5",
+          "text": "Shard actors run on web workers using the beamr-wasm scheduler.",
+          "done": false
+        }
+      ]
+    },
+    {
+      "name": "IndexedDB Node Store",
+      "items": [
+        {
+          "id": "C6",
+          "text": "IndexedDB NodeStore implements the NodeStore trait with hash as key and zstd-compressed bytes as value.",
+          "done": false
+        },
+        {
+          "id": "C7",
+          "text": "IndexedDB operations do not block the browser's main thread (CN4).",
+          "done": false
+        },
+        {
+          "id": "C8",
+          "text": "The LRU cache from the persistence cluster caches decompressed nodes in WASM linear memory.",
+          "done": false
+        },
+        {
+          "id": "C9",
+          "text": "IndexedDB NodeStore passes the same functional tests as the native DiskStore.",
+          "done": false
+        },
+        {
+          "id": "C10",
+          "text": "Node writes are idempotent: writing a hash that already exists in IndexedDB is a no-op.",
+          "done": false
+        }
+      ]
+    },
+    {
+      "name": "OPFS WAL Backend",
+      "items": [
+        {
+          "id": "C11",
+          "text": "OPFS WAL uses synchronous file access in web worker contexts for append-only writes.",
+          "done": false
+        },
+        {
+          "id": "C12",
+          "text": "OPFS WAL entry format is byte-identical to the native durable WAL format (CN6).",
+          "done": false
+        },
+        {
+          "id": "C13",
+          "text": "OPFS WAL includes CRC32 checksums per entry, matching the native format.",
+          "done": false
+        },
+        {
+          "id": "C14",
+          "text": "Runtime capability detection determines OPFS availability.",
+          "done": false
+        },
+        {
+          "id": "C15",
+          "text": "When OPFS is unavailable, the WAL falls back to IndexedDB-backed persistence (CN5).",
+          "done": false
+        },
+        {
+          "id": "C16",
+          "text": "Fallback is transparent to the shard actor \u2014 the WAL interface is the same regardless of backend.",
+          "done": false
+        }
+      ]
+    },
+    {
+      "name": "Browser Transport",
+      "items": [
+        {
+          "id": "C17",
+          "text": "Distribution sync in the WASM build operates over WebSocket data channels.",
+          "done": false
+        },
+        {
+          "id": "C18",
+          "text": "The sync protocol payload is identical to the native distribution sync \u2014 only the transport differs.",
+          "done": false
+        }
+      ]
+    }
+  ]
+}

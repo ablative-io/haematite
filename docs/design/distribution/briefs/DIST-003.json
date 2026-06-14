@@ -1,0 +1,80 @@
+{
+  "id": "DIST-003",
+  "cluster": "distribution",
+  "title": "Sync topology configuration and scheduling",
+  "depends_on": ["DIST-001"],
+  "blocked_by": [],
+  "checklist": ["C17", "C18", "C19"],
+  "stories": ["S2", "S3"],
+  "design_anchor": ["ADR-001"],
+  "purpose": "Deliver configurable sync topology (full-mesh, ring, custom pairs) and the sync scheduler that triggers periodic syncs based on the configured topology and interval. Any topology converges to consistency given sufficient sync rounds.",
+  "task": "Implement sync topology configuration: full-mesh (every node syncs with every other), ring (each node syncs with its successor), and custom (explicit sync pairs). Implement the sync scheduler as a beamr process that triggers periodic syncs based on topology and interval. The scheduler fires pull-syncs to the target nodes according to the topology map. Does not implement the sync protocol (DIST-001) or merge logic (DIST-002).",
+  "requirements": [
+    {
+      "id": "R1",
+      "title": "Topology configuration",
+      "spec": "THE SYSTEM SHALL accept a sync topology on database creation: FullMesh, Ring, or Custom(pairs). THE SYSTEM SHALL derive the sync partner list from the topology. THE SYSTEM SHALL NOT have a default topology — the caller must choose explicitly.",
+      "acceptance": [
+        "SyncTopology::FullMesh with 4 nodes produces 6 sync pairs (all combinations)",
+        "SyncTopology::Ring with 4 nodes produces 4 sync pairs (each to its successor)",
+        "SyncTopology::Custom accepts an explicit list of (source, target) pairs",
+        "Creating a distributed database without a topology is an error"
+      ],
+      "files": {
+        "create": ["crates/haematite/src/sync/topology.rs"],
+        "modify": ["crates/haematite/src/sync/mod.rs"],
+        "delete": []
+      },
+      "checklist": ["C17"],
+      "stories": ["S2"]
+    },
+    {
+      "id": "R2",
+      "title": "Sync scheduler",
+      "spec": "THE SYSTEM SHALL spawn a sync scheduler as a supervised beamr process. THE SYSTEM SHALL trigger pull-syncs to partner nodes at the configured interval according to the topology. THE SYSTEM SHALL NOT block the shard actor's write path while syncing.",
+      "acceptance": [
+        "The scheduler fires sync operations at the configured interval",
+        "Sync targets are determined by the topology",
+        "The scheduler is supervised — a crash restarts it",
+        "Write operations are not blocked during scheduled syncs"
+      ],
+      "files": {
+        "create": ["crates/haematite/src/sync/scheduler.rs"],
+        "modify": ["crates/haematite/src/sync/mod.rs"],
+        "delete": []
+      },
+      "checklist": ["C18"],
+      "stories": ["S3"]
+    },
+    {
+      "id": "R3",
+      "title": "Convergence guarantee",
+      "spec": "THE SYSTEM SHALL ensure that any topology converges to consistency given sufficient sync rounds. THE SYSTEM SHALL document the convergence properties of each topology: FullMesh converges in 1 round, Ring converges in N-1 rounds, Custom depends on the pair graph connectivity.",
+      "acceptance": [
+        "FullMesh topology converges all nodes to the same state in one sync round",
+        "Ring topology converges in at most N-1 rounds for N nodes",
+        "Custom topology converges if and only if the pair graph is connected"
+      ],
+      "files": {
+        "create": [],
+        "modify": ["crates/haematite/src/sync/topology.rs"],
+        "delete": []
+      },
+      "checklist": ["C19"],
+      "stories": []
+    }
+  ],
+  "boundaries": [
+    "SHALL NOT implement the sync protocol or node transfer — that is DIST-001",
+    "SHALL NOT implement merge or consistency modes — that is DIST-002",
+    "SHALL NOT implement dynamic topology changes at runtime — topology is set at creation",
+    "SHALL NOT implement node discovery — uses beamr's existing distribution connection manager"
+  ],
+  "verification": [
+    "cargo check -p haematite succeeds with no errors",
+    "cargo test -p haematite --lib passes all tests",
+    "cargo clippy -p haematite produces no errors",
+    "grep -r 'unwrap()\\|expect(' crates/haematite/src/sync/ --include='*.rs' -l finds no non-test files",
+    "No file in crates/haematite/src/sync/ exceeds 500 lines"
+  ]
+}

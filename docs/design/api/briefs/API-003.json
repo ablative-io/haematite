@@ -1,0 +1,118 @@
+{
+  "id": "API-003",
+  "cluster": "api",
+  "title": "TTL expiry with per-shard sweep actors",
+  "depends_on": ["API-001", "API-002"],
+  "blocked_by": [],
+  "checklist": ["C18", "C19", "C20", "C21", "C22", "C23", "C24"],
+  "stories": ["S6", "S9", "S14", "S15", "S16"],
+  "design_anchor": ["ADR-004"],
+  "purpose": "Deliver per-key TTL expiry with read-time filtering and per-shard sweep actors. Expired entries are invisible at read time regardless of sweep state. The sweep actor is a supervised beamr process that physically removes expired entries without blocking the shard actor's write path. Maps to Aion's HistoryCompacted lifecycle.",
+  "task": "Add an optional TTL parameter to put and append. Store expiry timestamps alongside values in the tree. Implement read-time expiry filtering on get/read/read_from/range/scan — expired entries return None/empty even before sweep removes them. Implement a per-shard sweep actor as a supervised beamr process that periodically scans for and deletes expired entries. Configurable sweep interval. Expired workflow histories return HistoryCompacted-equivalent error.",
+  "requirements": [
+    {
+      "id": "R1",
+      "title": "TTL entry metadata",
+      "spec": "THE SYSTEM SHALL store an optional expiry timestamp alongside each value in the tree. WHEN put or append is called with a TTL parameter, THE SYSTEM SHALL compute the expiry timestamp as now + TTL and store it with the entry. THE SYSTEM SHALL store entries without TTL as never-expiring.",
+      "acceptance": [
+        "put(key, value, ttl=60s) stores the value with an expiry timestamp 60 seconds from now",
+        "put(key, value) with no TTL stores the value as never-expiring",
+        "append(key, events, expected_seq, ttl=3600s) stores events with expiry",
+        "The expiry timestamp is persisted alongside the value in the tree"
+      ],
+      "files": {
+        "create": ["crates/haematite/src/ttl/mod.rs", "crates/haematite/src/ttl/entry.rs"],
+        "modify": ["crates/haematite/src/lib.rs"],
+        "delete": []
+      },
+      "checklist": ["C18", "C19"],
+      "stories": ["S9", "S14"]
+    },
+    {
+      "id": "R2",
+      "title": "Read-time expiry filtering",
+      "spec": "WHEN get, read, read_from, range, or scan encounters an entry with an expiry timestamp in the past, THE SYSTEM SHALL exclude it from the result. THE SYSTEM SHALL filter expired entries regardless of whether the sweep actor has physically removed them. THE SYSTEM SHALL NOT return expired entries under any circumstances.",
+      "acceptance": [
+        "get on an expired key returns None",
+        "read on a stream with some expired events returns only non-expired events",
+        "range excludes expired entries from results",
+        "scan excludes expired entries from results",
+        "An entry written with TTL=1s returns correctly at t=0 and returns None at t=2s"
+      ],
+      "files": {
+        "create": ["crates/haematite/src/ttl/filter.rs"],
+        "modify": ["crates/haematite/src/api/kv.rs", "crates/haematite/src/api/event_store.rs"],
+        "delete": []
+      },
+      "checklist": ["C20"],
+      "stories": ["S9"]
+    },
+    {
+      "id": "R3",
+      "title": "Per-shard sweep actor",
+      "spec": "THE SYSTEM SHALL spawn a per-shard sweep actor as a supervised beamr process. THE SYSTEM SHALL have the sweep actor periodically scan its shard's tree for entries with expired TTL and delete them. THE SYSTEM SHALL NOT block the shard actor's write path during sweep. THE SYSTEM SHALL run the sweep actor on the normal beamr scheduler, subject to preemptive scheduling.",
+      "acceptance": [
+        "Each shard has a corresponding sweep actor process",
+        "The sweep actor is supervised — a crash restarts it",
+        "The sweep actor scans and deletes expired entries",
+        "Writes to the shard actor are not blocked during sweep",
+        "The sweep actor runs on the normal scheduler, not a dedicated thread"
+      ],
+      "files": {
+        "create": ["crates/haematite/src/ttl/sweep.rs"],
+        "modify": [],
+        "delete": []
+      },
+      "checklist": ["C21", "C22"],
+      "stories": ["S15", "S16"]
+    },
+    {
+      "id": "R4",
+      "title": "Configurable sweep interval",
+      "spec": "THE SYSTEM SHALL accept a sweep interval configuration per-database. THE SYSTEM SHALL default to no implicit interval — the interval must be explicitly configured (P6 from core: no silent defaults).",
+      "acceptance": [
+        "Database configuration includes a sweep_interval field",
+        "Creating a database without specifying sweep_interval is an error if TTL is used",
+        "The sweep actor fires at the configured interval"
+      ],
+      "files": {
+        "create": [],
+        "modify": ["crates/haematite/src/ttl/sweep.rs"],
+        "delete": []
+      },
+      "checklist": ["C23"],
+      "stories": ["S15"]
+    },
+    {
+      "id": "R5",
+      "title": "HistoryCompacted error for expired workflow history",
+      "spec": "WHEN read or read_from is called on a workflow key whose entire history has expired, THE SYSTEM SHALL return a HistoryCompacted error. THE SYSTEM SHALL NOT return an empty result — the caller must be able to distinguish a compacted workflow from a non-existent one.",
+      "acceptance": [
+        "read on a workflow whose entire history expired returns HistoryCompacted error",
+        "read on a non-existent key returns empty (not HistoryCompacted)",
+        "read on a workflow with some expired and some live events returns only live events (not HistoryCompacted)",
+        "HistoryCompacted implements std::error::Error and Debug"
+      ],
+      "files": {
+        "create": [],
+        "modify": ["crates/haematite/src/api/error.rs", "crates/haematite/src/api/event_store.rs"],
+        "delete": []
+      },
+      "checklist": ["C24"],
+      "stories": ["S6"]
+    }
+  ],
+  "boundaries": [
+    "SHALL NOT implement EventStore operations — those are API-001",
+    "SHALL NOT implement general KV operations — those are API-002",
+    "SHALL NOT implement automatic TTL for all entries — TTL is opt-in per write",
+    "SHALL NOT implement sweep scheduling beyond a configurable interval — cron-like scheduling is application-level"
+  ],
+  "verification": [
+    "cargo check -p haematite succeeds with no errors",
+    "cargo test -p haematite --lib passes all tests",
+    "cargo clippy -p haematite produces no errors",
+    "grep -r 'unwrap()\\|expect(' crates/haematite/src/ttl/ --include='*.rs' -l finds no non-test files",
+    "No file in crates/haematite/src/ttl/ exceeds 500 lines"
+  ]
+}

@@ -1,0 +1,149 @@
+{
+  "cluster": "persistence",
+  "title": "Disk Node Store, WAL Durability, and Crash Recovery",
+  "intention": "Persistence is the durability boundary \u2014 the line between data that survives a power failure and data that doesn't. When this cluster is complete, haematite writes content-addressed tree nodes to disk with zstd compression, maintains a durable WAL file per shard for crash recovery, and can reconstruct its full state from disk after an unclean shutdown. The experience should be invisible: a developer opens a database, writes to it, and trusts that committed data is durable. No manual recovery steps, no fsck, no WAL management. The content-addressed structure makes this unusually clean \u2014 nodes are immutable once written, so there is no in-place update problem, and the WAL is the only source of uncommitted state.",
+  "problem": "The core cluster defines in-memory node storage (MemoryStore) and WAL buffer semantics, but everything is lost on process exit. For haematite to be a real storage engine \u2014 not a cache \u2014 it needs durable storage with crash recovery guarantees.\n\nThree specific problems:\n\n1. Content-addressed tree nodes must be persisted to disk so that the tree survives restart. Nodes are immutable (content is identity per core P1), so the write path is append-only, but reads must be fast \u2014 random access to any node by hash.\n\n2. The WAL buffer's uncommitted mutations must be durably written before the shard actor acknowledges a write. Without durable WAL, a crash between acknowledgment and tree commit loses data the caller believes is persisted.\n\n3. On restart, each shard actor must reconstruct its state: load the last committed root hash, replay the durable WAL from that point forward, and resume accepting writes. This must be automatic \u2014 no operator intervention.",
+  "solution": "The persistence cluster adds three components:\n\n1. Disk Node Store\n\nImplements the NodeStore trait with on-disk storage. Each content-addressed node is stored as a file in a content-addressed directory structure: the BLAKE3 hash determines the file path (first 2 hex bytes as directory, remaining bytes as filename, following git's object storage pattern). This gives O(1) lookup by hash and avoids filesystem performance degradation from too many files in one directory.\n\nNodes are compressed with zstd before writing (ADR-006). Reads decompress on load. A configurable in-memory LRU cache holds recently-accessed decompressed nodes to avoid repeated disk reads and decompression.\n\nWrites are idempotent: writing a node that already exists (same hash) is a no-op. This is safe because content addressing guarantees that two nodes with the same hash have the same content.\n\nThe disk node store handles node garbage collection in coordination with the branching cluster's snapshot pruning: it exposes a method to delete a node by hash, but never initiates deletion on its own.\n\n2. Durable WAL\n\nEach shard actor's WAL buffer is backed by an append-only file on disk. Every mutation (put, delete) is written to the WAL file before the shard actor acknowledges the write. The WAL entry format includes: operation type, key, value (for puts), and a CRC32 checksum for integrity.\n\nThe WAL file is fsync'd according to a configurable policy: every write (maximum durability, higher latency), every N writes (batched durability), or on commit only (maximum throughput, risk of losing uncommitted writes on crash). The policy is specified at database creation.\n\nOn commit (tree flush), the WAL file is truncated \u2014 the committed mutations are now in the tree, so the WAL entries are no longer needed. A truncation marker records the committed root hash.\n\n3. Crash Recovery\n\nOn shard actor startup, the recovery procedure is:\n\n- Read the last truncation marker to find the committed root hash.\n- Verify the committed root hash exists in the disk node store.\n- Replay all WAL entries after the truncation marker, reconstructing the in-memory WAL buffer.\n- Resume normal operation.\n\nIf the WAL file is corrupted (CRC mismatch), recovery replays up to the last valid entry and logs a warning. The committed tree state is never at risk \u2014 only uncommitted WAL entries can be lost, and only if the WAL file itself is corrupted.\n\nRecovery is per-shard: each shard actor recovers independently. A shard that takes longer to recover does not block other shards from accepting writes.",
+  "principles": [
+    {
+      "id": "P1",
+      "text": "Committed data is durable. Once commit() returns a root hash, that tree state is on disk. A power failure after commit does not lose data."
+    },
+    {
+      "id": "P2",
+      "text": "Writes are acknowledged after WAL append. The shard actor does not acknowledge a write until the mutation is in the durable WAL. The durability policy (per-write fsync, batched, or commit-only) controls the exact guarantee."
+    },
+    {
+      "id": "P3",
+      "text": "Recovery is automatic and per-shard. Each shard recovers independently from its own WAL file. No operator intervention, no global coordination."
+    },
+    {
+      "id": "P4",
+      "text": "Node writes are idempotent. Writing a content-addressed node that already exists is a no-op, not an error. This simplifies recovery and eliminates write-write conflicts on the node store."
+    },
+    {
+      "id": "P5",
+      "text": "The committed tree is never at risk. WAL corruption can lose uncommitted writes, but the committed tree state (content-addressed nodes on disk) is always intact."
+    }
+  ],
+  "decisions": [
+    "ADR-001",
+    "ADR-006"
+  ],
+  "goals": [
+    "A database that is committed, killed, and reopened contains exactly the committed state \u2014 no data loss, no corruption.",
+    "WAL replay after unclean shutdown reconstructs the in-memory buffer state from the durable WAL file.",
+    "Disk node store reads decompress zstd-compressed nodes and the LRU cache eliminates redundant disk reads for hot nodes.",
+    "Node writes are idempotent: writing the same hash twice does not error or corrupt.",
+    "Shard recovery is independent: a slow-recovering shard does not block other shards from accepting writes.",
+    "Corrupted WAL entries are detected by CRC mismatch and recovery replays up to the last valid entry."
+  ],
+  "non_goals": [
+    {
+      "text": "Replication to remote nodes",
+      "reason": "Covered by the distribution cluster (RM-007). Persistence is local durability only."
+    },
+    {
+      "text": "Node compaction or defragmentation",
+      "reason": "Content-addressed nodes are immutable. Dead nodes are reclaimed by snapshot pruning in the branching cluster."
+    },
+    {
+      "text": "Encryption at rest",
+      "reason": "Encryption is an application-level or filesystem-level concern. The storage engine writes plaintext (compressed) nodes."
+    },
+    {
+      "text": "Multiple storage backends (S3, cloud block storage)",
+      "reason": "The disk node store targets local filesystems. Cloud backends would be a separate NodeStore implementation."
+    },
+    {
+      "text": "WAL archival or WAL shipping",
+      "reason": "WAL is a crash-recovery mechanism, not a replication mechanism. Distribution uses hash-based sync, not WAL shipping."
+    }
+  ],
+  "structure": [
+    {
+      "path": "crates/haematite/src/wal/mod.rs",
+      "note": "WAL module root \u2014 pre-existing from core cluster",
+      "brief": ""
+    },
+    {
+      "path": "crates/haematite/src/store/mod.rs",
+      "note": "Node store module root \u2014 pre-existing from core cluster",
+      "brief": ""
+    },
+    {
+      "path": "crates/haematite/src/store/disk.rs",
+      "note": "DiskStore: content-addressed directory layout, zstd compression, LRU cache",
+      "brief": "PERSIST-001"
+    },
+    {
+      "path": "crates/haematite/src/store/cache.rs",
+      "note": "LRU node cache: configurable size, decompressed nodes in memory",
+      "brief": "PERSIST-001"
+    },
+    {
+      "path": "crates/haematite/src/wal/durable.rs",
+      "note": "Durable WAL writer: append-only file, CRC32 checksums, fsync policy",
+      "brief": "PERSIST-002"
+    },
+    {
+      "path": "crates/haematite/src/wal/recovery.rs",
+      "note": "Crash recovery: truncation marker read, WAL replay, CRC validation",
+      "brief": "PERSIST-003"
+    },
+    {
+      "path": "crates/haematite/src/wal/entry.rs",
+      "note": "WAL entry format: operation type, key, value, CRC32 checksum",
+      "brief": "PERSIST-002"
+    },
+    {
+      "path": "crates/haematite/src/store/gc.rs",
+      "note": "Node deletion by hash for snapshot pruning coordination",
+      "brief": "PERSIST-001"
+    }
+  ],
+  "inventory": [
+    {
+      "path": "crates/haematite/src/store/mod.rs",
+      "note": "Node store module root, defined by core cluster (CORE-001). Contains NodeStore trait."
+    },
+    {
+      "path": "crates/haematite/src/store/memory.rs",
+      "note": "In-memory node store for testing, defined by core cluster (CORE-001)."
+    },
+    {
+      "path": "crates/haematite/src/wal/mod.rs",
+      "note": "WAL module root, defined by core cluster (CORE-005)."
+    },
+    {
+      "path": "crates/haematite/src/wal/buffer.rs",
+      "note": "In-memory WAL buffer, defined by core cluster (CORE-005)."
+    }
+  ],
+  "constraints": [
+    {
+      "id": "CN1",
+      "text": "Committed tree state must survive unclean shutdown. A committed root hash and all nodes it references must be on disk before commit() returns."
+    },
+    {
+      "id": "CN2",
+      "text": "WAL entries must include CRC32 checksums. A corrupted entry must be detectable, not silently replayed."
+    },
+    {
+      "id": "CN3",
+      "text": "Shard recovery must be independent. One shard's recovery must not block another shard's startup or write acceptance."
+    },
+    {
+      "id": "CN4",
+      "text": "The disk node store directory layout must support at least 10 million nodes without filesystem performance degradation (2-level hash prefix directories)."
+    },
+    {
+      "id": "CN5",
+      "text": "WAL truncation must be atomic: the truncation marker and committed root hash must be written together so that a crash during truncation does not lose the commit reference."
+    },
+    {
+      "id": "CN6",
+      "text": "LRU cache eviction must not affect correctness \u2014 a cache miss falls through to disk read."
+    }
+  ]
+}

@@ -1,0 +1,277 @@
+{
+  "repo_root": "/Users/tom/Developer/ablative/haematite",
+  "brief_id": "PERSIST-003",
+  "reviewers": [
+    "Danger Mouse"
+  ],
+  "base_ref": "main",
+  "placement": "local",
+  "isolation": "worktree",
+  "brief_document": {
+    "id": "PERSIST-003",
+    "cluster": "persistence",
+    "title": "Crash recovery via WAL replay",
+    "depends_on": [
+      "PERSIST-001",
+      "PERSIST-002"
+    ],
+    "blocked_by": [],
+    "checklist": [
+      "C15",
+      "C16",
+      "C17",
+      "C18",
+      "C19",
+      "C20"
+    ],
+    "stories": [
+      "S2",
+      "S5",
+      "S6",
+      "S7",
+      "S10"
+    ],
+    "design_anchor": [
+      "ADR-001",
+      "ADR-003"
+    ],
+    "purpose": "Deliver automatic crash recovery for shard actors by replaying the durable WAL from the last committed root hash. Each shard recovers independently. Corrupted WAL entries are detected by CRC mismatch and recovery replays up to the last valid entry.",
+    "task": "Implement crash recovery: on shard actor startup, read the last truncation marker to find the committed root hash, verify it exists in the disk node store, replay all WAL entries after the marker to reconstruct the in-memory buffer, and resume normal operation. CRC32 validation on each entry \u2014 corrupted entries stop replay at the last valid entry. Recovery is per-shard: each shard recovers independently without blocking others.",
+    "requirements": [
+      {
+        "id": "R1",
+        "title": "Read last truncation marker",
+        "spec": "WHEN a shard actor starts, THE SYSTEM SHALL read the last truncation marker from the durable WAL file to find the committed root hash. IF no truncation marker exists (fresh database), THE SYSTEM SHALL start with an empty tree.",
+        "acceptance": [
+          "Recovery reads the truncation marker and extracts the committed root hash",
+          "A fresh database with no WAL file starts with an empty tree",
+          "A WAL file with only a truncation marker (no uncommitted entries) starts at the committed state"
+        ],
+        "files": {
+          "create": [],
+          "modify": [
+            "crates/haematite/src/wal/recovery.rs"
+          ],
+          "delete": []
+        },
+        "checklist": [
+          "C15"
+        ],
+        "stories": [
+          "S2"
+        ]
+      },
+      {
+        "id": "R2",
+        "title": "Verify committed root hash",
+        "spec": "WHEN recovery reads the committed root hash, THE SYSTEM SHALL verify that the root hash exists in the disk node store. IF the root hash is missing, THE SYSTEM SHALL report a fatal error \u2014 the committed tree state is corrupted.",
+        "acceptance": [
+          "Recovery succeeds when the committed root hash exists in the node store",
+          "Recovery reports a fatal error when the committed root hash is missing from the node store",
+          "The error message includes the missing root hash"
+        ],
+        "files": {
+          "create": [],
+          "modify": [
+            "crates/haematite/src/wal/recovery.rs"
+          ],
+          "delete": []
+        },
+        "checklist": [
+          "C16"
+        ],
+        "stories": []
+      },
+      {
+        "id": "R3",
+        "title": "WAL entry replay",
+        "spec": "WHEN recovery finds WAL entries after the truncation marker, THE SYSTEM SHALL replay each entry in order, reconstructing the in-memory WAL buffer. THE SYSTEM SHALL validate the CRC32 checksum of each entry before replaying it. THE SYSTEM SHALL stop replay at the first corrupted entry (CRC mismatch) and log a warning.",
+        "acceptance": [
+          "N entries after the truncation marker produce an in-memory buffer with N mutations",
+          "The buffer state after replay matches the state before crash",
+          "A corrupted entry (CRC mismatch) stops replay at that point",
+          "Entries before the corrupted one are replayed successfully",
+          "A warning is logged when corruption is detected"
+        ],
+        "files": {
+          "create": [],
+          "modify": [
+            "crates/haematite/src/wal/recovery.rs"
+          ],
+          "delete": []
+        },
+        "checklist": [
+          "C17",
+          "C18"
+        ],
+        "stories": [
+          "S5",
+          "S7"
+        ]
+      },
+      {
+        "id": "R4",
+        "title": "Per-shard independent recovery",
+        "spec": "THE SYSTEM SHALL recover each shard independently from its own WAL file. THE SYSTEM SHALL NOT wait for all shards to recover before any shard accepts writes. A slow-recovering shard SHALL NOT block other shards from starting.",
+        "acceptance": [
+          "Shard 0 can accept writes while shard 5 is still recovering",
+          "Each shard reads only its own WAL file",
+          "A shard with a large WAL does not delay other shards"
+        ],
+        "files": {
+          "create": [],
+          "modify": [
+            "crates/haematite/src/wal/recovery.rs"
+          ],
+          "delete": []
+        },
+        "checklist": [
+          "C19"
+        ],
+        "stories": [
+          "S6"
+        ]
+      },
+      {
+        "id": "R5",
+        "title": "Resume normal operation after recovery",
+        "spec": "WHEN WAL replay is complete, THE SYSTEM SHALL transition the shard actor to normal operation, accepting new writes. THE SYSTEM SHALL append new WAL entries after the replayed entries.",
+        "acceptance": [
+          "After recovery, put/get/delete operations work normally",
+          "New writes are appended to the WAL after the replayed entries",
+          "commit() after recovery truncates the WAL and produces a new root hash",
+          "The shard is indistinguishable from one that never crashed"
+        ],
+        "files": {
+          "create": [],
+          "modify": [
+            "crates/haematite/src/wal/recovery.rs"
+          ],
+          "delete": []
+        },
+        "checklist": [
+          "C20"
+        ],
+        "stories": [
+          "S2",
+          "S10"
+        ]
+      }
+    ],
+    "boundaries": [
+      "SHALL NOT implement the disk node store \u2014 that is PERSIST-001",
+      "SHALL NOT implement the durable WAL writer \u2014 that is PERSIST-002",
+      "SHALL NOT implement WAL compaction or archival",
+      "SHALL NOT recover from a missing committed root hash \u2014 that is a fatal error, not a recoverable state"
+    ],
+    "verification": [
+      "cargo check -p haematite succeeds with no errors",
+      "cargo test -p haematite --lib passes all tests",
+      "cargo clippy -p haematite produces no errors",
+      "grep -r 'unwrap()\\|expect(' crates/haematite/src/wal/recovery.rs -l finds nothing",
+      "No file in crates/haematite/src/wal/ exceeds 500 lines"
+    ]
+  },
+  "resolved_context": {
+    "adrs": [
+      {
+        "id": "ADR-001",
+        "title": "Content-addressed prolly tree over B+ tree with WAL overlay",
+        "decision": "Content-addressed prolly tree over B+ tree with WAL overlay, because branching/merging/sync is the headline feature and must be structural (O(differences), history-independent) rather than overlaid (O(branch-writes), order-dependent). The rejected alternative (B+ tree + WAL overlay) makes branching an afterthought \u2014 functional but O(branch-writes) for merge and requiring WAL coordination for replication.",
+        "quote": "",
+        "decided_by": "Bono, Frodo Baggins, Sir Patick Stewart"
+      },
+      {
+        "id": "ADR-003",
+        "title": "WAL buffer for write amortization rather than direct tree mutation",
+        "decision": "WAL buffer over direct tree mutation, because it gives sequential-append write latency (the WAL) with amortized tree cost (one path-to-root rewrite per flush, not per write). The rejected alternative (direct mutation with batching windows) forces callers to accept high write latency or risk high write amplification with small batches.",
+        "quote": "",
+        "decided_by": "Bono"
+      }
+    ],
+    "checklist": [
+      {
+        "id": "C15",
+        "text": "Recovery reads the last truncation marker to find the committed root hash."
+      },
+      {
+        "id": "C16",
+        "text": "Recovery verifies the committed root hash exists in the disk node store."
+      },
+      {
+        "id": "C17",
+        "text": "Recovery replays all WAL entries after the truncation marker, reconstructing the in-memory buffer."
+      },
+      {
+        "id": "C18",
+        "text": "Corrupted WAL entries (CRC mismatch) are detected and recovery replays up to the last valid entry."
+      },
+      {
+        "id": "C19",
+        "text": "Recovery is per-shard: each shard recovers independently (CN3)."
+      },
+      {
+        "id": "C20",
+        "text": "After recovery, the shard actor resumes normal operation accepting new writes."
+      }
+    ],
+    "stories": [
+      {
+        "id": "S2",
+        "text": "As an application developer, I want the database to recover automatically on restart so that I do not need to write recovery logic or run repair tools."
+      },
+      {
+        "id": "S5",
+        "text": "As the Aion engine, I want crash recovery to replay uncommitted WAL entries so that events appended but not yet tree-committed are not lost."
+      },
+      {
+        "id": "S6",
+        "text": "As the Aion engine, I want each shard to recover independently so that a slow-recovering shard does not block workflows on other shards."
+      },
+      {
+        "id": "S7",
+        "text": "As an operations engineer, I want corrupted WAL entries to be detected and skipped during recovery so that a partial disk failure does not prevent the database from starting."
+      },
+      {
+        "id": "S10",
+        "text": "As an operations engineer, I want recovery to log what it replayed so that I can audit what happened during an unclean shutdown."
+      }
+    ],
+    "constraints": [
+      {
+        "id": "CN1",
+        "text": "Committed tree state must survive unclean shutdown. A committed root hash and all nodes it references must be on disk before commit() returns."
+      },
+      {
+        "id": "CN2",
+        "text": "WAL entries must include CRC32 checksums. A corrupted entry must be detectable, not silently replayed."
+      },
+      {
+        "id": "CN3",
+        "text": "Shard recovery must be independent. One shard's recovery must not block another shard's startup or write acceptance."
+      },
+      {
+        "id": "CN4",
+        "text": "The disk node store directory layout must support at least 10 million nodes without filesystem performance degradation (2-level hash prefix directories)."
+      },
+      {
+        "id": "CN5",
+        "text": "WAL truncation must be atomic: the truncation marker and committed root hash must be written together so that a crash during truncation does not lose the commit reference."
+      },
+      {
+        "id": "CN6",
+        "text": "LRU cache eviction must not affect correctness \u2014 a cache miss falls through to disk read."
+      }
+    ],
+    "intention": "Persistence is the durability boundary \u2014 the line between data that survives a power failure and data that doesn't. When this cluster is complete, haematite writes content-addressed tree nodes to disk with zstd compression, maintains a durable WAL file per shard for crash recovery, and can reconstruct its full state from disk after an unclean shutdown. The experience should be invisible: a developer opens a database, writes to it, and trusts that committed data is durable. No manual recovery steps, no fsck, no WAL management. The content-addressed structure makes this unusually clean \u2014 nodes are immutable once written, so there is no in-place update problem, and the WAL is the only source of uncommitted state.",
+    "design_path": "docs/design/persistence",
+    "provenance": {
+      "requested_by": "Tom",
+      "quote": "Persistence is the durability boundary \u2014 the line between data that survives a power failure and data that doesn't. When this cluster is complete, haematite writes content-addressed tree nodes to disk"
+    }
+  },
+  "verify_fix_cap": 3,
+  "review_cap": 1,
+  "round_backoff_ms": 2000,
+  "review_deadline_ms": 300000
+}

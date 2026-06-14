@@ -1,0 +1,225 @@
+{
+  "repo_root": "/Users/tom/Developer/ablative/haematite",
+  "brief_id": "CORE-006",
+  "reviewers": [
+    "Danger Mouse"
+  ],
+  "base_ref": "main",
+  "placement": "local",
+  "isolation": "worktree",
+  "brief_document": {
+    "id": "CORE-006",
+    "cluster": "core",
+    "title": "WAL recovery: replay durable WAL from last committed root to reconstruct buffer state",
+    "depends_on": [
+      "CORE-005"
+    ],
+    "blocked_by": [],
+    "checklist": [
+      "C27"
+    ],
+    "stories": [
+      "S5"
+    ],
+    "design_anchor": [
+      "ADR-003"
+    ],
+    "purpose": "Deliver the crash-recovery complement to the durable WAL writer introduced in CORE-005. ADR-003 mandates that uncommitted mutations buffered in memory at crash time are recoverable from the on-disk WAL \u2014 this brief implements that recovery path. WalRecovery reads the durable WAL file written by DurableWal, validates each entry's CRC32 checksum, and replays mutations from the last committed root hash position forward into a fresh WalBuffer. The result is a reconstructed buffer indistinguishable from the one that existed before the crash, ready for the shard actor (CORE-007) to resume normal operation. Without this brief, the durable WAL file is written but never read on restart \u2014 crash safety is a guarantee only if recovery exists.",
+    "task": "Create crates/haematite/src/wal/recovery.rs implementing WalRecovery. The recovery reader opens the durable WAL file, scans entries sequentially, and identifies the position of the last committed root hash (written by DurableWal as a Commit entry). It then replays all subsequent Put and Delete entries into a new WalBuffer, stopping at the first truncated entry (incomplete write from crash) or the end of file. Truncated entries are silently skipped \u2014 a truncated tail is the normal crash signature and is not an error. Corrupted entries (entry is complete but CRC32 does not match) are hard errors \u2014 corruption is distinct from truncation and indicates data integrity failure. After replay, the returned WalBuffer contains exactly the uncommitted mutations from the pre-crash shard state. Wire WalRecovery into wal/mod.rs. This brief does not implement the shard actor that calls recovery on restart \u2014 that is CORE-007.",
+    "requirements": [
+      {
+        "id": "R1",
+        "title": "WalRecovery type and open constructor",
+        "spec": "Define a WalRecovery struct that holds an open file handle to the durable WAL. WHEN WalRecovery::open(path) is called, THE SYSTEM SHALL open the file at path for reading and return Ok(WalRecovery) if the file exists. IF the file does not exist, THE SYSTEM SHALL return WalError::Io wrapping the underlying io::Error. THE SYSTEM SHALL NOT truncate or modify the file on open \u2014 the file is read-only during recovery. WalRecovery SHALL implement Debug.",
+        "acceptance": [
+          "WalRecovery::open(path) returns Ok when the file exists",
+          "WalRecovery::open(path) returns Err(WalError::Io(_)) when the file does not exist",
+          "Opening a WAL file does not modify or truncate it (file length is unchanged after open)",
+          "WalRecovery implements Debug"
+        ],
+        "files": {
+          "create": [
+            "crates/haematite/src/wal/recovery.rs"
+          ],
+          "modify": [],
+          "delete": []
+        },
+        "checklist": [],
+        "stories": []
+      },
+      {
+        "id": "R2",
+        "title": "WAL frame parsing with CRC32 validation",
+        "spec": "WHEN reading a frame from the WAL file, THE SYSTEM SHALL read the 4-byte little-endian payload length, then the payload bytes, then the 4-byte CRC32 checksum, matching the exact frame format written by DurableWal. THE SYSTEM SHALL verify the CRC32 of the payload bytes against the stored checksum using crc32fast::hash. IF the checksum does not match, THE SYSTEM SHALL return WalError::ChecksumMismatch { expected, actual } \u2014 this is a hard error indicating data corruption. IF the file ends mid-frame (fewer bytes than the length prefix or payload declares), THE SYSTEM SHALL treat the entry as truncated and return a sentinel indicating truncation, not an error. THE SYSTEM SHALL NOT silently ignore a complete frame whose CRC32 fails \u2014 truncation and corruption are distinct conditions.",
+        "acceptance": [
+          "A well-formed frame (length + payload + matching CRC32) is parsed and returned as Ok(Some(payload_bytes))",
+          "A frame whose CRC32 does not match the payload returns Err(WalError::ChecksumMismatch { expected, actual })",
+          "Reading a frame when the file ends before the 4-byte length prefix returns Ok(None) indicating clean end-of-file",
+          "Reading a frame where the file ends after the length prefix but before all payload bytes returns Ok(None) indicating truncation",
+          "Reading a frame where the file ends after the payload but before the 4-byte checksum returns Ok(None) indicating truncation",
+          "A ChecksumMismatch error names both the expected (stored) and actual (computed) values"
+        ],
+        "files": {
+          "create": [],
+          "modify": [
+            "crates/haematite/src/wal/recovery.rs"
+          ],
+          "delete": []
+        },
+        "checklist": [],
+        "stories": []
+      },
+      {
+        "id": "R3",
+        "title": "Mutation deserialisation matching DurableWal format",
+        "spec": "WHEN a payload is decoded from a WAL frame, THE SYSTEM SHALL deserialise it using the same tag-prefixed format written by DurableWal: tag byte 0x01 for Mutation::Put (followed by 4-byte LE key length, key bytes, 4-byte LE value length, value bytes), tag byte 0x02 for Mutation::Delete (followed by 4-byte LE key length, key bytes), and tag byte 0x03 for a Commit entry (followed by the 32-byte root hash). IF a payload begins with an unknown tag byte, THE SYSTEM SHALL return WalError::ChecksumMismatch with a descriptive message \u2014 an unknown tag in an otherwise intact frame is data corruption, not truncation. THE SYSTEM SHALL NOT produce Mutation values with partial fields \u2014 if the payload length is inconsistent with the tag's required fields, this is a corrupted entry.",
+        "acceptance": [
+          "A payload beginning with 0x01 and valid key/value fields deserialises to Mutation::Put { key, value }",
+          "A payload beginning with 0x02 and a valid key field deserialises to Mutation::Delete { key }",
+          "A payload beginning with 0x03 and 32 subsequent bytes deserialises to a Commit(Hash) variant",
+          "A payload beginning with an unknown tag (e.g. 0xFF) returns Err(WalError::ChecksumMismatch) with a message identifying the unknown tag",
+          "A Put payload where the declared key length exceeds the remaining payload bytes returns a corruption error, not a truncation sentinel"
+        ],
+        "files": {
+          "create": [],
+          "modify": [
+            "crates/haematite/src/wal/recovery.rs"
+          ],
+          "delete": []
+        },
+        "checklist": [],
+        "stories": []
+      },
+      {
+        "id": "R4",
+        "title": "WalRecovery::recover \u2014 replay from last committed root forward",
+        "spec": "WHEN WalRecovery::recover(initial_root) is called, THE SYSTEM SHALL scan the WAL file from the beginning, tracking the position of every Commit entry encountered. After locating the last Commit entry, THE SYSTEM SHALL replay all subsequent Put and Delete mutations into a new WalBuffer in the order they appear in the file. THE SYSTEM SHALL stop replay when it encounters a truncated entry (returning the WalBuffer as recovered so far \u2014 truncation is normal) or the end of file. THE SYSTEM SHALL return Err on encountering a corrupted entry (bad CRC32 or unknown tag) at any position. THE SYSTEM SHALL NOT replay mutations that precede the last Commit entry \u2014 those are already committed to the tree at initial_root. THE SYSTEM SHALL NOT modify the WAL file during recovery. IF the WAL file contains no Commit entries, THE SYSTEM SHALL replay all entries from the beginning, treating the provided initial_root as the baseline.",
+        "acceptance": [
+          "Given a WAL with: Put(a=1), Commit(hash_A), Put(b=2), Put(c=3), recover() returns a WalBuffer containing exactly Put(b=2) and Put(c=3)",
+          "Given a WAL with: Put(a=1), Commit(hash_A), Put(b=2), [truncated frame], recover() returns Ok(WalBuffer{b=2}) \u2014 the truncated tail is accepted",
+          "Given a WAL with: Put(a=1), Commit(hash_A), [corrupt CRC32 frame], recover() returns Err(WalError::ChecksumMismatch)",
+          "Given a WAL with no Commit entries and: Put(a=1), Put(b=2), recover() returns a WalBuffer containing both mutations",
+          "Given a WAL with two Commit entries: Put(a=1), Commit(hash_A), Put(b=2), Commit(hash_B), Put(c=3), recover() returns a WalBuffer containing only Put(c=3)",
+          "The WAL file is unchanged (same byte length) after recover() completes"
+        ],
+        "files": {
+          "create": [],
+          "modify": [
+            "crates/haematite/src/wal/recovery.rs"
+          ],
+          "delete": []
+        },
+        "checklist": [
+          "C27"
+        ],
+        "stories": [
+          "S5"
+        ]
+      },
+      {
+        "id": "R5",
+        "title": "Wire WalRecovery into the wal module",
+        "spec": "Add pub mod recovery to wal/mod.rs and re-export WalRecovery from the wal module so that the shard actor (CORE-007) can access it as haematite::wal::WalRecovery. Update crates/haematite/src/lib.rs to expose WalRecovery at the crate root if other public types from the wal module are already re-exported there. wal/mod.rs SHALL NOT contain any logic beyond pub mod declarations and pub use re-exports (CN3).",
+        "acceptance": [
+          "crates/haematite/src/wal/mod.rs contains pub mod recovery and pub use recovery::WalRecovery",
+          "WalRecovery is accessible as haematite::wal::WalRecovery after the wiring",
+          "wal/mod.rs contains only pub mod and pub use statements \u2014 no struct definitions, functions, or trait implementations",
+          "cargo check -p haematite succeeds with WalRecovery wired in"
+        ],
+        "files": {
+          "create": [],
+          "modify": [
+            "crates/haematite/src/wal/mod.rs",
+            "crates/haematite/src/lib.rs"
+          ],
+          "delete": []
+        },
+        "checklist": [],
+        "stories": []
+      }
+    ],
+    "boundaries": [
+      "SHALL NOT implement the shard actor that calls WalRecovery::recover on restart \u2014 that is CORE-007",
+      "SHALL NOT truncate or compact the WAL file after recovery \u2014 WAL truncation is deferred to a future phase",
+      "SHALL NOT re-implement DurableWal's write path \u2014 recovery reads the format DurableWal writes; any format changes must be made in durable.rs and matched here",
+      "SHALL NOT replay mutations that are already committed to the prolly tree \u2014 only mutations after the last Commit entry are replayed",
+      "SHALL NOT perform any prolly tree operations \u2014 the returned WalBuffer is handed to the shard actor, which owns the tree"
+    ],
+    "verification": [
+      "cargo check -p haematite succeeds with no errors",
+      "cargo test -p haematite --lib passes all tests in the wal::recovery module",
+      "cargo clippy -p haematite -- -D warnings produces no warnings",
+      "grep -r 'unwrap()\\|expect(' crates/haematite/src/wal/recovery.rs produces no matches outside #[cfg(test)] blocks",
+      "crates/haematite/src/wal/recovery.rs does not exceed 500 lines",
+      "grep -n '.' crates/haematite/src/wal/mod.rs | grep -v 'pub mod\\|pub use\\|^[[:space:]]*$\\|//' produces no output \u2014 mod.rs contains only declarations",
+      "A round-trip test: write N mutations and a commit to a DurableWal, then recover with WalRecovery and assert the returned WalBuffer contains exactly the post-commit mutations"
+    ]
+  },
+  "resolved_context": {
+    "adrs": [
+      {
+        "id": "ADR-003",
+        "title": "WAL buffer for write amortization rather than direct tree mutation",
+        "decision": "WAL buffer over direct tree mutation, because it gives sequential-append write latency (the WAL) with amortized tree cost (one path-to-root rewrite per flush, not per write). The rejected alternative (direct mutation with batching windows) forces callers to accept high write latency or risk high write amplification with small batches.",
+        "quote": "",
+        "decided_by": "Bono"
+      }
+    ],
+    "checklist": [
+      {
+        "id": "C27",
+        "text": "WalRecovery replays the durable WAL from a given root hash forward, reconstructing the buffer state."
+      }
+    ],
+    "stories": [
+      {
+        "id": "S5",
+        "text": "As an application developer, I want the database to recover automatically from crashes so that I do not need to write recovery logic."
+      }
+    ],
+    "constraints": [
+      {
+        "id": "CN1",
+        "text": "No file over 500 lines. If a module approaches this limit, extract into submodules."
+      },
+      {
+        "id": "CN2",
+        "text": "No panics in production code. .unwrap() and .expect() only in tests."
+      },
+      {
+        "id": "CN3",
+        "text": "mod.rs contains ONLY pub mod declarations and pub use re-exports. No logic."
+      },
+      {
+        "id": "CN4",
+        "text": "All public types implement Debug. All error types implement std::error::Error."
+      },
+      {
+        "id": "CN5",
+        "text": "The prolly tree root hash for a given key-value set must be deterministic and history-independent: the same keys and values always produce the same root hash regardless of insertion order."
+      },
+      {
+        "id": "CN6",
+        "text": "WAL buffer reads must shadow tree reads: a key written to the buffer but not yet committed must be returned by get, not the stale tree value."
+      },
+      {
+        "id": "CN7",
+        "text": "Shard actor crash must not affect other shards. Supervision restarts only the failed shard."
+      },
+      {
+        "id": "CN8",
+        "text": "Batch append (multiple key-value pairs in one call) must produce exactly one tree commit, not N individual commits."
+      }
+    ],
+    "intention": "Haematite's core is a storage engine where concurrency is free and branching is structural. When this cluster is complete, a developer can open a haematite database, write to it from hundreds of concurrent actors without any locking discipline, fork it instantly by sharing a hash, and merge two forks by walking only the nodes that differ. The experience should feel like working with an in-memory data structure that happens to be durable \u2014 no connection pools, no transaction coordinators, no lock managers. The content-addressed prolly tree is what makes branching zero-friction; the actor-per-shard model is what makes concurrency zero-contention; the WAL buffer is what makes writes fast despite the content-addressing overhead. All three are load-bearing.",
+    "design_path": "docs/design/core",
+    "provenance": {
+      "requested_by": "Tom",
+      "quote": "Haematite's core is a storage engine where concurrency is free and branching is structural. When this cluster is complete, a developer can open a haematite database, write to it from hundreds of concu"
+    }
+  },
+  "verify_fix_cap": 3,
+  "review_cap": 1,
+  "round_backoff_ms": 2000,
+  "review_deadline_ms": 300000
+}

@@ -1,0 +1,268 @@
+{
+  "repo_root": "/Users/tom/Developer/ablative/haematite",
+  "brief_id": "DIST-002",
+  "reviewers": [
+    "Danger Mouse"
+  ],
+  "base_ref": "main",
+  "placement": "local",
+  "isolation": "worktree",
+  "brief_document": {
+    "id": "DIST-002",
+    "cluster": "distribution",
+    "title": "Sync-time merge and consistency modes",
+    "depends_on": [
+      "DIST-001",
+      "BRANCH-002"
+    ],
+    "blocked_by": [],
+    "checklist": [
+      "C11",
+      "C12",
+      "C13",
+      "C14",
+      "C15",
+      "C16"
+    ],
+    "stories": [
+      "S6",
+      "S7",
+      "S9",
+      "S10"
+    ],
+    "design_anchor": [
+      "ADR-001"
+    ],
+    "purpose": "Deliver sync-time merge for divergent writes and configurable consistency modes (eventual and strong). When two nodes have independently written to the same key, sync merges them using the same conflict resolution policies as the branching cluster. Strong consistency waits for quorum acknowledgment.",
+    "task": "Implement sync-time merge: when the pull sync discovers divergence (both nodes wrote to the same key independently), apply the configured conflict resolution policy to produce a merged result. The merged result is committed to the target's tree as a new root hash. Implement two consistency modes: eventual (async sync at configurable intervals, non-blocking) and strong (synchronous sync, wait for quorum N/2+1 before returning from writes). Consistency mode is configurable per-operation.",
+    "requirements": [
+      {
+        "id": "R1",
+        "title": "Sync-time divergence detection",
+        "spec": "WHEN pull sync discovers that both nodes have modified the same key independently (different values for the same key, neither derived from the other), THE SYSTEM SHALL detect this as a divergence and route it to conflict resolution.",
+        "acceptance": [
+          "Two nodes that both wrote to key K with different values trigger divergence detection",
+          "A node that only received writes from the other (non-divergent) does not trigger divergence",
+          "Divergence detection works per-key within the sync walk"
+        ],
+        "files": {
+          "create": [
+            "crates/haematite/src/sync/merge.rs"
+          ],
+          "modify": [
+            "crates/haematite/src/sync/mod.rs"
+          ],
+          "delete": []
+        },
+        "checklist": [
+          "C11"
+        ],
+        "stories": [
+          "S9"
+        ]
+      },
+      {
+        "id": "R2",
+        "title": "Conflict resolution during sync",
+        "spec": "WHEN divergence is detected during sync, THE SYSTEM SHALL resolve it using the configured conflict resolution policy (LWW, vector-clock, or custom \u2014 the same policies as BRANCH-002). THE SYSTEM SHALL NOT silently drop either side's value. THE SYSTEM SHALL commit the merged result to the target's tree.",
+        "acceptance": [
+          "Divergent writes are resolved using the configured policy",
+          "The merged result is committed as a new root hash on the target",
+          "No data is silently discarded",
+          "The conflict resolution policy from BRANCH-002 is reused, not reimplemented"
+        ],
+        "files": {
+          "create": [],
+          "modify": [
+            "crates/haematite/src/sync/merge.rs"
+          ],
+          "delete": []
+        },
+        "checklist": [
+          "C12",
+          "C13"
+        ],
+        "stories": [
+          "S9",
+          "S10"
+        ]
+      },
+      {
+        "id": "R3",
+        "title": "Eventual consistency mode",
+        "spec": "WHEN eventual consistency is configured, THE SYSTEM SHALL sync at configurable intervals without blocking the write path. THE SYSTEM SHALL NOT wait for sync acknowledgment before returning from write operations.",
+        "acceptance": [
+          "Writes return immediately without waiting for sync",
+          "Sync triggers periodically at the configured interval",
+          "Data propagates to other nodes within a bounded number of sync intervals"
+        ],
+        "files": {
+          "create": [
+            "crates/haematite/src/sync/consistency.rs"
+          ],
+          "modify": [
+            "crates/haematite/src/sync/mod.rs"
+          ],
+          "delete": []
+        },
+        "checklist": [
+          "C14"
+        ],
+        "stories": [
+          "S7"
+        ]
+      },
+      {
+        "id": "R4",
+        "title": "Strong consistency mode",
+        "spec": "WHEN strong consistency is requested for an operation, THE SYSTEM SHALL NOT return from the write until quorum (N/2+1) nodes have acknowledged receiving the data via sync. THE SYSTEM SHALL return an error if quorum cannot be reached within a timeout.",
+        "acceptance": [
+          "A write with strong consistency blocks until N/2+1 nodes acknowledge",
+          "A write with strong consistency returns an error if quorum is not reached within timeout",
+          "The quorum count is N/2+1 where N is the total node count"
+        ],
+        "files": {
+          "create": [],
+          "modify": [
+            "crates/haematite/src/sync/consistency.rs"
+          ],
+          "delete": []
+        },
+        "checklist": [
+          "C15"
+        ],
+        "stories": [
+          "S6"
+        ]
+      },
+      {
+        "id": "R5",
+        "title": "Per-operation consistency selection",
+        "spec": "THE SYSTEM SHALL accept consistency mode as a parameter per operation. THE SYSTEM SHALL support Eventual and Strong as variants.",
+        "acceptance": [
+          "put(key, value, consistency=Strong) waits for quorum",
+          "put(key, value, consistency=Eventual) returns immediately",
+          "Different operations on the same database can use different consistency modes"
+        ],
+        "files": {
+          "create": [],
+          "modify": [
+            "crates/haematite/src/sync/consistency.rs"
+          ],
+          "delete": []
+        },
+        "checklist": [
+          "C16"
+        ],
+        "stories": [
+          "S6",
+          "S7"
+        ]
+      }
+    ],
+    "boundaries": [
+      "SHALL NOT implement the sync protocol or node transfer \u2014 that is DIST-001",
+      "SHALL NOT implement topology or sync scheduling \u2014 that is DIST-003",
+      "SHALL NOT reimplement conflict resolution \u2014 reuse policies from BRANCH-002",
+      "SHALL NOT implement Paxos or Raft \u2014 strong consistency is quorum-based sync acknowledgment"
+    ],
+    "verification": [
+      "cargo check -p haematite succeeds with no errors",
+      "cargo test -p haematite --lib passes all tests",
+      "cargo clippy -p haematite produces no errors",
+      "grep -r 'unwrap()\\|expect(' crates/haematite/src/sync/ --include='*.rs' -l finds no non-test files",
+      "No file in crates/haematite/src/sync/ exceeds 500 lines"
+    ]
+  },
+  "resolved_context": {
+    "adrs": [
+      {
+        "id": "ADR-001",
+        "title": "Content-addressed prolly tree over B+ tree with WAL overlay",
+        "decision": "Content-addressed prolly tree over B+ tree with WAL overlay, because branching/merging/sync is the headline feature and must be structural (O(differences), history-independent) rather than overlaid (O(branch-writes), order-dependent). The rejected alternative (B+ tree + WAL overlay) makes branching an afterthought \u2014 functional but O(branch-writes) for merge and requiring WAL coordination for replication.",
+        "quote": "",
+        "decided_by": "Bono, Frodo Baggins, Sir Patick Stewart"
+      }
+    ],
+    "checklist": [
+      {
+        "id": "C11",
+        "text": "When both nodes have diverged (independent writes to the same key), sync performs a merge using the configured conflict resolution policy."
+      },
+      {
+        "id": "C12",
+        "text": "Divergent writes are never silently dropped \u2014 they are resolved or surfaced (CN4)."
+      },
+      {
+        "id": "C13",
+        "text": "The merged result is committed to the target's tree as a new root hash."
+      },
+      {
+        "id": "C14",
+        "text": "Eventual consistency mode syncs at configurable intervals without blocking the write path."
+      },
+      {
+        "id": "C15",
+        "text": "Strong consistency mode waits for quorum (N/2+1) acknowledgments before returning from a write (CN3)."
+      },
+      {
+        "id": "C16",
+        "text": "Consistency mode is configurable per-operation."
+      }
+    ],
+    "stories": [
+      {
+        "id": "S6",
+        "text": "As the Aion engine, I want to request strong consistency for critical writes so that quorum acknowledgment guarantees the event survives any single node failure."
+      },
+      {
+        "id": "S7",
+        "text": "As the Aion engine, I want eventual consistency for non-critical reads so that read latency is not penalised by sync round-trips."
+      },
+      {
+        "id": "S9",
+        "text": "As an application developer, I want divergent writes to be merged automatically so that I do not need to implement my own conflict resolution for multi-writer scenarios."
+      },
+      {
+        "id": "S10",
+        "text": "As an application developer, I want to choose the conflict resolution policy per-operation so that different data types can use different merge strategies."
+      }
+    ],
+    "constraints": [
+      {
+        "id": "CN1",
+        "text": "Sync must transfer only content-addressed nodes that the target does not have. Full database copies on sync are a correctness bug."
+      },
+      {
+        "id": "CN2",
+        "text": "Sync must operate per-shard. A sync on shard 5 must not block or affect shards 0-4 and 6-N."
+      },
+      {
+        "id": "CN3",
+        "text": "Strong consistency mode must wait for quorum (N/2+1) acknowledgments before returning. Returning early is a durability violation."
+      },
+      {
+        "id": "CN4",
+        "text": "Divergent writes must be resolved by the configured conflict resolution policy, never silently dropped."
+      },
+      {
+        "id": "CN5",
+        "text": "Sync must use beamr's existing distribution connections. No separate TCP connections or custom transport."
+      },
+      {
+        "id": "CN6",
+        "text": "A sync failure (network partition, node crash mid-sync) must not corrupt either node's local state. Partial syncs are safe to retry."
+      }
+    ],
+    "intention": "Distribution extends haematite from a single-node storage engine to a multi-node system where databases on different machines stay in sync by exchanging content-addressed tree nodes. When this cluster is complete, two haematite nodes can sync a database by comparing root hashes and exchanging only the missing nodes \u2014 the same mechanism git uses for fetch and push, applied to a live key-value store. There is no primary-replica relationship, no replication log to manage, no WAL coordination. Any node can sync with any other node. The experience should feel like git remote: add a remote, push, pull, and the content-addressed structure guarantees that the minimal set of data moves.",
+    "design_path": "docs/design/distribution",
+    "provenance": {
+      "requested_by": "Tom",
+      "quote": "Distribution extends haematite from a single-node storage engine to a multi-node system where databases on different machines stay in sync by exchanging content-addressed tree nodes. When this cluster"
+    }
+  },
+  "verify_fix_cap": 3,
+  "review_cap": 1,
+  "round_backoff_ms": 2000,
+  "review_deadline_ms": 300000
+}

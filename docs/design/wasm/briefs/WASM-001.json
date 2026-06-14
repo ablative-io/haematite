@@ -1,0 +1,230 @@
+{
+  "id": "WASM-001",
+  "cluster": "wasm",
+  "title": "WASM build target, runtime adapter, and IndexedDB node store",
+  "depends_on": [
+    "CORE-001",
+    "PERSIST-001"
+  ],
+  "blocked_by": [],
+  "checklist": [
+    "C1",
+    "C2",
+    "C3",
+    "C4",
+    "C5",
+    "C6",
+    "C7",
+    "C8",
+    "C9",
+    "C10"
+  ],
+  "stories": [
+    "S1",
+    "S2",
+    "S3",
+    "S4",
+    "S6",
+    "S8",
+    "S9",
+    "S10"
+  ],
+  "design_anchor": [
+    "ADR-002",
+    "ADR-006"
+  ],
+  "purpose": "Deliver the WASM compilation target, the web worker runtime adapter, and the IndexedDB-backed NodeStore. This is the foundation for running haematite in the browser \u2014 the same API, the same content-addressed tree, backed by IndexedDB instead of the filesystem.",
+  "task": "Add a wasm feature flag that cfg-gates filesystem-only code (DiskStore, native durable WAL). Implement the WASM runtime adapter that runs shard actors on web workers via beamr-wasm. Implement IndexedDB NodeStore with hash as key and zstd-compressed bytes as value. IndexedDB is async \u2014 the adapter runs on web workers where transactions can be awaited. Reuse the LRU cache for decompressed nodes in WASM linear memory. Ensure BLAKE3 portable implementation produces identical hashes to native SIMD implementation. Target binary size under 2MB gzipped. Does not implement OPFS WAL (WASM-002) or browser transport (WASM-003).",
+  "requirements": [
+    {
+      "id": "R1",
+      "title": "WASM feature flag and cfg gates",
+      "spec": "THE SYSTEM SHALL add a wasm feature flag to Cargo.toml. WHEN the wasm feature is enabled, THE SYSTEM SHALL cfg-gate out filesystem-only code (DiskStore, native durable WAL). THE SYSTEM SHALL ensure no native-only dependencies leak into the WASM build.",
+      "acceptance": [
+        "Cargo.toml has a [features] wasm entry",
+        "DiskStore and native WAL are behind #[cfg(not(feature = \"wasm\"))]",
+        "cargo check -p haematite --target wasm32-unknown-unknown --features wasm succeeds",
+        "No native-only dependencies appear in the WASM dependency tree"
+      ],
+      "files": {
+        "create": [
+          "crates/haematite/src/wasm/mod.rs"
+        ],
+        "modify": [
+          "crates/haematite/Cargo.toml",
+          "crates/haematite/src/lib.rs",
+          "crates/haematite/src/store/mod.rs"
+        ],
+        "delete": []
+      },
+      "checklist": [
+        "C1",
+        "C2"
+      ],
+      "stories": [
+        "S8",
+        "S9"
+      ]
+    },
+    {
+      "id": "R2",
+      "title": "BLAKE3 portable hash parity",
+      "spec": "THE SYSTEM SHALL verify that the BLAKE3 portable (non-SIMD) implementation used in WASM produces identical hashes to the SIMD-accelerated implementation used in native builds. THE SYSTEM SHALL NOT use any WASM-specific hash implementation.",
+      "acceptance": [
+        "Hashing the same input on native (SIMD) and WASM (portable) produces identical 32-byte hashes",
+        "A test hashes a known input and asserts the output matches across both implementations",
+        "The blake3 crate's portable feature is used for the WASM target"
+      ],
+      "files": {
+        "create": [],
+        "modify": [
+          "crates/haematite/Cargo.toml"
+        ],
+        "delete": []
+      },
+      "checklist": [
+        "C3"
+      ],
+      "stories": [
+        "S6",
+        "S10",
+        "S8"
+      ]
+    },
+    {
+      "id": "R3",
+      "title": "WASM runtime adapter",
+      "spec": "THE SYSTEM SHALL implement a runtime adapter that runs shard actors on web workers using beamr-wasm's scheduler. THE SYSTEM SHALL integrate with the browser's event loop. THE SYSTEM SHALL NOT run shard actors on the main thread.",
+      "acceptance": [
+        "Shard actors run on web worker threads",
+        "The main thread is not blocked by shard actor operations",
+        "The adapter uses beamr-wasm's existing scheduler",
+        "Multiple shard actors can run concurrently on separate web workers"
+      ],
+      "files": {
+        "create": [
+          "crates/haematite/src/wasm/runtime.rs"
+        ],
+        "modify": [
+          "crates/haematite/src/wasm/mod.rs"
+        ],
+        "delete": []
+      },
+      "checklist": [
+        "C5"
+      ],
+      "stories": [
+        "S3"
+      ]
+    },
+    {
+      "id": "R4",
+      "title": "IndexedDB NodeStore",
+      "spec": "THE SYSTEM SHALL implement an IndexedDB-backed NodeStore where each content-addressed node is stored as an IndexedDB object with the BLAKE3 hash as key and zstd-compressed bytes as value. THE SYSTEM SHALL NOT block the browser's main thread with IndexedDB operations. THE SYSTEM SHALL run IndexedDB transactions on web workers.",
+      "acceptance": [
+        "IndexedDbStore implements the NodeStore trait",
+        "put(node) stores compressed bytes in IndexedDB with hash as key",
+        "get(hash) retrieves and decompresses the node from IndexedDB",
+        "get(unknown_hash) returns None",
+        "IndexedDB operations run on web workers, not the main thread"
+      ],
+      "files": {
+        "create": [
+          "crates/haematite/src/store/indexeddb.rs"
+        ],
+        "modify": [
+          "crates/haematite/src/store/mod.rs"
+        ],
+        "delete": []
+      },
+      "checklist": [
+        "C6",
+        "C7"
+      ],
+      "stories": [
+        "S1"
+      ]
+    },
+    {
+      "id": "R5",
+      "title": "LRU cache reuse in WASM",
+      "spec": "THE SYSTEM SHALL reuse the LRU cache from the persistence cluster to cache decompressed nodes in WASM linear memory. THE SYSTEM SHALL NOT implement a separate cache for WASM.",
+      "acceptance": [
+        "The same LruCache type is used in both native and WASM builds",
+        "Cached nodes are stored decompressed in WASM linear memory",
+        "A cache hit avoids IndexedDB access"
+      ],
+      "files": {
+        "create": [],
+        "modify": [
+          "crates/haematite/src/store/indexeddb.rs"
+        ],
+        "delete": []
+      },
+      "checklist": [
+        "C8"
+      ],
+      "stories": []
+    },
+    {
+      "id": "R6",
+      "title": "Idempotent writes and functional parity",
+      "spec": "THE SYSTEM SHALL ensure IndexedDB NodeStore passes the same functional tests as the native DiskStore: idempotent writes, round-trip serialisation, and hash-based lookup. THE SYSTEM SHALL make write of an existing hash a no-op.",
+      "acceptance": [
+        "put(node) twice returns the same hash both times without error",
+        "A node round-trips through put/get correctly",
+        "The IndexedDB store passes the same test suite as DiskStore"
+      ],
+      "files": {
+        "create": [],
+        "modify": [
+          "crates/haematite/src/store/indexeddb.rs"
+        ],
+        "delete": []
+      },
+      "checklist": [
+        "C9",
+        "C10"
+      ],
+      "stories": [
+        "S4"
+      ]
+    },
+    {
+      "id": "R7",
+      "title": "Binary size optimisation",
+      "spec": "THE SYSTEM SHALL keep the WASM binary size under 2MB gzipped. THE SYSTEM SHALL use wasm-opt for size optimisation. THE SYSTEM SHALL cfg-gate any dependency that significantly inflates the WASM binary.",
+      "acceptance": [
+        "wasm-pack build --release produces a binary under 2MB gzipped",
+        "wasm-opt is applied in the release build",
+        "No unnecessary dependencies are included in the WASM build"
+      ],
+      "files": {
+        "create": [],
+        "modify": [
+          "crates/haematite/Cargo.toml"
+        ],
+        "delete": []
+      },
+      "checklist": [
+        "C4"
+      ],
+      "stories": [
+        "S2"
+      ]
+    }
+  ],
+  "boundaries": [
+    "SHALL NOT implement OPFS WAL backend \u2014 that is WASM-002",
+    "SHALL NOT implement browser transport for distribution \u2014 that is WASM-003",
+    "SHALL NOT run shard actors on the main thread",
+    "SHALL NOT implement a WASM-specific hash function \u2014 use BLAKE3 portable"
+  ],
+  "verification": [
+    "cargo check -p haematite --target wasm32-unknown-unknown --features wasm succeeds",
+    "cargo test -p haematite --lib passes all tests (native)",
+    "cargo clippy -p haematite produces no errors",
+    "grep -r 'unwrap()\\|expect(' crates/haematite/src/wasm/ --include='*.rs' -l finds no non-test files",
+    "No file in crates/haematite/src/ exceeds 500 lines"
+  ]
+}

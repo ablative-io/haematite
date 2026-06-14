@@ -1,0 +1,64 @@
+{
+  "cluster": "core",
+  "title": "Prolly Tree, WAL Buffer, and Actor-Per-Shard Foundation",
+  "intention": "Haematite's core is a storage engine where concurrency is free and branching is structural. When this cluster is complete, a developer can open a haematite database, write to it from hundreds of concurrent actors without any locking discipline, fork it instantly by sharing a hash, and merge two forks by walking only the nodes that differ. The experience should feel like working with an in-memory data structure that happens to be durable — no connection pools, no transaction coordinators, no lock managers. The content-addressed prolly tree is what makes branching zero-friction; the actor-per-shard model is what makes concurrency zero-contention; the WAL buffer is what makes writes fast despite the content-addressing overhead. All three are load-bearing.",
+  "problem": "Every embedded key-value store (SQLite, LMDB, RocksDB, sled) serialises writes behind a lock. The moment you need concurrent writers, you pay for lock contention, write-ahead log coordination, and reader-writer scheduling. Branching (forking a database for testing, debugging, or speculative work) is either impossible or implemented as a full copy. Multi-node sync requires replication logs and primary-replica coordination. These are structural limitations of the B-tree and LSM architectures these databases use — not implementation bugs, but consequences of mutable, order-dependent data structures.\n\nAion needs a storage engine that supports multiple concurrent workflow writers (one per active workflow), instant fork for what-if debugging, and multi-node sync for distribution. The messaging bus needs a persistent backing store for durable channels and conversations. Both need these properties without operational complexity — no connection strings, no replica management, no lock tuning.",
+  "solution": "The core cluster delivers three interlocking components:\n\n1. Content-Addressed Prolly Tree\n\nA probabilistic B-tree where node boundaries are determined by content hashing (BLAKE3). The key property: history-independence. The same set of key-value pairs always produces the same tree, regardless of insertion order. Every node is identified by the BLAKE3 hash of its contents.\n\nNode structure: each node is either a leaf (containing sorted key-value pairs) or an internal node (containing sorted key-childHash pairs). Node boundaries are determined by a rolling hash over the key stream: when the hash meets a threshold, a boundary is placed. The threshold controls the expected node size (target: 4KB aligned with OS page size).\n\nOperations: get traverses root to leaf by key comparison. put inserts into the appropriate leaf; if the leaf splits (rolling hash boundary shifts), the parent is updated, potentially cascading to root. Every modified node gets a new hash. Unmodified subtrees keep their existing hashes — this is what makes fork cheap (shared nodes) and merge fast (skip identical subtrees by hash comparison).\n\nThe tree root hash is the database identity at a point in time. Two databases with the same root hash contain exactly the same data.\n\n2. WAL Buffer\n\nA per-shard write-ahead log that accumulates mutations before committing them to the prolly tree. The write path: caller sends a put/delete message to the shard actor; the actor appends to its in-memory WAL buffer and acknowledges immediately. The WAL is durably written to disk (sequential append, fast). Periodically — or on explicit commit — the buffer flushes to the prolly tree as a single batch, producing one new root hash.\n\nThis amortises the content-addressing overhead: N buffered writes produce one path-to-root rewrite, not N. For Aion's workload (batch event appends), this aligns perfectly — the recorder already batches.\n\nReads check the buffer first (in-memory, fast), then the tree. Buffer entries shadow tree entries for the same key.\n\nCrash recovery: on restart, the shard actor replays its durable WAL from the last committed root hash forward, reconstructing the buffer state.\n\n3. Actor-Per-Shard\n\nThe keyspace is partitioned into N shards (fixed at database creation; see ADR-004). Each shard is a supervised beamr process that owns its prolly tree and WAL buffer. The shard actor is the single writer for its key range — no locks, no contention, no shared mutable state.\n\nShard routing: shard(K) = hash(K) % N. A router actor maintains the shard table and forwards requests. Clients can cache the routing table for direct sends.\n\nSupervision: each shard actor is supervised. Crash leads to automatic restart with WAL replay. Other shards are unaffected. The supervision tree mirrors beamr's existing OTP-style supervision.\n\nRead replicas: a shard can spawn read-replica processes that trail the primary by subscribing to committed root hashes. Replicas serve reads from their (slightly stale) tree snapshot. This provides read scaling without write contention.",
+  "principles": [
+    {"id": "P1", "text": "Content is identity. A node's hash is derived from its contents, never assigned. Two nodes with the same content have the same hash. This is the foundation of fork, merge, sync, and caching."},
+    {"id": "P2", "text": "The shard actor is the single writer. No operation on a shard's data happens outside that shard's actor. All mutations arrive as messages. This eliminates locks and makes the concurrency model trivially correct."},
+    {"id": "P3", "text": "Writes are buffered, commits are atomic. The WAL buffer is the write hot path; the tree commit is the durability boundary. A commit produces exactly one new root hash from all buffered writes."},
+    {"id": "P4", "text": "Unmodified subtrees are free. Fork, merge, and sync skip subtrees whose root hash matches. The cost of any structural operation is proportional to the differences, not the total data."},
+    {"id": "P5", "text": "The API hides the representation. Callers interact with get/put/delete/range/append/commit. Whether the shard uses a prolly tree, a B+ tree, or a filing cabinet is invisible at the API boundary."},
+    {"id": "P6", "text": "No silent defaults. Every configuration (shard count, commit policy, compression) is explicit. An unconfigured database is an error, not a database with surprising behaviour."}
+  ],
+  "decisions": ["ADR-001", "ADR-002", "ADR-003", "ADR-004", "ADR-005", "ADR-006"],
+  "goals": [
+    "A haematite database can be opened, written to from 256 concurrent shard actors, and read from with zero lock contention.",
+    "put followed by get returns the written value within the same shard actor, both from buffer and after commit.",
+    "commit produces a deterministic root hash: the same sequence of puts to an empty database always produces the same hash.",
+    "Two databases forked from the same root hash and independently mutated can be compared by walking only the differing subtrees.",
+    "Crash recovery replays the WAL from the last committed root and reconstructs buffer state without data loss.",
+    "range queries return keys in sorted order, merging buffer entries with tree entries correctly."
+  ],
+  "non_goals": [
+    {"text": "Dynamic resharding (changing shard count after creation)", "reason": "Deferred to a future phase per ADR-004. Fixed shard count is sufficient for single-node deployments."},
+    {"text": "Secondary indexes", "reason": "Scan with predicate covers Aion's search-attribute queries. Full secondary indexes deferred until real query patterns are understood."},
+    {"text": "Multi-node distribution", "reason": "Covered by the distribution cluster (RM-007). The core cluster provides the content-addressed structure that distribution builds on."},
+    {"text": "WASM compilation", "reason": "Covered by the wasm cluster (RM-010). The core cluster targets native Rust only."},
+    {"text": "Branching and merging operations", "reason": "Covered by the branching cluster (RM-004). The core cluster provides the content-addressed tree that branching depends on, including tree diff (CORE-003)."},
+    {"text": "Transaction isolation levels", "reason": "The single-writer-per-shard model provides serialisability within a shard. Cross-shard transactions are out of scope for the initial release."}
+  ],
+  "structure": [
+    {"path": "crates/haematite/src/lib.rs", "note": "Crate root, public API re-exports", "brief": "CORE-001"},
+    {"path": "crates/haematite/src/tree/mod.rs", "note": "Prolly tree module root", "brief": "CORE-001"},
+    {"path": "crates/haematite/src/tree/node.rs", "note": "Node types: leaf and internal, serialisation, BLAKE3 hashing", "brief": "CORE-001"},
+    {"path": "crates/haematite/src/tree/boundary.rs", "note": "Rolling hash boundary detection for node splitting", "brief": "CORE-001"},
+    {"path": "crates/haematite/src/tree/cursor.rs", "note": "Tree traversal cursor for get/range operations", "brief": "CORE-002"},
+    {"path": "crates/haematite/src/tree/mutate.rs", "note": "Tree mutation: insert, delete, node split/merge, path-to-root rewrite", "brief": "CORE-002"},
+    {"path": "crates/haematite/src/tree/diff.rs", "note": "Structural diff between two trees by root hash comparison", "brief": "CORE-003"},
+    {"path": "crates/haematite/src/store/mod.rs", "note": "Node store module root", "brief": "CORE-001"},
+    {"path": "crates/haematite/src/store/memory.rs", "note": "In-memory node store (HashMap<Hash, Node>) for testing", "brief": "CORE-001"},
+    {"path": "crates/haematite/src/store/disk.rs", "note": "On-disk node store with zstd compression", "brief": "CORE-004"},
+    {"path": "crates/haematite/src/wal/mod.rs", "note": "WAL module root", "brief": "CORE-005"},
+    {"path": "crates/haematite/src/wal/buffer.rs", "note": "In-memory WAL buffer with sorted mutation log", "brief": "CORE-005"},
+    {"path": "crates/haematite/src/wal/durable.rs", "note": "Durable WAL writer (append-only file)", "brief": "CORE-005"},
+    {"path": "crates/haematite/src/wal/recovery.rs", "note": "WAL replay for crash recovery", "brief": "CORE-006"},
+    {"path": "crates/haematite/src/shard/mod.rs", "note": "Shard actor module root", "brief": "CORE-007"},
+    {"path": "crates/haematite/src/shard/actor.rs", "note": "Shard actor: owns tree + WAL buffer, handles get/put/delete/commit messages", "brief": "CORE-007"},
+    {"path": "crates/haematite/src/shard/router.rs", "note": "Shard router: hash-based key-to-shard mapping", "brief": "CORE-008"},
+    {"path": "crates/haematite/src/db.rs", "note": "Database handle: opens/creates databases, manages shard actors, exposes public API", "brief": "CORE-009"},
+    {"path": "crates/haematite/Cargo.toml", "note": "Crate manifest with blake3, zstd, beamr dependencies", "brief": "CORE-001"}
+  ],
+  "inventory": [],
+  "constraints": [
+    {"id": "CN1", "text": "No file over 500 lines. If a module approaches this limit, extract into submodules."},
+    {"id": "CN2", "text": "No panics in production code. .unwrap() and .expect() only in tests."},
+    {"id": "CN3", "text": "mod.rs contains ONLY pub mod declarations and pub use re-exports. No logic."},
+    {"id": "CN4", "text": "All public types implement Debug. All error types implement std::error::Error."},
+    {"id": "CN5", "text": "The prolly tree root hash for a given key-value set must be deterministic and history-independent: the same keys and values always produce the same root hash regardless of insertion order."},
+    {"id": "CN6", "text": "WAL buffer reads must shadow tree reads: a key written to the buffer but not yet committed must be returned by get, not the stale tree value."},
+    {"id": "CN7", "text": "Shard actor crash must not affect other shards. Supervision restarts only the failed shard."},
+    {"id": "CN8", "text": "Batch append (multiple key-value pairs in one call) must produce exactly one tree commit, not N individual commits."}
+  ]
+}

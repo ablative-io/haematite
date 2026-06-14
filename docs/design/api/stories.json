@@ -1,0 +1,45 @@
+{
+  "cluster": "api",
+  "personas": [
+    {
+      "name": "Aion Engine",
+      "role": "Using haematite as the EventStore backend",
+      "stories": [
+        {"id": "S1", "text": "As the Aion engine, I want to append events to a workflow key with optimistic concurrency so that two concurrent recorders to the same workflow are detected and one retries."},
+        {"id": "S2", "text": "As the Aion engine, I want to batch-append WorkflowStarted and SearchAttributesUpdated atomically so that a crash between them never leaves an orphaned workflow."},
+        {"id": "S3", "text": "As the Aion engine, I want to read a workflow's full event history in sequence order so that I can replay it for recovery."},
+        {"id": "S4", "text": "As the Aion engine, I want to read events from a specific sequence number forward so that recovery resumes without re-reading the entire history."},
+        {"id": "S5", "text": "As the Aion engine, I want to scan for workflows matching search attributes so that I can implement workflow visibility queries."},
+        {"id": "S6", "text": "As the Aion engine, I want expired workflow histories to return a HistoryCompacted error so that I can distinguish compacted workflows from missing ones."}
+      ]
+    },
+    {
+      "name": "Messaging Bus",
+      "role": "Using haematite for durable channel state",
+      "stories": [
+        {"id": "S7", "text": "As the messaging bus, I want to put and get conversation state by key so that durable channel state survives restarts."},
+        {"id": "S8", "text": "As the messaging bus, I want to delete keys so that I can clean up closed conversations."},
+        {"id": "S9", "text": "As the messaging bus, I want to set a TTL on consumer cursors so that abandoned cursors are automatically cleaned up without application-level sweep logic."},
+        {"id": "S10", "text": "As the messaging bus, I want range queries to return keys in sorted order so that I can efficiently list conversations in a channel."}
+      ]
+    },
+    {
+      "name": "Application Developer",
+      "role": "Embedding haematite as a general KV store",
+      "stories": [
+        {"id": "S11", "text": "As an application developer, I want a simple get/put/delete/range API so that I can use haematite without understanding prolly trees or WAL buffers."},
+        {"id": "S12", "text": "As an application developer, I want commit to flush all pending writes and return root hashes so that I can control the durability boundary."},
+        {"id": "S13", "text": "As an application developer, I want compare-and-swap on a single key so that I can implement optimistic concurrency for my own data structures."},
+        {"id": "S14", "text": "As an application developer, I want to set TTL at write time so that I do not need to build my own expiry system."}
+      ]
+    },
+    {
+      "name": "Operations Engineer",
+      "role": "Configuring and monitoring TTL expiry",
+      "stories": [
+        {"id": "S15", "text": "As an operations engineer, I want to configure the sweep interval per-database so that I can balance cleanup frequency against scan cost."},
+        {"id": "S16", "text": "As an operations engineer, I want the sweep actor to be independently supervised so that a sweep crash does not affect the shard actor's write availability."}
+      ]
+    }
+  ]
+}

@@ -1,0 +1,167 @@
+{
+  "id": "API-002",
+  "cluster": "api",
+  "title": "General key-value API",
+  "depends_on": [
+    "CORE-007",
+    "CORE-008",
+    "CORE-009",
+    "API-001"
+  ],
+  "blocked_by": [],
+  "checklist": [
+    "C9",
+    "C10",
+    "C11",
+    "C12",
+    "C13"
+  ],
+  "stories": [
+    "S7",
+    "S8",
+    "S10",
+    "S11",
+    "S12"
+  ],
+  "design_anchor": [
+    "ADR-003",
+    "ADR-004"
+  ],
+  "purpose": "Deliver the general key-value API (get, put, delete, range, commit) that wraps the core shard actor operations with routing, error handling, and the public type surface. This is the foundational API that both the EventStore and TTL layers build on.",
+  "task": "Implement the KV API operations routing through the shard router: get checks buffer then tree, put appends to buffer, delete appends tombstone, range merges buffer and tree in sorted order, commit flushes all shard WAL buffers. These are the same operations the shard actor handles internally; this brief wraps them with the public API surface, shard routing, and error types. Does not implement EventStore operations (API-001) or TTL (API-003).",
+  "requirements": [
+    {
+      "id": "R1",
+      "title": "KV API module",
+      "spec": "Create the kv.rs module exposing get, put, delete, range, and commit operations on the database handle. Each operation routes to the correct shard via hash(key) % shard_count.",
+      "acceptance": [
+        "crates/haematite/src/api/kv.rs exists",
+        "All five operations are publicly accessible from the database handle",
+        "Each operation routes to the correct shard actor"
+      ],
+      "files": {
+        "create": [
+          "crates/haematite/src/api/kv.rs"
+        ],
+        "modify": [
+          "crates/haematite/src/api/mod.rs"
+        ],
+        "delete": []
+      },
+      "checklist": [],
+      "stories": [
+        "S11"
+      ]
+    },
+    {
+      "id": "R2",
+      "title": "Get operation",
+      "spec": "WHEN get(key) is called, THE SYSTEM SHALL route to the owning shard and return Option<Value>. THE SYSTEM SHALL check the shard's WAL buffer first, then the tree. THE SYSTEM SHALL return None for keys that do not exist.",
+      "acceptance": [
+        "get after put returns the written value",
+        "get on a non-existent key returns None",
+        "get returns the buffer value even if the tree has a stale value for the same key"
+      ],
+      "files": {
+        "create": [],
+        "modify": [
+          "crates/haematite/src/api/kv.rs"
+        ],
+        "delete": []
+      },
+      "checklist": [
+        "C9"
+      ],
+      "stories": [
+        "S7"
+      ]
+    },
+    {
+      "id": "R3",
+      "title": "Put and delete operations",
+      "spec": "WHEN put(key, value) is called, THE SYSTEM SHALL append the mutation to the owning shard's WAL buffer. WHEN delete(key) is called, THE SYSTEM SHALL append a tombstone to the owning shard's WAL buffer. THE SYSTEM SHALL NOT flush to the tree \u2014 that is commit()'s job.",
+      "acceptance": [
+        "put(key, value) followed by get(key) returns the value",
+        "delete(key) followed by get(key) returns None",
+        "put does not trigger a tree commit",
+        "delete does not trigger a tree commit"
+      ],
+      "files": {
+        "create": [],
+        "modify": [
+          "crates/haematite/src/api/kv.rs"
+        ],
+        "delete": []
+      },
+      "checklist": [
+        "C10",
+        "C11"
+      ],
+      "stories": [
+        "S7",
+        "S8"
+      ]
+    },
+    {
+      "id": "R4",
+      "title": "Range query",
+      "spec": "WHEN range(from, to) is called, THE SYSTEM SHALL return key-value pairs in sorted key order, merging buffer entries with tree entries. THE SYSTEM SHALL route the range to the correct shard(s) based on key hash. Buffer entries shadow tree entries for the same key.",
+      "acceptance": [
+        "range returns entries in sorted key order",
+        "range includes entries from both the buffer and the tree",
+        "A buffered put shadows a tree entry for the same key in range results",
+        "A buffered delete excludes the key from range results"
+      ],
+      "files": {
+        "create": [],
+        "modify": [
+          "crates/haematite/src/api/kv.rs"
+        ],
+        "delete": []
+      },
+      "checklist": [
+        "C12"
+      ],
+      "stories": [
+        "S10"
+      ]
+    },
+    {
+      "id": "R5",
+      "title": "Commit operation",
+      "spec": "WHEN commit() is called, THE SYSTEM SHALL flush all shard WAL buffers to their respective prolly trees and return per-shard root hashes. THE SYSTEM SHALL produce exactly one tree commit per shard.",
+      "acceptance": [
+        "commit() returns a map of shard_id to root_hash",
+        "After commit, get returns values from the tree (buffer is empty)",
+        "Each shard produces exactly one tree commit",
+        "Calling commit() with no buffered writes is a no-op that returns current root hashes"
+      ],
+      "files": {
+        "create": [],
+        "modify": [
+          "crates/haematite/src/api/kv.rs"
+        ],
+        "delete": []
+      },
+      "checklist": [
+        "C13"
+      ],
+      "stories": [
+        "S12"
+      ]
+    }
+  ],
+  "boundaries": [
+    "SHALL NOT implement EventStore operations \u2014 those are API-001",
+    "SHALL NOT implement TTL or expiry \u2014 that is API-003",
+    "SHALL NOT implement cross-shard range queries that span multiple shards in a single sorted result \u2014 range routes to the owning shard(s)",
+    "SHALL NOT implement batch put/delete \u2014 single-key operations only at this layer"
+  ],
+  "verification": [
+    "cargo check -p haematite succeeds with no errors",
+    "cargo test -p haematite --lib passes all tests",
+    "cargo clippy -p haematite produces no errors",
+    "grep -r 'unwrap()\\|expect(' crates/haematite/src/api/ --include='*.rs' -l finds no non-test files",
+    "No file in crates/haematite/src/api/ exceeds 500 lines"
+  ]
+}

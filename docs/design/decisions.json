@@ -1,0 +1,121 @@
+{
+  "project": "haematite",
+  "updated": "2026-06-13",
+  "decisions": [
+    {
+      "id": "ADR-001",
+      "title": "Content-addressed prolly tree over B+ tree with WAL overlay",
+      "status": "decided",
+      "scope": "project",
+      "date": "2026-06-13",
+      "decided_by": "Bono, Frodo Baggins, Sir Patick Stewart",
+      "context": "The storage engine's headline feature is branchable/graftable databases. Two approaches were proposed: B+ tree with WAL and branching via WAL fork-point overlay (Bono's original proposal), and content-addressed prolly tree with BLAKE3 hashing where branching is structural (Sir Patick Stewart's proposal). The fork/merge/sync properties differ fundamentally: WAL overlay gives O(branch-writes) merge and requires WAL coordination for sync; prolly tree gives O(differences) three-way structural merge and sync-by-hash-negotiation between arbitrary nodes.",
+      "decision": "Content-addressed prolly tree over B+ tree with WAL overlay, because branching/merging/sync is the headline feature and must be structural (O(differences), history-independent) rather than overlaid (O(branch-writes), order-dependent). The rejected alternative (B+ tree + WAL overlay) makes branching an afterthought — functional but O(branch-writes) for merge and requiring WAL coordination for replication.",
+      "quote": "",
+      "consequences": [
+        "Every commit rewrites the path from modified leaves to root as new content-addressed nodes — write amplification is inherent and must be mitigated by WAL buffer batching (see ADR-003)",
+        "BLAKE3 hashing adds CPU cost per write — ephemeral workloads that do not need durability should bypass the tree entirely",
+        "Node deduplication is free: identical content produces identical hashes, so forked databases share all unchanged nodes without explicit copy-on-write",
+        "Cache invalidation is eliminated: content-addressed nodes are immutable, the hash IS the cache key",
+        "Sync between arbitrary nodes works by hash negotiation — no primary-replica relationship required, no WAL coordination"
+      ],
+      "supersedes": [],
+      "superseded_by": ""
+    },
+    {
+      "id": "ADR-002",
+      "title": "BLAKE3 for content addressing",
+      "status": "decided",
+      "scope": "project",
+      "date": "2026-06-13",
+      "decided_by": "Sir Patick Stewart",
+      "context": "Content-addressed nodes need a hash function. Options: SHA-256 (widely used, slower), BLAKE2b (fast, 64-byte output), BLAKE3 (fastest, 32-byte output, tree-hashable, SIMD-accelerated).",
+      "decision": "BLAKE3 over SHA-256 and BLAKE2b, because BLAKE3 is the fastest cryptographic hash available with SIMD acceleration, its 32-byte output is compact enough for node keys, and its tree-hashing mode enables parallel hashing of large nodes. SHA-256 is 3-5x slower on modern hardware. BLAKE2b is fast but BLAKE3 matches or exceeds it while being newer and better optimized.",
+      "quote": "",
+      "consequences": [
+        "The blake3 Rust crate becomes a core dependency",
+        "Node keys are 32 bytes (256 bits) — sufficient for collision resistance in all foreseeable use cases",
+        "SIMD acceleration is available on x86_64 (AVX2/AVX-512) and aarch64 (NEON) — the WASM target falls back to the portable implementation"
+      ],
+      "supersedes": [],
+      "superseded_by": ""
+    },
+    {
+      "id": "ADR-003",
+      "title": "WAL buffer for write amortization rather than direct tree mutation",
+      "status": "decided",
+      "scope": "project",
+      "date": "2026-06-13",
+      "decided_by": "Bono",
+      "context": "Content-addressed trees have inherent write amplification: every mutation rewrites the path to root. For workloads with many small writes (Aion event appends, messaging bus consumer cursors), this cost is prohibitive without amortization. Two approaches: direct tree mutation with large batching windows (simple but high latency), or a WAL buffer that accumulates writes and flushes to the tree periodically (more complex but low write latency with amortized tree cost).",
+      "decision": "WAL buffer over direct tree mutation, because it gives sequential-append write latency (the WAL) with amortized tree cost (one path-to-root rewrite per flush, not per write). The rejected alternative (direct mutation with batching windows) forces callers to accept high write latency or risk high write amplification with small batches.",
+      "quote": "",
+      "consequences": [
+        "Every shard actor maintains an in-memory WAL buffer alongside its prolly tree",
+        "Reads must check the buffer before the tree — buffer contents take precedence over tree state",
+        "Crash recovery replays the WAL buffer to reconstruct uncommitted state",
+        "The commit operation (flush buffer to tree) is the durability boundary — uncommitted writes in the buffer are recoverable from the WAL but not yet in the content-addressed structure",
+        "Batch appends (Aion's atomic multi-event append) naturally map to buffer appends followed by a single tree commit"
+      ],
+      "supersedes": [],
+      "superseded_by": ""
+    },
+    {
+      "id": "ADR-004",
+      "title": "Actor-per-shard with fixed shard count at creation",
+      "status": "decided",
+      "scope": "project",
+      "date": "2026-06-13",
+      "decided_by": "Bono, Frodo Baggins",
+      "context": "The concurrency model for the storage engine. Options: single-writer with global lock (conventional), sharded with lock-per-shard (reduced contention), actor-per-shard on beamr (zero contention). For shard count: dynamic resharding (complex, operational risk) or fixed at creation with resharding deferred to Phase 2.",
+      "decision": "Actor-per-shard on beamr with fixed shard count at creation, over single-writer and lock-per-shard, because the actor model eliminates locks entirely — each shard is a single-writer beamr process with no shared mutable state. Fixed shard count over dynamic resharding because resharding is operationally complex and can be deferred: 256 or 1024 shards covers any reasonable single-node deployment for Aion's workload (one key per workflow_id).",
+      "quote": "",
+      "consequences": [
+        "The shard count is immutable after database creation — chosen at init time based on expected write parallelism",
+        "Each shard actor is supervised: crash recovery restarts exactly the failed shard without affecting others",
+        "Shard routing is hash-based: shard(K) = hash(K) % N — consistent hashing is deferred to the resharding phase",
+        "The maximum write concurrency is bounded by shard count — 256 shards means 256 parallel writers",
+        "Resharding (changing N) is explicitly deferred to a future phase"
+      ],
+      "supersedes": [],
+      "superseded_by": ""
+    },
+    {
+      "id": "ADR-005",
+      "title": "Unbounded value size via off-heap binary storage",
+      "status": "decided",
+      "scope": "project",
+      "date": "2026-06-13",
+      "decided_by": "Bono, Frodo Baggins",
+      "context": "Should haematite impose value size limits? beamr's ProcBin stores binaries off-heap via Arc<Vec<u8>> with a 3-word on-heap stub regardless of payload size. Imposing our own limit would be an artificial constraint that prevents valid use cases (workflow state snapshots, document processing).",
+      "decision": "Unbounded value size (inheriting beamr's ProcBin off-heap storage) over imposing an arbitrary limit, because large values are a valid use case and the off-heap binary representation means they do not consume proportional heap space. The rejected alternative (size cap) would prevent Aion from storing large workflow state and would require callers to implement their own chunking.",
+      "quote": "",
+      "consequences": [
+        "Large values are stored as off-heap binaries referenced by 3-word ProcBin stubs on the process heap",
+        "Tree node size is bounded by key size, not value size — values are stored by reference",
+        "Callers can store arbitrarily large blobs without worrying about heap pressure"
+      ],
+      "supersedes": [],
+      "superseded_by": ""
+    },
+    {
+      "id": "ADR-006",
+      "title": "zstd compression per content-addressed node, WAL uncompressed",
+      "status": "decided",
+      "scope": "project",
+      "date": "2026-06-13",
+      "decided_by": "Bono, Frodo Baggins",
+      "context": "Compression strategy: per-WAL-entry, per-tree-node, or both. WAL entries are small sequential writes where append speed is the bottleneck — compressing them individually has terrible ratio and adds latency. Tree nodes are larger and written lazily — compression amortizes well.",
+      "decision": "zstd compression per content-addressed tree node, WAL entries uncompressed, over compressing both or neither. The rejected alternatives: compressing WAL entries (poor ratio, added write latency on the hot path); no compression (wasted disk for tree nodes that compress well at ~3:1 for structured data).",
+      "quote": "",
+      "consequences": [
+        "The zstd Rust crate becomes a dependency",
+        "Tree node writes include a compression step — this is on the lazy flush path, not the write hot path",
+        "Tree node reads include a decompression step — cached nodes are stored decompressed in memory",
+        "WAL append is raw bytes: no compression overhead on the write hot path"
+      ],
+      "supersedes": [],
+      "superseded_by": ""
+    }
+  ]
+}

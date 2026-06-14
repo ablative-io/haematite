@@ -1,0 +1,323 @@
+{
+  "repo_root": "/Users/tom/Developer/ablative/haematite",
+  "brief_id": "CORE-007",
+  "reviewers": [
+    "Danger Mouse"
+  ],
+  "base_ref": "main",
+  "placement": "local",
+  "isolation": "worktree",
+  "brief_document": {
+    "id": "CORE-007",
+    "cluster": "core",
+    "title": "Shard actor: beamr process owning one prolly tree and one WAL buffer",
+    "depends_on": [
+      "CORE-004",
+      "CORE-005",
+      "CORE-006"
+    ],
+    "blocked_by": [],
+    "checklist": [
+      "C28",
+      "C29",
+      "C30",
+      "C31",
+      "C32"
+    ],
+    "stories": [
+      "S2",
+      "S10",
+      "S11"
+    ],
+    "design_anchor": [
+      "ADR-004"
+    ],
+    "purpose": "Deliver the shard actor \u2014 the concurrency primitive that makes haematite zero-contention by design. The design (ADR-004) commits to actor-per-shard on beamr: each shard is a single supervised beamr process that is the sole writer for its key range. No locks, no shared mutable state, no coordination overhead. This brief implements that process: the ShardActor owns one DiskStore, one WalBuffer, one DurableWal, and the current root hash for its slice of the keyspace. It receives Get, Put, Delete, Commit, and Range messages from any caller and responds via beamr message passing. On crash, beamr's supervision tree restarts only the failed shard actor; it calls WalRecovery (CORE-006) to replay the durable WAL and reconstruct its pre-crash buffer state. All other shards are unaffected. Without this brief the WAL, recovery, and tree machinery built in CORE-001 through CORE-006 has no owner \u2014 it is inert infrastructure waiting for a process to drive it.",
+    "task": "Create crates/haematite/src/shard/mod.rs (module root, declarations only) and crates/haematite/src/shard/actor.rs (the ShardActor implementation). ShardActor is a Rust struct that is spawned as a beamr process via beamr's process API. It owns a DiskStore (from CORE-004), a WalBuffer and DurableWal (from CORE-005), and a current root hash. Its message loop handles five message variants: Get(key), Put(key, value), Delete(key), Commit, and Range(from, to). Each message carries a reply_to Pid and the actor sends the result back to that Pid via beamr message passing. Put and Delete append to the durable WAL first, then the buffer, then Ack. Get reads the buffer first, then the tree. Commit flushes the buffer to the tree as a single batch and returns the new root hash. Range merges buffer and tree entries in sorted key order, streaming RangeEntry replies followed by RangeDone. On start (including crash-restart), the actor calls WalRecovery::recover before entering the message loop. This brief does NOT implement the shard router that maps keys to shard actors \u2014 that is CORE-008. It does NOT implement the database handle that spawns shards \u2014 that is CORE-009.",
+    "requirements": [
+      {
+        "id": "R1",
+        "title": "ShardMessage enum and ShardReply enum",
+        "spec": "Define a ShardMessage enum with variants Get { key: Vec<u8>, reply_to: beamr::Pid }, Put { key: Vec<u8>, value: Vec<u8>, reply_to: beamr::Pid }, Delete { key: Vec<u8>, reply_to: beamr::Pid }, Commit { reply_to: beamr::Pid }, and Range { from: Vec<u8>, to: Vec<u8>, reply_to: beamr::Pid }. Define a ShardReply enum with variants Got(Option<Vec<u8>>), Ack, Committed(Hash), RangeEntry { key: Vec<u8>, value: Vec<u8> }, and RangeDone. THE SYSTEM SHALL NOT define any logic in shard/mod.rs beyond pub mod and pub use declarations (CN3). ShardMessage and ShardReply SHALL implement Debug.",
+        "acceptance": [
+          "ShardMessage has five base variants: Get, Put, Delete, Commit, Range \u2014 each carrying a reply_to field of type beamr::Pid. CORE-009 R9 adds an Append variant for event sourcing.",
+          "ShardReply has Got(Option<Vec<u8>>), Ack, Committed(Hash), RangeEntry { key, value }, and RangeDone variants",
+          "ShardMessage implements Debug",
+          "ShardReply implements Debug",
+          "grep for fn, struct, enum, impl in shard/mod.rs returns no matches"
+        ],
+        "files": {
+          "create": [
+            "crates/haematite/src/shard/mod.rs",
+            "crates/haematite/src/shard/actor.rs"
+          ],
+          "modify": [],
+          "delete": []
+        },
+        "checklist": [],
+        "stories": []
+      },
+      {
+        "id": "R2",
+        "title": "ShardActor struct and beamr process spawn",
+        "spec": "Define a ShardActor struct that holds a DiskStore, a WalBuffer, a DurableWal, and a current_root: Hash. Implement ShardActor::spawn(store: DiskStore, wal: DurableWal, root: Hash) -> beamr::Pid, which spawns a beamr process running the actor's message loop and returns the Pid of the spawned process. THE SYSTEM SHALL NOT spawn the actor with an unrecovered buffer \u2014 the actor calls WalRecovery::recover(root) before entering the message loop (C32). THE SYSTEM SHALL NOT expose mutable access to any ShardActor field outside the actor process \u2014 all mutation arrives through messages (P2, C30). ShardActor SHALL implement Debug.",
+        "acceptance": [
+          "ShardActor::spawn returns a beamr::Pid that identifies the running actor process",
+          "A newly spawned ShardActor calls WalRecovery::recover(root) before its first message is processed",
+          "ShardActor implements Debug",
+          "No public method on ShardActor accepts &mut self \u2014 mutation is message-driven only",
+          "cargo check -p haematite succeeds with ShardActor defined"
+        ],
+        "files": {
+          "create": [],
+          "modify": [
+            "crates/haematite/src/shard/actor.rs"
+          ],
+          "delete": []
+        },
+        "checklist": [
+          "C28",
+          "C32"
+        ],
+        "stories": []
+      },
+      {
+        "id": "R3",
+        "title": "Get and Range message handlers",
+        "spec": "WHEN the actor receives ShardMessage::Get { key, reply_to }, THE SYSTEM SHALL check WalBuffer first for a buffered value for key; if found, send ShardReply::Got(Some(value)) to reply_to; if not found in the buffer, look up the key in the prolly tree via DiskStore and send ShardReply::Got(result) to reply_to. Buffer entries SHALL shadow tree entries (CN6). WHEN the actor receives ShardMessage::Range { from, to, reply_to }, THE SYSTEM SHALL produce all (key, value) pairs with from <= key < to in sorted ascending order by merging buffer entries with tree entries, send one ShardReply::RangeEntry { key, value } per pair, and finally send ShardReply::RangeDone. THE SYSTEM SHALL NOT skip a buffered key that does not exist in the tree. THE SYSTEM SHALL NOT return a tree value for a key that is present in the buffer.",
+        "acceptance": [
+          "Get for a key that was Put but not yet committed returns the buffered value, not the stale tree value",
+          "Get for a key that was committed and not buffered returns the tree value",
+          "Get for an unknown key returns ShardReply::Got(None)",
+          "Range over [from, to) returns all matching entries in ascending key order",
+          "Range merges buffer and tree: a key present in both returns the buffer value exactly once",
+          "Range sends ShardReply::RangeDone as the final message after all RangeEntry messages",
+          "A Delete in the buffer suppresses the corresponding tree entry from Range results"
+        ],
+        "files": {
+          "create": [],
+          "modify": [
+            "crates/haematite/src/shard/actor.rs"
+          ],
+          "delete": []
+        },
+        "checklist": [
+          "C29"
+        ],
+        "stories": [
+          "S2"
+        ]
+      },
+      {
+        "id": "R4",
+        "title": "Put and Delete message handlers",
+        "spec": "WHEN the actor receives ShardMessage::Put { key, value, reply_to }, THE SYSTEM SHALL append Mutation::Put { key, value } to the DurableWal (durable write first), then insert the mutation into the WalBuffer, then send ShardReply::Ack to reply_to. WHEN the actor receives ShardMessage::Delete { key, reply_to }, THE SYSTEM SHALL append Mutation::Delete { key } to the DurableWal (durable write first), then insert the mutation into the WalBuffer, then send ShardReply::Ack to reply_to. THE SYSTEM SHALL NOT apply mutations directly to the prolly tree \u2014 all mutations are buffered (P3). THE SYSTEM SHALL NOT send ShardReply::Ack before the mutation is durably written to the WAL. IF DurableWal::append returns an error, THE SYSTEM SHALL NOT add the mutation to WalBuffer and SHALL propagate the error, crashing the actor for supervision restart.",
+        "acceptance": [
+          "ShardReply::Ack is sent to reply_to only after DurableWal::append succeeds for a Put",
+          "ShardReply::Ack is sent to reply_to only after DurableWal::append succeeds for a Delete",
+          "After a Put, WalBuffer::get(key) returns the written value before any Commit",
+          "After a Delete, the key is absent from WalBuffer before any Commit",
+          "A Put does not change the prolly tree root hash until Commit is called",
+          "If DurableWal::append returns an error, the mutation is NOT present in WalBuffer and the actor crashes for supervision restart"
+        ],
+        "files": {
+          "create": [],
+          "modify": [
+            "crates/haematite/src/shard/actor.rs"
+          ],
+          "delete": []
+        },
+        "checklist": [
+          "C29",
+          "C30"
+        ],
+        "stories": [
+          "S2",
+          "S10"
+        ]
+      },
+      {
+        "id": "R5",
+        "title": "Commit message handler",
+        "spec": "WHEN the actor receives ShardMessage::Commit { reply_to }, THE SYSTEM SHALL call WalBuffer::commit() to flush all buffered mutations to the prolly tree as a single batch, obtaining a new root hash. THE SYSTEM SHALL write a Commit entry containing the new root hash to the DurableWal. THE SYSTEM SHALL update current_root to the new hash. THE SYSTEM SHALL send ShardReply::Committed(new_root) to reply_to. THE SYSTEM SHALL NOT produce more than one path-to-root rewrite per Commit message \u2014 N buffered writes produce exactly one batch commit (P3, CN8). IF WalBuffer::commit() returns an error, THE SYSTEM SHALL NOT update current_root and SHALL propagate the error rather than silently leaving the buffer partially committed.",
+        "acceptance": [
+          "ShardReply::Committed(hash) is sent to reply_to after a successful commit",
+          "The returned hash matches the deterministic root hash for the committed key-value set (CN5): the same sequence of puts to an empty database always produces the same hash",
+          "After Commit, WalBuffer is empty and current_root equals the new hash",
+          "A single Commit message with N buffered mutations triggers exactly one WalBuffer::commit() call \u2014 confirmed by a test that counts calls",
+          "The DurableWal contains a Commit entry with the new root hash after the handler returns",
+          "Get for a committed key after Commit reads from the tree (buffer is empty)"
+        ],
+        "files": {
+          "create": [],
+          "modify": [
+            "crates/haematite/src/shard/actor.rs"
+          ],
+          "delete": []
+        },
+        "checklist": [
+          "C29"
+        ],
+        "stories": []
+      },
+      {
+        "id": "R6",
+        "title": "Crash isolation and supervised restart with WAL replay",
+        "spec": "WHILE running as a supervised beamr process, IF the ShardActor crashes, THE SYSTEM SHALL restart only the failed shard actor \u2014 sibling shard actors SHALL NOT be restarted or interrupted (CN7, C31). WHEN the restarted actor initialises, THE SYSTEM SHALL call WalRecovery::recover(persisted_root) with the last committed root hash to reconstruct the pre-crash WalBuffer before resuming the message loop (C32). THE SYSTEM SHALL NOT lose mutations that were durably appended to the WAL before the crash. THE SYSTEM SHALL NOT restart a sibling shard actor as a side-effect of one shard's crash.",
+        "acceptance": [
+          "A test spawns two shard actors on separate keys, crashes one via a deliberate panic trigger, and confirms the other shard actor responds correctly to Get within 1 second of the crash",
+          "After a simulated crash and restart, Get for a key that was Put-and-WAL-appended (but not committed) before the crash returns the correct buffered value \u2014 confirming WAL replay reconstructed the buffer",
+          "After a simulated crash and restart, Get for a key that was committed before the crash returns the tree value",
+          "WalRecovery::recover is called exactly once during actor initialisation, on both initial start and each restart",
+          "The restarted actor's current_root matches the last committed root hash recorded in the DurableWal"
+        ],
+        "files": {
+          "create": [],
+          "modify": [
+            "crates/haematite/src/shard/actor.rs"
+          ],
+          "delete": []
+        },
+        "checklist": [
+          "C31",
+          "C32"
+        ],
+        "stories": [
+          "S11"
+        ]
+      },
+      {
+        "id": "R7",
+        "title": "Wire shard module into crate root",
+        "spec": "Add pub mod shard to crates/haematite/src/lib.rs and re-export ShardActor, ShardMessage, and ShardReply from the crate root. Add pub mod actor and pub use actor::{ShardActor, ShardMessage, ShardReply} to shard/mod.rs. shard/mod.rs SHALL NOT contain any logic beyond pub mod and pub use declarations (CN3).",
+        "acceptance": [
+          "haematite::shard::ShardActor is accessible after wiring",
+          "haematite::shard::ShardMessage is accessible after wiring",
+          "haematite::shard::ShardReply is accessible after wiring",
+          "shard/mod.rs contains only pub mod and pub use statements \u2014 no struct definitions, functions, or trait implementations",
+          "cargo check -p haematite succeeds with the shard module wired in"
+        ],
+        "files": {
+          "create": [],
+          "modify": [
+            "crates/haematite/src/shard/mod.rs",
+            "crates/haematite/src/lib.rs"
+          ],
+          "delete": []
+        },
+        "checklist": [
+          "C28"
+        ],
+        "stories": []
+      }
+    ],
+    "boundaries": [
+      "SHALL NOT implement the shard router that maps keys to shard actors via hash(key) % N \u2014 that is CORE-008",
+      "SHALL NOT implement the Database handle that spawns and manages the full set of shard actors \u2014 that is CORE-009",
+      "SHALL NOT implement read replicas that trail the primary shard by subscribing to committed root hashes \u2014 deferred to a future phase",
+      "SHALL NOT implement dynamic resharding or allow the shard count to change at runtime \u2014 ADR-004 fixes shard count at database creation",
+      "SHALL NOT implement cross-shard transactions or two-phase commit \u2014 serialisability is per-shard only"
+    ],
+    "verification": [
+      "cargo check -p haematite succeeds with no errors",
+      "cargo test -p haematite --lib passes all tests in the shard::actor module",
+      "cargo clippy -p haematite -- -D warnings produces no warnings",
+      "grep -rn 'unwrap()\\|expect(' crates/haematite/src/shard/actor.rs produces no matches outside #[cfg(test)] blocks",
+      "crates/haematite/src/shard/actor.rs does not exceed 500 lines",
+      "grep -n '.' crates/haematite/src/shard/mod.rs | grep -v 'pub mod\\|pub use\\|^[[:space:]]*$\\|//' produces no output \u2014 mod.rs contains only declarations",
+      "A round-trip integration test: spawn a ShardActor, send Put(k, v), send Commit, send Get(k) \u2014 assert ShardReply::Got(Some(v)) is received",
+      "A crash-isolation test: spawn two ShardActors, crash one, assert the other shard actor still serves Get correctly"
+    ]
+  },
+  "resolved_context": {
+    "adrs": [
+      {
+        "id": "ADR-004",
+        "title": "Actor-per-shard with fixed shard count at creation",
+        "decision": "Actor-per-shard on beamr with fixed shard count at creation, over single-writer and lock-per-shard, because the actor model eliminates locks entirely \u2014 each shard is a single-writer beamr process with no shared mutable state. Fixed shard count over dynamic resharding because resharding is operationally complex and can be deferred: 256 or 1024 shards covers any reasonable single-node deployment for Aion's workload (one key per workflow_id).",
+        "quote": "",
+        "decided_by": "Bono, Frodo Baggins"
+      }
+    ],
+    "checklist": [
+      {
+        "id": "C28",
+        "text": "ShardActor is a beamr process that owns one prolly tree and one WAL buffer."
+      },
+      {
+        "id": "C29",
+        "text": "ShardActor handles get/put/delete/commit/range messages via beamr message passing."
+      },
+      {
+        "id": "C30",
+        "text": "ShardActor is the single writer for its key range \u2014 no external mutation (P2)."
+      },
+      {
+        "id": "C31",
+        "text": "ShardActor crash does not affect other shard actors (CN7)."
+      },
+      {
+        "id": "C32",
+        "text": "ShardActor restarts via WAL replay on crash recovery."
+      }
+    ],
+    "stories": [
+      {
+        "id": "S2",
+        "text": "As an application developer, I want to put and get key-value pairs without thinking about which shard owns them so that the sharding is transparent."
+      },
+      {
+        "id": "S10",
+        "text": "As a concurrent writer, I want to write to different keys from hundreds of beamr processes simultaneously without any of them blocking so that write throughput scales linearly with shard count."
+      },
+      {
+        "id": "S11",
+        "text": "As a concurrent writer, I want a crashed shard to restart without affecting my writes to other shards so that fault isolation is per-shard, not per-database."
+      }
+    ],
+    "constraints": [
+      {
+        "id": "CN1",
+        "text": "No file over 500 lines. If a module approaches this limit, extract into submodules."
+      },
+      {
+        "id": "CN2",
+        "text": "No panics in production code. .unwrap() and .expect() only in tests."
+      },
+      {
+        "id": "CN3",
+        "text": "mod.rs contains ONLY pub mod declarations and pub use re-exports. No logic."
+      },
+      {
+        "id": "CN4",
+        "text": "All public types implement Debug. All error types implement std::error::Error."
+      },
+      {
+        "id": "CN5",
+        "text": "The prolly tree root hash for a given key-value set must be deterministic and history-independent: the same keys and values always produce the same root hash regardless of insertion order."
+      },
+      {
+        "id": "CN6",
+        "text": "WAL buffer reads must shadow tree reads: a key written to the buffer but not yet committed must be returned by get, not the stale tree value."
+      },
+      {
+        "id": "CN7",
+        "text": "Shard actor crash must not affect other shards. Supervision restarts only the failed shard."
+      },
+      {
+        "id": "CN8",
+        "text": "Batch append (multiple key-value pairs in one call) must produce exactly one tree commit, not N individual commits."
+      }
+    ],
+    "intention": "Haematite's core is a storage engine where concurrency is free and branching is structural. When this cluster is complete, a developer can open a haematite database, write to it from hundreds of concurrent actors without any locking discipline, fork it instantly by sharing a hash, and merge two forks by walking only the nodes that differ. The experience should feel like working with an in-memory data structure that happens to be durable \u2014 no connection pools, no transaction coordinators, no lock managers. The content-addressed prolly tree is what makes branching zero-friction; the actor-per-shard model is what makes concurrency zero-contention; the WAL buffer is what makes writes fast despite the content-addressing overhead. All three are load-bearing.",
+    "design_path": "docs/design/core",
+    "provenance": {
+      "requested_by": "Tom",
+      "quote": "Haematite's core is a storage engine where concurrency is free and branching is structural. When this cluster is complete, a developer can open a haematite database, write to it from hundreds of concu"
+    }
+  },
+  "verify_fix_cap": 3,
+  "review_cap": 1,
+  "round_backoff_ms": 2000,
+  "review_deadline_ms": 300000
+}

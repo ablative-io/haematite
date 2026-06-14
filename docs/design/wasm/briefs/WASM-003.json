@@ -1,0 +1,86 @@
+{
+  "id": "WASM-003",
+  "cluster": "wasm",
+  "title": "Browser transport adapter for distribution sync",
+  "depends_on": [
+    "WASM-001",
+    "DIST-001"
+  ],
+  "blocked_by": [],
+  "checklist": [
+    "C17",
+    "C18"
+  ],
+  "stories": [
+    "S5"
+  ],
+  "design_anchor": [
+    "ADR-001"
+  ],
+  "purpose": "Deliver the browser transport adapter that enables distribution sync between WASM and native haematite nodes over WebSocket or WebRTC data channels. The sync protocol payload is identical to native \u2014 only the transport layer differs.",
+  "task": "Implement a transport adapter that bridges haematite's distribution sync protocol (DIST-001) to browser-compatible transports: WebSocket for server-to-browser sync and WebRTC data channels for browser-to-browser sync. The sync protocol payload (root hash exchange, tree walk, node transfer) is identical to native. The adapter translates between beamr distribution messages and WebSocket/WebRTC frames. Does not implement the sync protocol itself (DIST-001) or merge logic (DIST-002).",
+  "requirements": [
+    {
+      "id": "R1",
+      "title": "WebSocket transport",
+      "spec": "THE SYSTEM SHALL implement a WebSocket transport that carries haematite sync protocol messages between a browser and a server. THE SYSTEM SHALL serialise sync messages into WebSocket binary frames. THE SYSTEM SHALL deserialise incoming frames back into sync messages.",
+      "acceptance": [
+        "The WebSocket transport connects to a server endpoint",
+        "Sync protocol messages are serialised into binary WebSocket frames",
+        "Incoming frames are deserialised into sync protocol messages",
+        "A full pull-sync completes over WebSocket"
+      ],
+      "files": {
+        "create": [
+          "crates/haematite/src/wasm/transport.rs"
+        ],
+        "modify": [
+          "crates/haematite/src/wasm/mod.rs"
+        ],
+        "delete": []
+      },
+      "checklist": [
+        "C17"
+      ],
+      "stories": [
+        "S5"
+      ]
+    },
+    {
+      "id": "R2",
+      "title": "Protocol payload parity",
+      "spec": "THE SYSTEM SHALL use identical sync protocol payloads in the browser transport as in the native distribution transport. THE SYSTEM SHALL NOT introduce browser-specific message formats. The only difference is the transport layer \u2014 WebSocket instead of TCP.",
+      "acceptance": [
+        "The sync message format is identical between native and WASM builds",
+        "A native node can sync with a WASM node via WebSocket",
+        "Root hash exchange, tree walk, and node transfer messages are byte-compatible"
+      ],
+      "files": {
+        "create": [],
+        "modify": [
+          "crates/haematite/src/wasm/transport.rs"
+        ],
+        "delete": []
+      },
+      "checklist": [
+        "C18"
+      ],
+      "stories": [
+        "S5"
+      ]
+    }
+  ],
+  "boundaries": [
+    "SHALL NOT implement the sync protocol \u2014 that is DIST-001",
+    "SHALL NOT implement merge or consistency modes \u2014 that is DIST-002",
+    "SHALL NOT implement a WebRTC signaling server \u2014 signaling is application-level",
+    "SHALL NOT implement the IndexedDB NodeStore or OPFS WAL \u2014 those are WASM-001 and WASM-002",
+    "SHALL NOT implement WebRTC data channel transport \u2014 deferred to future phase. WebSocket only for MVP."
+  ],
+  "verification": [
+    "cargo check -p haematite --target wasm32-unknown-unknown --features wasm succeeds",
+    "cargo test -p haematite --lib passes all tests (native)",
+    "cargo clippy -p haematite produces no errors",
+    "No file in crates/haematite/src/wasm/ exceeds 500 lines"
+  ]
+}

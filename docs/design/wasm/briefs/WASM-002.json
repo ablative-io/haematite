@@ -1,0 +1,96 @@
+{
+  "id": "WASM-002",
+  "cluster": "wasm",
+  "title": "OPFS WAL backend with capability detection and IndexedDB fallback",
+  "depends_on": ["WASM-001", "PERSIST-002"],
+  "blocked_by": [],
+  "checklist": ["C11", "C12", "C13", "C14", "C15", "C16"],
+  "stories": ["S7", "S11"],
+  "design_anchor": ["ADR-006"],
+  "purpose": "Deliver the OPFS-backed WAL for browsers that support it, with transparent fallback to IndexedDB when OPFS is unavailable. OPFS provides synchronous file access in web workers — a better fit than IndexedDB for the WAL's append-only pattern. The WAL entry format is byte-identical to native for portability.",
+  "task": "Implement OPFS WAL backend using synchronous file access in web worker contexts. Use the same WAL entry format and CRC32 checksums as the native durable WAL (PERSIST-002). Implement runtime capability detection for OPFS availability. When OPFS is unavailable, fall back to IndexedDB-backed WAL persistence. The fallback must be transparent to the shard actor — the WAL interface is identical regardless of backend.",
+  "requirements": [
+    {
+      "id": "R1",
+      "title": "OPFS WAL writer",
+      "spec": "THE SYSTEM SHALL implement an OPFS-backed WAL writer that uses synchronous file access in web worker contexts for append-only writes. THE SYSTEM SHALL use the same WAL interface as the native DurableWal.",
+      "acceptance": [
+        "OpfsWal implements the same WAL interface as DurableWal",
+        "OpfsWal uses synchronous file access via OPFS in web workers",
+        "Append operations write to the OPFS file sequentially"
+      ],
+      "files": {
+        "create": ["crates/haematite/src/store/opfs.rs"],
+        "modify": [],
+        "delete": []
+      },
+      "checklist": ["C11"],
+      "stories": []
+    },
+    {
+      "id": "R2",
+      "title": "Native-compatible WAL entry format",
+      "spec": "THE SYSTEM SHALL use the same WAL entry format (operation type, key, value, CRC32 checksum) in the OPFS backend as in the native durable WAL (PERSIST-002). THE SYSTEM SHALL produce byte-identical entries so that WAL files are portable between native and WASM builds.",
+      "acceptance": [
+        "A WAL entry written by OPFS backend deserialises correctly by the native WAL reader",
+        "A WAL entry written by the native WAL writer deserialises correctly by the OPFS backend",
+        "CRC32 checksums are computed identically in both backends"
+      ],
+      "files": {
+        "create": [],
+        "modify": ["crates/haematite/src/store/opfs.rs"],
+        "delete": []
+      },
+      "checklist": ["C12", "C13"],
+      "stories": []
+    },
+    {
+      "id": "R3",
+      "title": "Runtime OPFS capability detection",
+      "spec": "THE SYSTEM SHALL detect OPFS availability at runtime. THE SYSTEM SHALL check for web worker context and OPFS API presence. THE SYSTEM SHALL return a capability enum (OpfsAvailable, OpfsUnavailable).",
+      "acceptance": [
+        "detect_opfs() returns OpfsAvailable in a web worker with OPFS support",
+        "detect_opfs() returns OpfsUnavailable on the main thread",
+        "detect_opfs() returns OpfsUnavailable in browsers without OPFS"
+      ],
+      "files": {
+        "create": ["crates/haematite/src/wasm/detect.rs"],
+        "modify": ["crates/haematite/src/wasm/mod.rs"],
+        "delete": []
+      },
+      "checklist": ["C14"],
+      "stories": ["S11"]
+    },
+    {
+      "id": "R4",
+      "title": "IndexedDB WAL fallback",
+      "spec": "WHEN OPFS is unavailable, THE SYSTEM SHALL fall back to IndexedDB-backed WAL persistence. THE SYSTEM SHALL make the fallback transparent to the shard actor — the WAL interface is the same regardless of backend. THE SYSTEM SHALL document the durability limitation: IndexedDB transactions are not guaranteed to flush before page unload.",
+      "acceptance": [
+        "When OPFS is unavailable, the WAL uses IndexedDB without error",
+        "The shard actor does not know which WAL backend it uses",
+        "The WAL interface (append, truncate, read) is identical for both backends",
+        "The durability limitation of IndexedDB-only mode is documented"
+      ],
+      "files": {
+        "create": [],
+        "modify": ["crates/haematite/src/store/opfs.rs", "crates/haematite/src/wasm/detect.rs"],
+        "delete": []
+      },
+      "checklist": ["C15", "C16"],
+      "stories": ["S7", "S11"]
+    }
+  ],
+  "boundaries": [
+    "SHALL NOT implement the IndexedDB NodeStore — that is WASM-001",
+    "SHALL NOT implement browser transport — that is WASM-003",
+    "SHALL NOT implement a WAL format different from native — byte-identical is required",
+    "SHALL NOT implement OPFS on the main thread — synchronous access is only available in web workers"
+  ],
+  "verification": [
+    "cargo check -p haematite --target wasm32-unknown-unknown --features wasm succeeds",
+    "cargo test -p haematite --lib passes all tests (native)",
+    "cargo clippy -p haematite produces no errors",
+    "grep -r 'unwrap()\\|expect(' crates/haematite/src/store/opfs.rs -l finds nothing",
+    "No file in crates/haematite/src/ exceeds 500 lines"
+  ]
+}

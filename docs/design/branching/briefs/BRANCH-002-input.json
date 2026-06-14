@@ -1,0 +1,348 @@
+{
+  "repo_root": "/Users/tom/Developer/ablative/haematite",
+  "brief_id": "BRANCH-002",
+  "reviewers": [
+    "Danger Mouse"
+  ],
+  "base_ref": "main",
+  "placement": "local",
+  "isolation": "worktree",
+  "brief_document": {
+    "id": "BRANCH-002",
+    "cluster": "branching",
+    "title": "Three-way merge engine and conflict resolution policies",
+    "depends_on": [
+      "BRANCH-001",
+      "CORE-003"
+    ],
+    "blocked_by": [],
+    "checklist": [
+      "C7",
+      "C8",
+      "C9",
+      "C10",
+      "C11",
+      "C12",
+      "C13",
+      "C16",
+      "C17",
+      "C14",
+      "C15"
+    ],
+    "stories": [
+      "S2",
+      "S3",
+      "S4",
+      "S7",
+      "S11"
+    ],
+    "design_anchor": [
+      "ADR-001"
+    ],
+    "purpose": "Deliver the three-way merge engine that walks ancestor, parent, and branch trees simultaneously, and the conflict resolution policies (LWW, vector-clock, custom merge function) that determine how true conflicts are resolved. This is the core of haematite's branching value proposition \u2014 merge cost proportional to differences, not total data.",
+    "task": "Implement the three-way merge algorithm that takes two diverged root hashes and their common ancestor. Walk all three trees simultaneously, skipping subtrees where all three hashes match. For subtrees where only one side changed relative to ancestor, apply the changed side (clean merge). For subtrees where both sides changed the same key, route to the conflict resolution policy. Produce the merged result as a single batch tree commit. Implement three policies: LWW (branch wins), vector-clock (detect true conflicts, surface unresolved), and custom merge function (caller-provided). Policy is specified at merge time. Merge operates per-shard. Note: C14/C15 (vector-clock conflict detection and resolution) are covered by defining the ConflictPolicy::VectorClock variant, which returns Err(Unimplemented) in this release. Full implementation is deferred to a future phase.",
+    "requirements": [
+      {
+        "id": "R1",
+        "title": "Three-way tree walk",
+        "spec": "WHEN merge(parent_root, branch_root, ancestor_root) is called, THE SYSTEM SHALL walk all three trees simultaneously from root to leaves. THE SYSTEM SHALL skip subtrees where all three hashes are identical. THE SYSTEM SHALL descend only into subtrees where at least one hash differs. THE SYSTEM SHALL NOT perform a full-tree scan.",
+        "acceptance": [
+          "merge() with identical parent and branch roots returns immediately with no node reads beyond the root",
+          "merge() of two branches that each modified 10 keys out of 100,000 reads only the paths to those 20 keys (plus shared traversal nodes)",
+          "merge() visits leaf nodes only in subtrees where at least one hash differs across the three trees"
+        ],
+        "files": {
+          "create": [
+            "crates/haematite/src/branch/merge.rs"
+          ],
+          "modify": [],
+          "delete": []
+        },
+        "checklist": [
+          "C7",
+          "C8"
+        ],
+        "stories": [
+          "S2"
+        ]
+      },
+      {
+        "id": "R2",
+        "title": "Clean merge detection",
+        "spec": "WHILE walking differing subtrees, WHEN only one side (parent or branch) differs from the ancestor for a given key, THE SYSTEM SHALL apply the changed side without invoking conflict resolution. THE SYSTEM SHALL NOT treat a one-side-only change as a conflict.",
+        "acceptance": [
+          "A key modified only on the branch side appears in the merged result with the branch value",
+          "A key modified only on the parent side appears in the merged result with the parent value",
+          "A key deleted only on the branch side is absent in the merged result",
+          "No conflict resolution callback is invoked for one-side-only changes"
+        ],
+        "files": {
+          "create": [],
+          "modify": [
+            "crates/haematite/src/branch/merge.rs"
+          ],
+          "delete": []
+        },
+        "checklist": [
+          "C9"
+        ],
+        "stories": [
+          "S2"
+        ]
+      },
+      {
+        "id": "R3",
+        "title": "True conflict detection and routing",
+        "spec": "WHEN both the parent and branch have modified the same key relative to the ancestor, THE SYSTEM SHALL detect this as a true conflict and route it to the configured conflict resolution policy. THE SYSTEM SHALL NOT silently drop either side's value.",
+        "acceptance": [
+          "A key modified on both sides (different values) is detected as a conflict",
+          "A key deleted on one side and modified on the other is detected as a conflict",
+          "The conflict resolution policy receives the key, ancestor value, parent value, and branch value",
+          "No data is silently discarded"
+        ],
+        "files": {
+          "create": [],
+          "modify": [
+            "crates/haematite/src/branch/merge.rs"
+          ],
+          "delete": []
+        },
+        "checklist": [
+          "C10"
+        ],
+        "stories": [
+          "S3"
+        ]
+      },
+      {
+        "id": "R4",
+        "title": "Batch commit of merge result",
+        "spec": "WHEN the merge walk is complete, THE SYSTEM SHALL commit all resolved entries to the tree as a single batch \u2014 one path-to-root rewrite, not per-entry rewrites. THE SYSTEM SHALL return the new merged root hash.",
+        "acceptance": [
+          "merge() returns a single new root hash",
+          "The merged tree contains all entries from both sides with conflicts resolved",
+          "The commit produces exactly one tree mutation batch"
+        ],
+        "files": {
+          "create": [],
+          "modify": [
+            "crates/haematite/src/branch/merge.rs"
+          ],
+          "delete": []
+        },
+        "checklist": [
+          "C11",
+          "C12"
+        ],
+        "stories": [
+          "S7"
+        ]
+      },
+      {
+        "id": "R5",
+        "title": "Last-write-wins conflict resolution",
+        "spec": "WHEN the LWW policy is selected, THE SYSTEM SHALL resolve conflicts by taking the branch value over the parent value. THE SYSTEM SHALL treat LWW as explicitly lossy \u2014 the parent's value is discarded.",
+        "acceptance": [
+          "Under LWW, a conflict on key K resolves to the branch value",
+          "Under LWW, merge() returns Ok with no unresolved conflicts",
+          "The discarded parent value is not present in the merged tree"
+        ],
+        "files": {
+          "create": [
+            "crates/haematite/src/branch/conflict.rs"
+          ],
+          "modify": [],
+          "delete": []
+        },
+        "checklist": [
+          "C13"
+        ],
+        "stories": [
+          "S3"
+        ]
+      },
+      {
+        "id": "R7",
+        "title": "Custom merge function",
+        "spec": "WHEN a custom merge function is provided, THE SYSTEM SHALL call it with (key, ancestor_value, parent_value, branch_value) for each true conflict. THE SYSTEM SHALL use the function's return value as the resolved value. THE SYSTEM SHALL NOT call the function for clean merges.",
+        "acceptance": [
+          "The custom function receives all four arguments (key, ancestor, parent, branch)",
+          "The function's return value appears in the merged tree",
+          "The function is not called for clean merges (one-side-only changes)",
+          "A function that returns None causes the key to be deleted in the merged result"
+        ],
+        "files": {
+          "create": [],
+          "modify": [
+            "crates/haematite/src/branch/conflict.rs"
+          ],
+          "delete": []
+        },
+        "checklist": [
+          "C16"
+        ],
+        "stories": [
+          "S4"
+        ]
+      },
+      {
+        "id": "R8",
+        "title": "Policy selection at merge time",
+        "spec": "THE SYSTEM SHALL accept the conflict resolution policy as a parameter to merge(), not as a property of the branch. THE SYSTEM SHALL support LWW, VectorClock, and Custom(fn) as policy variants.",
+        "acceptance": [
+          "merge() takes a ConflictPolicy parameter",
+          "ConflictPolicy is an enum with Lww, VectorClock, and Custom variants",
+          "The same branch can be merged with different policies in different calls",
+          "ConflictPolicy implements Debug"
+        ],
+        "files": {
+          "create": [],
+          "modify": [
+            "crates/haematite/src/branch/merge.rs",
+            "crates/haematite/src/branch/conflict.rs"
+          ],
+          "delete": []
+        },
+        "checklist": [
+          "C17",
+          "C14",
+          "C15"
+        ],
+        "stories": [
+          "S3",
+          "S11"
+        ]
+      }
+    ],
+    "boundaries": [
+      "SHALL NOT implement fork or branch handle \u2014 those are BRANCH-001",
+      "SHALL NOT implement snapshot registry or time-travel \u2014 those are BRANCH-003",
+      "SHALL NOT implement snapshot pruning \u2014 that is BRANCH-004",
+      "SHALL NOT implement cross-shard merge coordination \u2014 each shard merges independently",
+      "SHALL NOT implement merge history tracking or merge commit log",
+      "SHALL NOT implement vector-clock conflict resolution \u2014 deferred to future phase. ConflictPolicy::VectorClock returns Err(Unimplemented)."
+    ],
+    "verification": [
+      "cargo check -p haematite succeeds with no errors",
+      "cargo test -p haematite --lib passes all tests",
+      "cargo clippy -p haematite produces no errors",
+      "grep -r 'unwrap()\\|expect(' crates/haematite/src/branch/ --include='*.rs' -l finds no non-test files",
+      "No file in crates/haematite/src/branch/ exceeds 500 lines"
+    ]
+  },
+  "resolved_context": {
+    "adrs": [
+      {
+        "id": "ADR-001",
+        "title": "Content-addressed prolly tree over B+ tree with WAL overlay",
+        "decision": "Content-addressed prolly tree over B+ tree with WAL overlay, because branching/merging/sync is the headline feature and must be structural (O(differences), history-independent) rather than overlaid (O(branch-writes), order-dependent). The rejected alternative (B+ tree + WAL overlay) makes branching an afterthought \u2014 functional but O(branch-writes) for merge and requiring WAL coordination for replication.",
+        "quote": "",
+        "decided_by": "Bono, Frodo Baggins, Sir Patick Stewart"
+      }
+    ],
+    "checklist": [
+      {
+        "id": "C7",
+        "text": "merge() takes two diverged root hashes and their common ancestor and produces a merged tree."
+      },
+      {
+        "id": "C8",
+        "text": "Merge skips subtrees where all three hashes (ancestor, parent, branch) are identical (CN2)."
+      },
+      {
+        "id": "C9",
+        "text": "Clean merges (only one side changed relative to ancestor) are applied automatically without invoking conflict resolution."
+      },
+      {
+        "id": "C10",
+        "text": "True conflicts (both sides changed the same key relative to ancestor) are routed to the conflict resolution policy."
+      },
+      {
+        "id": "C11",
+        "text": "Merge produces its output as a single batch commit to the tree \u2014 one path-to-root rewrite, not per-entry rewrites."
+      },
+      {
+        "id": "C12",
+        "text": "Merge operates per-shard: each shard's tree is merged independently (CN5)."
+      },
+      {
+        "id": "C13",
+        "text": "LWW policy resolves conflicts by taking the branch value over the parent value."
+      },
+      {
+        "id": "C14",
+        "text": "Vector-clock policy tracks per-key version vectors and distinguishes true conflicts (concurrent) from dominated updates (one causally after the other)."
+      },
+      {
+        "id": "C15",
+        "text": "True conflicts under vector-clock policy are surfaced to the caller as unresolved \u2014 they are not silently dropped (CN3)."
+      },
+      {
+        "id": "C16",
+        "text": "Custom merge function receives (key, ancestor_value, parent_value, branch_value) and returns the resolved value."
+      },
+      {
+        "id": "C17",
+        "text": "Conflict resolution policy is specified at merge time, not at fork time."
+      }
+    ],
+    "stories": [
+      {
+        "id": "S2",
+        "text": "As an application developer, I want to merge a branch back into the parent with automatic clean-merge handling so that non-conflicting changes are applied without manual intervention."
+      },
+      {
+        "id": "S3",
+        "text": "As an application developer, I want to choose a conflict resolution policy at merge time so that I can pick the strategy that fits the specific merge scenario."
+      },
+      {
+        "id": "S4",
+        "text": "As an application developer, I want to provide a custom merge function so that I can implement domain-specific conflict resolution logic."
+      },
+      {
+        "id": "S7",
+        "text": "As the Aion engine, I want to merge a successful experimental branch back into the parent so that validated changes can be promoted to the live workflow."
+      },
+      {
+        "id": "S11",
+        "text": "As a debugging developer, I want to diff two snapshots so that I can see exactly what changed between two points in time."
+      }
+    ],
+    "constraints": [
+      {
+        "id": "CN1",
+        "text": "Fork must complete in O(1) time and O(1) space \u2014 no tree node copying, only root hash recording and empty buffer allocation."
+      },
+      {
+        "id": "CN2",
+        "text": "Three-way merge must visit only subtrees where at least one hash differs across the three trees. Full-tree scan on merge is a correctness bug, not a performance issue."
+      },
+      {
+        "id": "CN3",
+        "text": "Conflict resolution must never silently discard data. LWW is explicit lossy; vector-clock surfaces true conflicts; custom functions receive all three values."
+      },
+      {
+        "id": "CN4",
+        "text": "Snapshot pruning must not delete tree nodes referenced by any active branch or named snapshot. Pruning a live reference is data loss."
+      },
+      {
+        "id": "CN5",
+        "text": "Branch operations must work per-shard: fork = fork each shard's tree, merge = merge each shard's tree. No cross-shard locking or coordination."
+      },
+      {
+        "id": "CN6",
+        "text": "Read-only checkout must not require WAL replay \u2014 it reads directly from the content-addressed node store at the specified root hash."
+      }
+    ],
+    "intention": "Branching is the headline feature \u2014 the reason haematite exists instead of wrapping SQLite. When this cluster is complete, a developer can fork a database in constant time by sharing a root hash, diverge both sides with independent writes, and merge them back by walking only the subtrees that differ. Every committed root hash is a permanent, verifiable snapshot that can be checked out for read-only time-travel at any point in the future. The experience should feel like working with git branches \u2014 cheap to create, cheap to compare, cheap to merge \u2014 but for a live key-value database with concurrent writers. The content-addressed prolly tree from the core cluster is what makes this structural rather than bolted-on: identical subtrees share nodes, fork costs nothing, and merge cost is proportional to differences, not total data.",
+    "design_path": "docs/design/branching",
+    "provenance": {
+      "requested_by": "Tom",
+      "quote": "Branching is the headline feature \u2014 the reason haematite exists instead of wrapping SQLite. When this cluster is complete, a developer can fork a database in constant time by sharing a root hash, dive"
+    }
+  },
+  "verify_fix_cap": 3,
+  "review_cap": 1,
+  "round_backoff_ms": 2000,
+  "review_deadline_ms": 300000
+}

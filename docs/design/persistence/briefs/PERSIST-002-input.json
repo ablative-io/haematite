@@ -1,0 +1,253 @@
+{
+  "repo_root": "/Users/tom/Developer/ablative/haematite",
+  "brief_id": "PERSIST-002",
+  "reviewers": [
+    "Danger Mouse"
+  ],
+  "base_ref": "main",
+  "placement": "local",
+  "isolation": "worktree",
+  "brief_document": {
+    "id": "PERSIST-002",
+    "cluster": "persistence",
+    "title": "Durable WAL writer with CRC32 checksums and fsync policy",
+    "depends_on": [
+      "CORE-005"
+    ],
+    "blocked_by": [],
+    "checklist": [
+      "C9",
+      "C10",
+      "C11",
+      "C12",
+      "C13",
+      "C14"
+    ],
+    "stories": [
+      "S3",
+      "S4"
+    ],
+    "design_anchor": [
+      "ADR-003"
+    ],
+    "purpose": "Deliver the durable WAL writer that backs each shard actor's WAL buffer with an append-only file on disk. Mutations are written to disk before acknowledgment. CRC32 checksums enable corruption detection during recovery. Configurable fsync policy lets callers trade latency for durability.",
+    "task": "Implement the durable WAL writer backed by an append-only file. Define the WAL entry format (operation type, key, value, CRC32 checksum). Mutations are written to the durable WAL before the shard actor acknowledges. Implement configurable fsync policy: per-write, every N writes, or commit-only. On commit, truncate the WAL with a truncation marker recording the committed root hash. Truncation must be atomic. Does not implement crash recovery replay (PERSIST-003).",
+    "requirements": [
+      {
+        "id": "R1",
+        "title": "WAL entry format",
+        "spec": "THE SYSTEM SHALL define a WAL entry format containing: operation type (Put or Delete), key bytes, value bytes (empty for Delete), and a CRC32 checksum of the preceding fields. THE SYSTEM SHALL use a length-prefixed binary format for deterministic serialisation.",
+        "acceptance": [
+          "WalEntry::Put has operation_type, key, value, and crc32 fields",
+          "WalEntry::Delete has operation_type, key, and crc32 fields",
+          "The CRC32 covers operation_type + key + value",
+          "Serialising and deserialising a WalEntry round-trips correctly",
+          "WalEntry implements Debug"
+        ],
+        "files": {
+          "create": [
+            "crates/haematite/src/wal/entry.rs"
+          ],
+          "modify": [
+            "crates/haematite/src/wal/mod.rs"
+          ],
+          "delete": []
+        },
+        "checklist": [
+          "C10"
+        ],
+        "stories": []
+      },
+      {
+        "id": "R2",
+        "title": "Append-only WAL file",
+        "spec": "THE SYSTEM SHALL back each shard actor's WAL buffer with an append-only file. WHEN a mutation is appended to the buffer, THE SYSTEM SHALL write the corresponding WalEntry to the file. THE SYSTEM SHALL NOT overwrite existing entries \u2014 the file is append-only.",
+        "acceptance": [
+          "DurableWal::new(path) opens or creates the WAL file",
+          "DurableWal::append(entry) writes the entry to the end of the file",
+          "Multiple appends produce sequential entries in the file",
+          "The file grows monotonically"
+        ],
+        "files": {
+          "create": [],
+          "modify": [
+            "crates/haematite/src/wal/durable.rs"
+          ],
+          "delete": []
+        },
+        "checklist": [
+          "C9"
+        ],
+        "stories": [
+          "S4"
+        ]
+      },
+      {
+        "id": "R3",
+        "title": "Write-before-acknowledge",
+        "spec": "THE SYSTEM SHALL write the WAL entry to the durable file before the shard actor acknowledges the mutation to the caller. THE SYSTEM SHALL NOT acknowledge a write until the WAL entry is on disk.",
+        "acceptance": [
+          "A put that crashes after WAL write but before tree commit can be recovered",
+          "The shard actor does not return Ok until the WAL entry is written",
+          "The WAL file contains the entry even if the process is killed immediately after acknowledgment"
+        ],
+        "files": {
+          "create": [],
+          "modify": [
+            "crates/haematite/src/wal/durable.rs"
+          ],
+          "delete": []
+        },
+        "checklist": [
+          "C11"
+        ],
+        "stories": [
+          "S4"
+        ]
+      },
+      {
+        "id": "R4",
+        "title": "Configurable fsync policy",
+        "spec": "THE SYSTEM SHALL accept a fsync policy on construction: PerWrite (fsync after every write), Batched(n) (fsync every n writes), or CommitOnly (fsync only on commit). THE SYSTEM SHALL NOT have a default policy \u2014 the caller must choose explicitly.",
+        "acceptance": [
+          "FsyncPolicy::PerWrite fsyncs after every append",
+          "FsyncPolicy::Batched(5) fsyncs after every 5th append",
+          "FsyncPolicy::CommitOnly fsyncs only when commit is called",
+          "Creating a DurableWal without a policy is a compilation error"
+        ],
+        "files": {
+          "create": [],
+          "modify": [
+            "crates/haematite/src/wal/durable.rs"
+          ],
+          "delete": []
+        },
+        "checklist": [
+          "C12"
+        ],
+        "stories": [
+          "S3"
+        ]
+      },
+      {
+        "id": "R5",
+        "title": "WAL truncation on commit",
+        "spec": "WHEN the WAL buffer is committed (flushed to tree), THE SYSTEM SHALL truncate the WAL file and write a truncation marker containing the committed root hash. THE SYSTEM SHALL make truncation atomic: the marker and root hash are written together so that a crash during truncation does not lose the commit reference.",
+        "acceptance": [
+          "After commit, the WAL file contains only the truncation marker",
+          "The truncation marker contains the committed root hash",
+          "A crash during truncation leaves either the old WAL (recoverable) or the new marker (committed)",
+          "Reading the WAL file after truncation yields zero replay entries and the committed root hash"
+        ],
+        "files": {
+          "create": [],
+          "modify": [
+            "crates/haematite/src/wal/durable.rs"
+          ],
+          "delete": []
+        },
+        "checklist": [
+          "C13",
+          "C14"
+        ],
+        "stories": []
+      }
+    ],
+    "boundaries": [
+      "SHALL NOT implement crash recovery replay \u2014 that is PERSIST-003",
+      "SHALL NOT implement the disk node store \u2014 that is PERSIST-001",
+      "SHALL NOT implement WAL archival or WAL shipping",
+      "SHALL NOT implement a default fsync policy \u2014 the caller must choose explicitly"
+    ],
+    "verification": [
+      "cargo check -p haematite succeeds with no errors",
+      "cargo test -p haematite --lib passes all tests",
+      "cargo clippy -p haematite produces no errors",
+      "grep -r 'unwrap()\\|expect(' crates/haematite/src/wal/ --include='*.rs' -l finds no non-test files (excluding buffer.rs from CORE-005)",
+      "No file in crates/haematite/src/wal/ exceeds 500 lines"
+    ]
+  },
+  "resolved_context": {
+    "adrs": [
+      {
+        "id": "ADR-003",
+        "title": "WAL buffer for write amortization rather than direct tree mutation",
+        "decision": "WAL buffer over direct tree mutation, because it gives sequential-append write latency (the WAL) with amortized tree cost (one path-to-root rewrite per flush, not per write). The rejected alternative (direct mutation with batching windows) forces callers to accept high write latency or risk high write amplification with small batches.",
+        "quote": "",
+        "decided_by": "Bono"
+      }
+    ],
+    "checklist": [
+      {
+        "id": "C9",
+        "text": "Each shard actor's WAL buffer is backed by an append-only file on disk."
+      },
+      {
+        "id": "C10",
+        "text": "WAL entries include operation type, key, value (for puts), and a CRC32 checksum (CN2)."
+      },
+      {
+        "id": "C11",
+        "text": "Mutations are written to the durable WAL before the shard actor acknowledges the write."
+      },
+      {
+        "id": "C12",
+        "text": "Fsync policy is configurable: per-write, every N writes, or commit-only."
+      },
+      {
+        "id": "C13",
+        "text": "On commit (tree flush), the WAL file is truncated with a truncation marker recording the committed root hash."
+      },
+      {
+        "id": "C14",
+        "text": "WAL truncation is atomic: truncation marker and root hash are written together (CN5)."
+      }
+    ],
+    "stories": [
+      {
+        "id": "S3",
+        "text": "As an application developer, I want to choose the fsync policy (per-write, batched, commit-only) so that I can trade latency for durability based on my workload."
+      },
+      {
+        "id": "S4",
+        "text": "As the Aion engine, I want acknowledged event appends to be durable so that a workflow crash does not lose events the recorder believes are persisted."
+      }
+    ],
+    "constraints": [
+      {
+        "id": "CN1",
+        "text": "Committed tree state must survive unclean shutdown. A committed root hash and all nodes it references must be on disk before commit() returns."
+      },
+      {
+        "id": "CN2",
+        "text": "WAL entries must include CRC32 checksums. A corrupted entry must be detectable, not silently replayed."
+      },
+      {
+        "id": "CN3",
+        "text": "Shard recovery must be independent. One shard's recovery must not block another shard's startup or write acceptance."
+      },
+      {
+        "id": "CN4",
+        "text": "The disk node store directory layout must support at least 10 million nodes without filesystem performance degradation (2-level hash prefix directories)."
+      },
+      {
+        "id": "CN5",
+        "text": "WAL truncation must be atomic: the truncation marker and committed root hash must be written together so that a crash during truncation does not lose the commit reference."
+      },
+      {
+        "id": "CN6",
+        "text": "LRU cache eviction must not affect correctness \u2014 a cache miss falls through to disk read."
+      }
+    ],
+    "intention": "Persistence is the durability boundary \u2014 the line between data that survives a power failure and data that doesn't. When this cluster is complete, haematite writes content-addressed tree nodes to disk with zstd compression, maintains a durable WAL file per shard for crash recovery, and can reconstruct its full state from disk after an unclean shutdown. The experience should be invisible: a developer opens a database, writes to it, and trusts that committed data is durable. No manual recovery steps, no fsck, no WAL management. The content-addressed structure makes this unusually clean \u2014 nodes are immutable once written, so there is no in-place update problem, and the WAL is the only source of uncommitted state.",
+    "design_path": "docs/design/persistence",
+    "provenance": {
+      "requested_by": "Tom",
+      "quote": "Persistence is the durability boundary \u2014 the line between data that survives a power failure and data that doesn't. When this cluster is complete, haematite writes content-addressed tree nodes to disk"
+    }
+  },
+  "verify_fix_cap": 3,
+  "review_cap": 1,
+  "round_backoff_ms": 2000,
+  "review_deadline_ms": 300000
+}

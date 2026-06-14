@@ -1,0 +1,366 @@
+{
+  "repo_root": "/Users/tom/Developer/ablative/haematite",
+  "brief_id": "API-001",
+  "reviewers": [
+    "Danger Mouse"
+  ],
+  "base_ref": "main",
+  "placement": "local",
+  "isolation": "worktree",
+  "brief_document": {
+    "id": "API-001",
+    "cluster": "api",
+    "title": "EventStore API, public types, and error types",
+    "depends_on": [
+      "CORE-007",
+      "CORE-008"
+    ],
+    "blocked_by": [],
+    "checklist": [
+      "C1",
+      "C2",
+      "C3",
+      "C4",
+      "C5",
+      "C6",
+      "C7",
+      "C8",
+      "C14",
+      "C15",
+      "C16",
+      "C17"
+    ],
+    "stories": [
+      "S1",
+      "S2",
+      "S3",
+      "S4",
+      "S5",
+      "S13"
+    ],
+    "design_anchor": [
+      "ADR-003",
+      "ADR-005"
+    ],
+    "purpose": "Deliver the EventStore API that Aion requires: append with optimistic concurrency, sequential reads, read-from-position, scan with predicate, and compare-and-swap. Also defines the public API types (Event, SequenceConflict, CasMismatch) and error types that the KV and TTL briefs build on.",
+    "task": "Implement the EventStore operations (append, read, read_from, scan, cas) routing through the shard router to shard actors. Define the event stream key format that encodes stream key + sequence number for ordered tree range queries. Define public API types and error types. append must be atomic within a shard: sequence check and append happen in the shard actor's message handler with no interleaving. Batch append produces exactly one tree commit. scan traverses all shards. This brief does not implement general KV (API-002) or TTL (API-003).",
+    "requirements": [
+      {
+        "id": "R1",
+        "title": "API module structure and types",
+        "spec": "Create the api module with mod.rs containing only pub mod declarations. Define Event type (sequence number, payload bytes), SequenceConflict error (expected and actual seq), CasMismatch error (expected and actual values), and ScanResult. All error types implement std::error::Error and Debug.",
+        "acceptance": [
+          "crates/haematite/src/api/mod.rs exists with only pub mod and pub use statements",
+          "Event type has seq: u64 and payload: Vec<u8> fields",
+          "SequenceConflict has expected: u64 and actual: u64 fields",
+          "CasMismatch has expected and actual value fields",
+          "All error types implement std::error::Error and Debug"
+        ],
+        "files": {
+          "create": [
+            "crates/haematite/src/api/mod.rs",
+            "crates/haematite/src/api/types.rs",
+            "crates/haematite/src/api/error.rs"
+          ],
+          "modify": [
+            "crates/haematite/src/lib.rs"
+          ],
+          "delete": []
+        },
+        "checklist": [
+          "C14",
+          "C15",
+          "C16",
+          "C17"
+        ],
+        "stories": []
+      },
+      {
+        "id": "R2",
+        "title": "Event stream key format",
+        "spec": "THE SYSTEM SHALL encode event stream keys as (stream_key, sequence_number) pairs in a binary format that sorts lexicographically by stream_key first, then by sequence_number. THE SYSTEM SHALL ensure that range queries on the tree yield events in sequence order within a stream.",
+        "acceptance": [
+          "encode_stream_key(stream_key, seq) produces bytes that sort correctly",
+          "Two keys with the same stream_key sort by sequence number",
+          "Two keys with different stream_keys sort by stream_key first",
+          "decode_stream_key(encoded) recovers the original stream_key and seq"
+        ],
+        "files": {
+          "create": [
+            "crates/haematite/src/api/event_store.rs"
+          ],
+          "modify": [],
+          "delete": []
+        },
+        "checklist": [
+          "C8"
+        ],
+        "stories": []
+      },
+      {
+        "id": "R3",
+        "title": "Atomic append with optimistic concurrency",
+        "spec": "WHEN append(key, events, expected_seq) is called, THE SYSTEM SHALL check the current sequence number within the shard actor's message handler. IF expected_seq matches, THE SYSTEM SHALL append all events atomically as a single batch commit. IF expected_seq does not match, THE SYSTEM SHALL return SequenceConflict without modifying the stream. THE SYSTEM SHALL NOT allow interleaving between the sequence check and the append.",
+        "acceptance": [
+          "append with correct expected_seq appends all events and returns Ok",
+          "append with stale expected_seq returns SequenceConflict without modifying the stream",
+          "Batch append of 5 events produces exactly one tree commit",
+          "After successful append, the stream's sequence number equals expected_seq + events.len()"
+        ],
+        "files": {
+          "create": [],
+          "modify": [
+            "crates/haematite/src/api/event_store.rs"
+          ],
+          "delete": []
+        },
+        "checklist": [
+          "C1",
+          "C2",
+          "C3"
+        ],
+        "stories": [
+          "S1",
+          "S2"
+        ]
+      },
+      {
+        "id": "R4",
+        "title": "Read full event stream",
+        "spec": "WHEN read(key) is called, THE SYSTEM SHALL return the full event stream for the key in sequence order. THE SYSTEM SHALL return an empty Vec for keys with no events.",
+        "acceptance": [
+          "read(key) after appending 10 events returns all 10 in sequence order",
+          "read(unknown_key) returns an empty Vec",
+          "Events are returned with correct sequence numbers and payloads"
+        ],
+        "files": {
+          "create": [],
+          "modify": [
+            "crates/haematite/src/api/event_store.rs"
+          ],
+          "delete": []
+        },
+        "checklist": [
+          "C4"
+        ],
+        "stories": [
+          "S3"
+        ]
+      },
+      {
+        "id": "R5",
+        "title": "Read from sequence position",
+        "spec": "WHEN read_from(key, from_seq) is called, THE SYSTEM SHALL return only events with sequence number >= from_seq. THE SYSTEM SHALL NOT read events before from_seq from the tree.",
+        "acceptance": [
+          "read_from(key, 5) on a stream with 10 events returns events 5-9",
+          "read_from(key, 0) returns the full stream",
+          "read_from(key, beyond_end) returns an empty Vec",
+          "read_from uses a range query starting at from_seq, not a full read with filter"
+        ],
+        "files": {
+          "create": [],
+          "modify": [
+            "crates/haematite/src/api/event_store.rs"
+          ],
+          "delete": []
+        },
+        "checklist": [
+          "C5"
+        ],
+        "stories": [
+          "S4"
+        ]
+      },
+      {
+        "id": "R6",
+        "title": "Scan with predicate",
+        "spec": "WHEN scan(predicate) is called, THE SYSTEM SHALL walk all shards and apply the predicate to each key's metadata. THE SYSTEM SHALL return matching entries. The caller must understand this is O(total entries across all shards).",
+        "acceptance": [
+          "scan with a predicate that matches 3 out of 100 keys returns those 3",
+          "scan with a predicate that matches nothing returns an empty Vec",
+          "scan traverses all shards, not just one"
+        ],
+        "files": {
+          "create": [],
+          "modify": [
+            "crates/haematite/src/api/event_store.rs"
+          ],
+          "delete": []
+        },
+        "checklist": [
+          "C6"
+        ],
+        "stories": [
+          "S5"
+        ]
+      },
+      {
+        "id": "R7",
+        "title": "Compare-and-swap",
+        "spec": "WHEN cas(key, expected, new) is called, THE SYSTEM SHALL atomically replace the value if it matches expected. IF the current value does not match expected, THE SYSTEM SHALL return CasMismatch. THE SYSTEM SHALL execute the compare and swap within the shard actor's message handler.",
+        "acceptance": [
+          "cas with matching expected value updates the key and returns Ok",
+          "cas with non-matching expected value returns CasMismatch with actual value",
+          "cas on a non-existent key with expected=None creates the key",
+          "cas is atomic \u2014 no interleaving between compare and swap"
+        ],
+        "files": {
+          "create": [],
+          "modify": [
+            "crates/haematite/src/api/event_store.rs"
+          ],
+          "delete": []
+        },
+        "checklist": [
+          "C7"
+        ],
+        "stories": [
+          "S13"
+        ]
+      }
+    ],
+    "boundaries": [
+      "SHALL NOT implement general KV operations (get/put/delete/range/commit) \u2014 those are API-002",
+      "SHALL NOT implement TTL or expiry \u2014 that is API-003",
+      "SHALL NOT implement secondary indexes for scan optimisation",
+      "SHALL NOT implement streaming or push-based event delivery"
+    ],
+    "verification": [
+      "cargo check -p haematite succeeds with no errors",
+      "cargo test -p haematite --lib passes all tests",
+      "cargo clippy -p haematite produces no errors",
+      "grep -r 'unwrap()\\|expect(' crates/haematite/src/api/ --include='*.rs' -l finds no non-test files",
+      "No file in crates/haematite/src/api/ exceeds 500 lines"
+    ]
+  },
+  "resolved_context": {
+    "adrs": [
+      {
+        "id": "ADR-003",
+        "title": "WAL buffer for write amortization rather than direct tree mutation",
+        "decision": "WAL buffer over direct tree mutation, because it gives sequential-append write latency (the WAL) with amortized tree cost (one path-to-root rewrite per flush, not per write). The rejected alternative (direct mutation with batching windows) forces callers to accept high write latency or risk high write amplification with small batches.",
+        "quote": "",
+        "decided_by": "Bono"
+      },
+      {
+        "id": "ADR-005",
+        "title": "Unbounded value size via off-heap binary storage",
+        "decision": "Unbounded value size (inheriting beamr's ProcBin off-heap storage) over imposing an arbitrary limit, because large values are a valid use case and the off-heap binary representation means they do not consume proportional heap space. The rejected alternative (size cap) would prevent Aion from storing large workflow state and would require callers to implement their own chunking.",
+        "quote": "",
+        "decided_by": "Bono, Frodo Baggins"
+      }
+    ],
+    "checklist": [
+      {
+        "id": "C1",
+        "text": "append(key, events, expected_seq) atomically appends events to the key's stream if expected_seq matches the current sequence number."
+      },
+      {
+        "id": "C2",
+        "text": "append returns SequenceConflict without modifying the stream when expected_seq does not match."
+      },
+      {
+        "id": "C3",
+        "text": "Batch append of N events produces exactly one tree commit per shard (CN2)."
+      },
+      {
+        "id": "C4",
+        "text": "read(key) returns the full event stream in sequence order."
+      },
+      {
+        "id": "C5",
+        "text": "read_from(key, from_seq) returns only events from from_seq forward without reading the full history."
+      },
+      {
+        "id": "C6",
+        "text": "scan(predicate) walks all shards and returns entries matching the predicate."
+      },
+      {
+        "id": "C7",
+        "text": "cas(key, expected, new) atomically replaces the value if it matches expected, returns CasMismatch otherwise."
+      },
+      {
+        "id": "C8",
+        "text": "Event stream key format encodes both the stream key and sequence number so that tree range queries yield events in order."
+      },
+      {
+        "id": "C14",
+        "text": "Event type represents a single event in a stream with sequence number and payload."
+      },
+      {
+        "id": "C15",
+        "text": "SequenceConflict error includes the expected and actual sequence numbers."
+      },
+      {
+        "id": "C16",
+        "text": "CasMismatch error includes the expected and actual values."
+      },
+      {
+        "id": "C17",
+        "text": "All error types implement std::error::Error and Debug."
+      }
+    ],
+    "stories": [
+      {
+        "id": "S1",
+        "text": "As the Aion engine, I want to append events to a workflow key with optimistic concurrency so that two concurrent recorders to the same workflow are detected and one retries."
+      },
+      {
+        "id": "S2",
+        "text": "As the Aion engine, I want to batch-append WorkflowStarted and SearchAttributesUpdated atomically so that a crash between them never leaves an orphaned workflow."
+      },
+      {
+        "id": "S3",
+        "text": "As the Aion engine, I want to read a workflow's full event history in sequence order so that I can replay it for recovery."
+      },
+      {
+        "id": "S4",
+        "text": "As the Aion engine, I want to read events from a specific sequence number forward so that recovery resumes without re-reading the entire history."
+      },
+      {
+        "id": "S5",
+        "text": "As the Aion engine, I want to scan for workflows matching search attributes so that I can implement workflow visibility queries."
+      },
+      {
+        "id": "S13",
+        "text": "As an application developer, I want compare-and-swap on a single key so that I can implement optimistic concurrency for my own data structures."
+      }
+    ],
+    "constraints": [
+      {
+        "id": "CN1",
+        "text": "append with expected_seq must be atomic: the sequence check and the append happen within the shard actor's message handler with no interleaving."
+      },
+      {
+        "id": "CN2",
+        "text": "Batch append of N events must produce exactly one tree commit, not N individual commits."
+      },
+      {
+        "id": "CN3",
+        "text": "Expired entries must never be returned by get, read, read_from, range, or scan \u2014 regardless of sweep actor state."
+      },
+      {
+        "id": "CN4",
+        "text": "The sweep actor must not block the shard actor's write path. Sweep runs as a separate supervised process."
+      },
+      {
+        "id": "CN5",
+        "text": "scan traverses all shards. The caller must understand this is O(total entries across all shards), not O(entries in one shard)."
+      },
+      {
+        "id": "CN6",
+        "text": "cas is atomic within a shard but provides no cross-shard guarantees."
+      }
+    ],
+    "intention": "The API cluster is the contract between haematite and every application that embeds it. When this cluster is complete, Aion can use haematite as its EventStore backend with append/read/read_from/scan/cas operations, the messaging bus can use general KV operations for durable channel state, and both get built-in TTL expiry without application-level sweep logic. The API should feel like a thin, honest surface \u2014 every operation maps directly to the underlying shard actor, nothing is hidden behind clever abstractions, and the cost model is transparent. A caller who understands the shard model should be able to predict the performance of any API call.",
+    "design_path": "docs/design/api",
+    "provenance": {
+      "requested_by": "Tom",
+      "quote": "The API cluster is the contract between haematite and every application that embeds it. When this cluster is complete, Aion can use haematite as its EventStore backend with append/read/read_from/scan/"
+    }
+  },
+  "verify_fix_cap": 3,
+  "review_cap": 1,
+  "round_backoff_ms": 2000,
+  "review_deadline_ms": 300000
+}

@@ -1,0 +1,40 @@
+{
+  "cluster": "persistence",
+  "sections": [
+    {
+      "name": "Disk Node Store",
+      "items": [
+        {"id": "C1", "text": "DiskStore implements the NodeStore trait with on-disk content-addressed storage.", "done": false},
+        {"id": "C2", "text": "Node file path is determined by BLAKE3 hash: first 2 hex bytes as directory, remaining as filename.", "done": false},
+        {"id": "C3", "text": "Nodes are compressed with zstd before writing to disk (ADR-006).", "done": false},
+        {"id": "C4", "text": "Reads decompress zstd on load; the LRU cache stores decompressed nodes.", "done": false},
+        {"id": "C5", "text": "Node writes are idempotent: writing a hash that already exists on disk is a no-op.", "done": false},
+        {"id": "C6", "text": "LRU cache has a configurable maximum size in entries or bytes.", "done": false},
+        {"id": "C7", "text": "Cache eviction does not affect correctness — a miss falls through to disk read (CN6).", "done": false},
+        {"id": "C8", "text": "DiskStore exposes a delete-by-hash method for snapshot pruning coordination.", "done": false}
+      ]
+    },
+    {
+      "name": "Durable WAL",
+      "items": [
+        {"id": "C9", "text": "Each shard actor's WAL buffer is backed by an append-only file on disk.", "done": false},
+        {"id": "C10", "text": "WAL entries include operation type, key, value (for puts), and a CRC32 checksum (CN2).", "done": false},
+        {"id": "C11", "text": "Mutations are written to the durable WAL before the shard actor acknowledges the write.", "done": false},
+        {"id": "C12", "text": "Fsync policy is configurable: per-write, every N writes, or commit-only.", "done": false},
+        {"id": "C13", "text": "On commit (tree flush), the WAL file is truncated with a truncation marker recording the committed root hash.", "done": false},
+        {"id": "C14", "text": "WAL truncation is atomic: truncation marker and root hash are written together (CN5).", "done": false}
+      ]
+    },
+    {
+      "name": "Crash Recovery",
+      "items": [
+        {"id": "C15", "text": "Recovery reads the last truncation marker to find the committed root hash.", "done": false},
+        {"id": "C16", "text": "Recovery verifies the committed root hash exists in the disk node store.", "done": false},
+        {"id": "C17", "text": "Recovery replays all WAL entries after the truncation marker, reconstructing the in-memory buffer.", "done": false},
+        {"id": "C18", "text": "Corrupted WAL entries (CRC mismatch) are detected and recovery replays up to the last valid entry.", "done": false},
+        {"id": "C19", "text": "Recovery is per-shard: each shard recovers independently (CN3).", "done": false},
+        {"id": "C20", "text": "After recovery, the shard actor resumes normal operation accepting new writes.", "done": false}
+      ]
+    }
+  ]
+}

@@ -1,0 +1,192 @@
+{
+  "repo_root": "/Users/tom/Developer/ablative/haematite",
+  "brief_id": "DIST-003",
+  "reviewers": [
+    "Danger Mouse"
+  ],
+  "base_ref": "main",
+  "placement": "local",
+  "isolation": "worktree",
+  "brief_document": {
+    "id": "DIST-003",
+    "cluster": "distribution",
+    "title": "Sync topology configuration and scheduling",
+    "depends_on": [
+      "DIST-001"
+    ],
+    "blocked_by": [],
+    "checklist": [
+      "C17",
+      "C18",
+      "C19"
+    ],
+    "stories": [
+      "S2",
+      "S3"
+    ],
+    "design_anchor": [
+      "ADR-001"
+    ],
+    "purpose": "Deliver configurable sync topology (full-mesh, ring, custom pairs) and the sync scheduler that triggers periodic syncs based on the configured topology and interval. Any topology converges to consistency given sufficient sync rounds.",
+    "task": "Implement sync topology configuration: full-mesh (every node syncs with every other), ring (each node syncs with its successor), and custom (explicit sync pairs). Implement the sync scheduler as a beamr process that triggers periodic syncs based on topology and interval. The scheduler fires pull-syncs to the target nodes according to the topology map. Does not implement the sync protocol (DIST-001) or merge logic (DIST-002).",
+    "requirements": [
+      {
+        "id": "R1",
+        "title": "Topology configuration",
+        "spec": "THE SYSTEM SHALL accept a sync topology on database creation: FullMesh, Ring, or Custom(pairs). THE SYSTEM SHALL derive the sync partner list from the topology. THE SYSTEM SHALL NOT have a default topology \u2014 the caller must choose explicitly.",
+        "acceptance": [
+          "SyncTopology::FullMesh with 4 nodes produces 6 sync pairs (all combinations)",
+          "SyncTopology::Ring with 4 nodes produces 4 sync pairs (each to its successor)",
+          "SyncTopology::Custom accepts an explicit list of (source, target) pairs",
+          "Creating a distributed database without a topology is an error"
+        ],
+        "files": {
+          "create": [
+            "crates/haematite/src/sync/topology.rs"
+          ],
+          "modify": [
+            "crates/haematite/src/sync/mod.rs"
+          ],
+          "delete": []
+        },
+        "checklist": [
+          "C17"
+        ],
+        "stories": [
+          "S2"
+        ]
+      },
+      {
+        "id": "R2",
+        "title": "Sync scheduler",
+        "spec": "THE SYSTEM SHALL spawn a sync scheduler as a supervised beamr process. THE SYSTEM SHALL trigger pull-syncs to partner nodes at the configured interval according to the topology. THE SYSTEM SHALL NOT block the shard actor's write path while syncing.",
+        "acceptance": [
+          "The scheduler fires sync operations at the configured interval",
+          "Sync targets are determined by the topology",
+          "The scheduler is supervised \u2014 a crash restarts it",
+          "Write operations are not blocked during scheduled syncs"
+        ],
+        "files": {
+          "create": [
+            "crates/haematite/src/sync/scheduler.rs"
+          ],
+          "modify": [
+            "crates/haematite/src/sync/mod.rs"
+          ],
+          "delete": []
+        },
+        "checklist": [
+          "C18"
+        ],
+        "stories": [
+          "S3"
+        ]
+      },
+      {
+        "id": "R3",
+        "title": "Convergence guarantee",
+        "spec": "THE SYSTEM SHALL ensure that any topology converges to consistency given sufficient sync rounds. THE SYSTEM SHALL document the convergence properties of each topology: FullMesh converges in 1 round, Ring converges in N-1 rounds, Custom depends on the pair graph connectivity.",
+        "acceptance": [
+          "FullMesh topology converges all nodes to the same state in one sync round",
+          "Ring topology converges in at most N-1 rounds for N nodes",
+          "Custom topology converges if and only if the pair graph is connected"
+        ],
+        "files": {
+          "create": [],
+          "modify": [
+            "crates/haematite/src/sync/topology.rs"
+          ],
+          "delete": []
+        },
+        "checklist": [
+          "C19"
+        ],
+        "stories": []
+      }
+    ],
+    "boundaries": [
+      "SHALL NOT implement the sync protocol or node transfer \u2014 that is DIST-001",
+      "SHALL NOT implement merge or consistency modes \u2014 that is DIST-002",
+      "SHALL NOT implement dynamic topology changes at runtime \u2014 topology is set at creation",
+      "SHALL NOT implement node discovery \u2014 uses beamr's existing distribution connection manager"
+    ],
+    "verification": [
+      "cargo check -p haematite succeeds with no errors",
+      "cargo test -p haematite --lib passes all tests",
+      "cargo clippy -p haematite produces no errors",
+      "grep -r 'unwrap()\\|expect(' crates/haematite/src/sync/ --include='*.rs' -l finds no non-test files",
+      "No file in crates/haematite/src/sync/ exceeds 500 lines"
+    ]
+  },
+  "resolved_context": {
+    "adrs": [
+      {
+        "id": "ADR-001",
+        "title": "Content-addressed prolly tree over B+ tree with WAL overlay",
+        "decision": "Content-addressed prolly tree over B+ tree with WAL overlay, because branching/merging/sync is the headline feature and must be structural (O(differences), history-independent) rather than overlaid (O(branch-writes), order-dependent). The rejected alternative (B+ tree + WAL overlay) makes branching an afterthought \u2014 functional but O(branch-writes) for merge and requiring WAL coordination for replication.",
+        "quote": "",
+        "decided_by": "Bono, Frodo Baggins, Sir Patick Stewart"
+      }
+    ],
+    "checklist": [
+      {
+        "id": "C17",
+        "text": "Sync topology is configurable: full-mesh, ring, or custom sync pairs."
+      },
+      {
+        "id": "C18",
+        "text": "Sync scheduler triggers periodic syncs based on the configured topology and interval."
+      },
+      {
+        "id": "C19",
+        "text": "Any topology converges to consistency given sufficient sync rounds."
+      }
+    ],
+    "stories": [
+      {
+        "id": "S2",
+        "text": "As an operations engineer, I want to choose a sync topology (full-mesh, ring, custom) so that I can balance sync traffic against convergence speed."
+      },
+      {
+        "id": "S3",
+        "text": "As an operations engineer, I want to configure the sync interval so that I can trade freshness against network bandwidth."
+      }
+    ],
+    "constraints": [
+      {
+        "id": "CN1",
+        "text": "Sync must transfer only content-addressed nodes that the target does not have. Full database copies on sync are a correctness bug."
+      },
+      {
+        "id": "CN2",
+        "text": "Sync must operate per-shard. A sync on shard 5 must not block or affect shards 0-4 and 6-N."
+      },
+      {
+        "id": "CN3",
+        "text": "Strong consistency mode must wait for quorum (N/2+1) acknowledgments before returning. Returning early is a durability violation."
+      },
+      {
+        "id": "CN4",
+        "text": "Divergent writes must be resolved by the configured conflict resolution policy, never silently dropped."
+      },
+      {
+        "id": "CN5",
+        "text": "Sync must use beamr's existing distribution connections. No separate TCP connections or custom transport."
+      },
+      {
+        "id": "CN6",
+        "text": "A sync failure (network partition, node crash mid-sync) must not corrupt either node's local state. Partial syncs are safe to retry."
+      }
+    ],
+    "intention": "Distribution extends haematite from a single-node storage engine to a multi-node system where databases on different machines stay in sync by exchanging content-addressed tree nodes. When this cluster is complete, two haematite nodes can sync a database by comparing root hashes and exchanging only the missing nodes \u2014 the same mechanism git uses for fetch and push, applied to a live key-value store. There is no primary-replica relationship, no replication log to manage, no WAL coordination. Any node can sync with any other node. The experience should feel like git remote: add a remote, push, pull, and the content-addressed structure guarantees that the minimal set of data moves.",
+    "design_path": "docs/design/distribution",
+    "provenance": {
+      "requested_by": "Tom",
+      "quote": "Distribution extends haematite from a single-node storage engine to a multi-node system where databases on different machines stay in sync by exchanging content-addressed tree nodes. When this cluster"
+    }
+  },
+  "verify_fix_cap": 3,
+  "review_cap": 1,
+  "round_backoff_ms": 2000,
+  "review_deadline_ms": 300000
+}

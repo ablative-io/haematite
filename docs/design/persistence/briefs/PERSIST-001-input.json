@@ -1,0 +1,326 @@
+{
+  "repo_root": "/Users/tom/Developer/ablative/haematite",
+  "brief_id": "PERSIST-001",
+  "reviewers": [
+    "Danger Mouse"
+  ],
+  "base_ref": "main",
+  "placement": "local",
+  "isolation": "worktree",
+  "brief_document": {
+    "id": "PERSIST-001",
+    "cluster": "persistence",
+    "title": "Disk node store with zstd compression and LRU cache",
+    "depends_on": [
+      "CORE-001"
+    ],
+    "blocked_by": [],
+    "checklist": [
+      "C1",
+      "C2",
+      "C3",
+      "C4",
+      "C5",
+      "C6",
+      "C7",
+      "C8"
+    ],
+    "stories": [
+      "S1",
+      "S8",
+      "S9"
+    ],
+    "design_anchor": [
+      "ADR-001",
+      "ADR-006"
+    ],
+    "purpose": "Deliver the disk-backed NodeStore implementation that persists content-addressed tree nodes with zstd compression and an LRU cache for fast reads. This is the durability layer for the prolly tree \u2014 without it, tree nodes exist only in memory.",
+    "task": "Implement DiskStore implementing the NodeStore trait. Nodes are stored as files in a content-addressed directory layout (first 2 hex bytes of hash as directory, remaining as filename). Nodes are compressed with zstd before writing. Reads decompress on load. An LRU cache holds recently-accessed decompressed nodes in memory. Node writes are idempotent \u2014 writing a hash that already exists is a no-op. Expose a delete-by-hash method for snapshot pruning coordination. Does not implement WAL durability (PERSIST-002) or crash recovery (PERSIST-003).",
+    "requirements": [
+      {
+        "id": "R1",
+        "title": "DiskStore type implementing NodeStore",
+        "spec": "THE SYSTEM SHALL define a DiskStore type implementing the NodeStore trait (get/put). THE SYSTEM SHALL accept a base directory path on construction. THE SYSTEM SHALL create the base directory if it does not exist.",
+        "acceptance": [
+          "DiskStore::new(path) creates the store with the given base directory",
+          "DiskStore implements NodeStore (get and put methods)",
+          "The base directory is created if absent",
+          "DiskStore implements Debug"
+        ],
+        "files": {
+          "create": [
+            "crates/haematite/src/store/disk.rs"
+          ],
+          "modify": [
+            "crates/haematite/src/store/mod.rs"
+          ],
+          "delete": []
+        },
+        "checklist": [
+          "C1"
+        ],
+        "stories": [
+          "S1"
+        ]
+      },
+      {
+        "id": "R2",
+        "title": "Content-addressed directory layout",
+        "spec": "THE SYSTEM SHALL store each node at a path determined by its BLAKE3 hash: the first 2 hex bytes as a subdirectory, the remaining hex bytes as the filename. THE SYSTEM SHALL create subdirectories on demand. THE SYSTEM SHALL support at least 10 million nodes without filesystem performance degradation.",
+        "acceptance": [
+          "A node with hash 'ab12cd...' is stored at base_dir/ab/12cd...",
+          "Subdirectories are created on first write to that prefix",
+          "get(hash) reads from the correct path",
+          "The layout produces 256 subdirectories (00-ff), each holding up to ~39,000 files per million nodes"
+        ],
+        "files": {
+          "create": [],
+          "modify": [
+            "crates/haematite/src/store/disk.rs"
+          ],
+          "delete": []
+        },
+        "checklist": [
+          "C2"
+        ],
+        "stories": [
+          "S8"
+        ]
+      },
+      {
+        "id": "R3",
+        "title": "Zstd compression on write",
+        "spec": "WHEN put(node) is called, THE SYSTEM SHALL serialise the node, compress the bytes with zstd, and write the compressed bytes to disk. THE SYSTEM SHALL NOT write uncompressed node bytes to disk.",
+        "acceptance": [
+          "The file on disk is smaller than the serialised node bytes (for non-trivial nodes)",
+          "The file on disk starts with the zstd magic bytes (0x28B52FFD)",
+          "put followed by reading the raw file and decompressing produces the original serialised bytes"
+        ],
+        "files": {
+          "create": [],
+          "modify": [
+            "crates/haematite/src/store/disk.rs"
+          ],
+          "delete": []
+        },
+        "checklist": [
+          "C3"
+        ],
+        "stories": []
+      },
+      {
+        "id": "R4",
+        "title": "Decompression on read with LRU cache",
+        "spec": "WHEN get(hash) is called, THE SYSTEM SHALL first check the LRU cache. IF the node is cached, THE SYSTEM SHALL return the decompressed node from cache. IF not cached, THE SYSTEM SHALL read the compressed bytes from disk, decompress with zstd, insert the decompressed node into the cache, and return it. THE SYSTEM SHALL NOT store compressed bytes in the cache.",
+        "acceptance": [
+          "get on a cached node returns without disk I/O",
+          "get on an uncached node reads from disk, decompresses, and caches",
+          "The cache stores decompressed nodes, not compressed bytes",
+          "A second get on the same hash hits the cache"
+        ],
+        "files": {
+          "create": [
+            "crates/haematite/src/store/cache.rs"
+          ],
+          "modify": [
+            "crates/haematite/src/store/disk.rs",
+            "crates/haematite/src/store/mod.rs"
+          ],
+          "delete": []
+        },
+        "checklist": [
+          "C4",
+          "C6"
+        ],
+        "stories": [
+          "S9"
+        ]
+      },
+      {
+        "id": "R5",
+        "title": "Idempotent writes",
+        "spec": "WHEN put(node) is called for a hash that already exists on disk, THE SYSTEM SHALL return the hash without writing. THE SYSTEM SHALL NOT error or overwrite \u2014 content addressing guarantees the content is identical.",
+        "acceptance": [
+          "put(node) twice returns the same hash both times",
+          "The second put does not perform a disk write",
+          "No error is produced for duplicate puts"
+        ],
+        "files": {
+          "create": [],
+          "modify": [
+            "crates/haematite/src/store/disk.rs"
+          ],
+          "delete": []
+        },
+        "checklist": [
+          "C5"
+        ],
+        "stories": []
+      },
+      {
+        "id": "R6",
+        "title": "Cache configuration and eviction",
+        "spec": "THE SYSTEM SHALL accept a configurable maximum cache size. WHEN the cache exceeds the maximum, THE SYSTEM SHALL evict the least-recently-used entry. Cache eviction SHALL NOT affect correctness \u2014 a miss falls through to disk read.",
+        "acceptance": [
+          "LruCache::new(max_entries) creates a cache with the given capacity",
+          "Inserting beyond capacity evicts the LRU entry",
+          "get on an evicted entry still works (falls through to disk read)",
+          "Cache size never exceeds the configured maximum"
+        ],
+        "files": {
+          "create": [],
+          "modify": [
+            "crates/haematite/src/store/cache.rs"
+          ],
+          "delete": []
+        },
+        "checklist": [
+          "C6",
+          "C7"
+        ],
+        "stories": [
+          "S9"
+        ]
+      },
+      {
+        "id": "R7",
+        "title": "Delete by hash for pruning",
+        "spec": "THE SYSTEM SHALL expose a delete(hash) method that removes a node's file from disk and evicts it from the cache. THE SYSTEM SHALL return Ok even if the hash does not exist on disk (idempotent delete).",
+        "acceptance": [
+          "delete(hash) removes the file from disk",
+          "delete(hash) evicts the entry from the LRU cache",
+          "get(hash) returns None after delete",
+          "delete(unknown_hash) returns Ok"
+        ],
+        "files": {
+          "create": [
+            "crates/haematite/src/store/gc.rs"
+          ],
+          "modify": [
+            "crates/haematite/src/store/mod.rs"
+          ],
+          "delete": []
+        },
+        "checklist": [
+          "C8"
+        ],
+        "stories": []
+      }
+    ],
+    "boundaries": [
+      "SHALL NOT implement WAL durability \u2014 that is PERSIST-002",
+      "SHALL NOT implement crash recovery \u2014 that is PERSIST-003",
+      "SHALL NOT implement node compression algorithms other than zstd",
+      "SHALL NOT initiate node deletion on its own \u2014 deletion is triggered by snapshot pruning (BRANCH-004)"
+    ],
+    "verification": [
+      "cargo check -p haematite succeeds with no errors",
+      "cargo test -p haematite --lib passes all tests",
+      "cargo clippy -p haematite produces no errors",
+      "grep -r 'unwrap()\\|expect(' crates/haematite/src/store/ --include='*.rs' -l finds no non-test files (excluding memory.rs from CORE-001)",
+      "No file in crates/haematite/src/store/ exceeds 500 lines"
+    ]
+  },
+  "resolved_context": {
+    "adrs": [
+      {
+        "id": "ADR-001",
+        "title": "Content-addressed prolly tree over B+ tree with WAL overlay",
+        "decision": "Content-addressed prolly tree over B+ tree with WAL overlay, because branching/merging/sync is the headline feature and must be structural (O(differences), history-independent) rather than overlaid (O(branch-writes), order-dependent). The rejected alternative (B+ tree + WAL overlay) makes branching an afterthought \u2014 functional but O(branch-writes) for merge and requiring WAL coordination for replication.",
+        "quote": "",
+        "decided_by": "Bono, Frodo Baggins, Sir Patick Stewart"
+      },
+      {
+        "id": "ADR-006",
+        "title": "zstd compression per content-addressed node, WAL uncompressed",
+        "decision": "zstd compression per content-addressed tree node, WAL entries uncompressed, over compressing both or neither. The rejected alternatives: compressing WAL entries (poor ratio, added write latency on the hot path); no compression (wasted disk for tree nodes that compress well at ~3:1 for structured data).",
+        "quote": "",
+        "decided_by": "Bono, Frodo Baggins"
+      }
+    ],
+    "checklist": [
+      {
+        "id": "C1",
+        "text": "DiskStore implements the NodeStore trait with on-disk content-addressed storage."
+      },
+      {
+        "id": "C2",
+        "text": "Node file path is determined by BLAKE3 hash: first 2 hex bytes as directory, remaining as filename."
+      },
+      {
+        "id": "C3",
+        "text": "Nodes are compressed with zstd before writing to disk (ADR-006)."
+      },
+      {
+        "id": "C4",
+        "text": "Reads decompress zstd on load; the LRU cache stores decompressed nodes."
+      },
+      {
+        "id": "C5",
+        "text": "Node writes are idempotent: writing a hash that already exists on disk is a no-op."
+      },
+      {
+        "id": "C6",
+        "text": "LRU cache has a configurable maximum size in entries or bytes."
+      },
+      {
+        "id": "C7",
+        "text": "Cache eviction does not affect correctness \u2014 a miss falls through to disk read (CN6)."
+      },
+      {
+        "id": "C8",
+        "text": "DiskStore exposes a delete-by-hash method for snapshot pruning coordination."
+      }
+    ],
+    "stories": [
+      {
+        "id": "S1",
+        "text": "As an application developer, I want committed data to survive a process crash so that I do not need to implement my own durability layer."
+      },
+      {
+        "id": "S8",
+        "text": "As an operations engineer, I want the disk node store to handle millions of nodes without filesystem performance degradation so that I do not need to tune directory structures."
+      },
+      {
+        "id": "S9",
+        "text": "As an operations engineer, I want the LRU cache size to be configurable so that I can tune memory usage based on available RAM and access patterns."
+      }
+    ],
+    "constraints": [
+      {
+        "id": "CN1",
+        "text": "Committed tree state must survive unclean shutdown. A committed root hash and all nodes it references must be on disk before commit() returns."
+      },
+      {
+        "id": "CN2",
+        "text": "WAL entries must include CRC32 checksums. A corrupted entry must be detectable, not silently replayed."
+      },
+      {
+        "id": "CN3",
+        "text": "Shard recovery must be independent. One shard's recovery must not block another shard's startup or write acceptance."
+      },
+      {
+        "id": "CN4",
+        "text": "The disk node store directory layout must support at least 10 million nodes without filesystem performance degradation (2-level hash prefix directories)."
+      },
+      {
+        "id": "CN5",
+        "text": "WAL truncation must be atomic: the truncation marker and committed root hash must be written together so that a crash during truncation does not lose the commit reference."
+      },
+      {
+        "id": "CN6",
+        "text": "LRU cache eviction must not affect correctness \u2014 a cache miss falls through to disk read."
+      }
+    ],
+    "intention": "Persistence is the durability boundary \u2014 the line between data that survives a power failure and data that doesn't. When this cluster is complete, haematite writes content-addressed tree nodes to disk with zstd compression, maintains a durable WAL file per shard for crash recovery, and can reconstruct its full state from disk after an unclean shutdown. The experience should be invisible: a developer opens a database, writes to it, and trusts that committed data is durable. No manual recovery steps, no fsck, no WAL management. The content-addressed structure makes this unusually clean \u2014 nodes are immutable once written, so there is no in-place update problem, and the WAL is the only source of uncommitted state.",
+    "design_path": "docs/design/persistence",
+    "provenance": {
+      "requested_by": "Tom",
+      "quote": "Persistence is the durability boundary \u2014 the line between data that survives a power failure and data that doesn't. When this cluster is complete, haematite writes content-addressed tree nodes to disk"
+    }
+  },
+  "verify_fix_cap": 3,
+  "review_cap": 1,
+  "round_backoff_ms": 2000,
+  "review_deadline_ms": 300000
+}

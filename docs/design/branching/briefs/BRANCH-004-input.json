@@ -1,0 +1,205 @@
+{
+  "repo_root": "/Users/tom/Developer/ablative/haematite",
+  "brief_id": "BRANCH-004",
+  "reviewers": [
+    "Danger Mouse"
+  ],
+  "base_ref": "main",
+  "placement": "local",
+  "isolation": "worktree",
+  "brief_document": {
+    "id": "BRANCH-004",
+    "cluster": "branching",
+    "title": "Snapshot pruning and unreferenced node reclamation",
+    "depends_on": [
+      "BRANCH-003",
+      "BRANCH-001"
+    ],
+    "blocked_by": [],
+    "checklist": [
+      "C24",
+      "C25",
+      "C26",
+      "C27"
+    ],
+    "stories": [
+      "S12",
+      "S13",
+      "S14"
+    ],
+    "design_anchor": [
+      "ADR-001"
+    ],
+    "purpose": "Deliver snapshot pruning \u2014 removing named snapshots and reclaiming tree nodes that are no longer referenced by any active branch or named snapshot. This is the storage reclamation mechanism: without pruning, content-addressed nodes accumulate indefinitely.",
+    "task": "Implement prune(name) to remove a named snapshot from the registry. After removal, walk the node store's reference graph to identify nodes no longer referenced by any active branch or remaining snapshot. Delete unreferenced nodes from the store. Pruning must never delete nodes that are still referenced \u2014 this is a safety-critical invariant. Report the number of nodes and bytes reclaimed.",
+    "requirements": [
+      {
+        "id": "R1",
+        "title": "Remove named snapshot",
+        "spec": "WHEN prune(name) is called, THE SYSTEM SHALL remove the named snapshot from the registry. THE SYSTEM SHALL return an error if the name does not exist. THE SYSTEM SHALL NOT remove the snapshot's root hash from the commit log \u2014 the log is append-only.",
+        "acceptance": [
+          "prune(name) removes the snapshot from the registry",
+          "After pruning, SnapshotRegistry::get(name) returns None",
+          "prune(unknown_name) returns an error",
+          "The commit log still contains the pruned snapshot's root hash"
+        ],
+        "files": {
+          "create": [
+            "crates/haematite/src/branch/prune.rs"
+          ],
+          "modify": [
+            "crates/haematite/src/branch/mod.rs"
+          ],
+          "delete": []
+        },
+        "checklist": [
+          "C24"
+        ],
+        "stories": [
+          "S12"
+        ]
+      },
+      {
+        "id": "R2",
+        "title": "Reference graph walk",
+        "spec": "AFTER removing a snapshot, THE SYSTEM SHALL walk the node store's reference graph starting from all live roots (active branches and remaining named snapshots). THE SYSTEM SHALL identify nodes that are not reachable from any live root. THE SYSTEM SHALL NOT mark nodes as unreferenced if they are reachable from any live root.",
+        "acceptance": [
+          "Nodes reachable from any active branch root are not marked for deletion",
+          "Nodes reachable from any remaining named snapshot are not marked for deletion",
+          "Nodes reachable only from the pruned snapshot's root are marked for deletion",
+          "Shared nodes (reachable from multiple roots) are never marked for deletion"
+        ],
+        "files": {
+          "create": [],
+          "modify": [
+            "crates/haematite/src/branch/prune.rs"
+          ],
+          "delete": []
+        },
+        "checklist": [
+          "C25",
+          "C26"
+        ],
+        "stories": [
+          "S14"
+        ]
+      },
+      {
+        "id": "R3",
+        "title": "Unreferenced node deletion",
+        "spec": "THE SYSTEM SHALL delete unreferenced nodes from the node store. THE SYSTEM SHALL report the number of nodes deleted and the total bytes reclaimed. THE SYSTEM SHALL NOT delete nodes while the reference walk is in progress \u2014 collect first, delete second.",
+        "acceptance": [
+          "Unreferenced nodes are deleted from the node store",
+          "prune() returns a PruneReport with node_count and bytes_reclaimed fields",
+          "After pruning, NodeStore::get(deleted_hash) returns None",
+          "Nodes still referenced by live roots remain accessible after pruning"
+        ],
+        "files": {
+          "create": [],
+          "modify": [
+            "crates/haematite/src/branch/prune.rs"
+          ],
+          "delete": []
+        },
+        "checklist": [
+          "C27"
+        ],
+        "stories": [
+          "S13"
+        ]
+      }
+    ],
+    "boundaries": [
+      "SHALL NOT implement fork, merge, or checkout \u2014 those are BRANCH-001 through BRANCH-003",
+      "SHALL NOT modify the commit log \u2014 it is append-only",
+      "SHALL NOT delete nodes that are reachable from any active branch or named snapshot",
+      "SHALL NOT implement automatic pruning scheduling \u2014 pruning is caller-initiated"
+    ],
+    "verification": [
+      "cargo check -p haematite succeeds with no errors",
+      "cargo test -p haematite --lib passes all tests",
+      "cargo clippy -p haematite produces no errors",
+      "grep -r 'unwrap()\\|expect(' crates/haematite/src/branch/ --include='*.rs' -l finds no non-test files",
+      "No file in crates/haematite/src/branch/ exceeds 500 lines"
+    ]
+  },
+  "resolved_context": {
+    "adrs": [
+      {
+        "id": "ADR-001",
+        "title": "Content-addressed prolly tree over B+ tree with WAL overlay",
+        "decision": "Content-addressed prolly tree over B+ tree with WAL overlay, because branching/merging/sync is the headline feature and must be structural (O(differences), history-independent) rather than overlaid (O(branch-writes), order-dependent). The rejected alternative (B+ tree + WAL overlay) makes branching an afterthought \u2014 functional but O(branch-writes) for merge and requiring WAL coordination for replication.",
+        "quote": "",
+        "decided_by": "Bono, Frodo Baggins, Sir Patick Stewart"
+      }
+    ],
+    "checklist": [
+      {
+        "id": "C24",
+        "text": "prune(name) removes a named snapshot from the registry."
+      },
+      {
+        "id": "C25",
+        "text": "Pruning walks the node store's reference graph to identify nodes no longer referenced by any active branch or named snapshot."
+      },
+      {
+        "id": "C26",
+        "text": "Pruning never deletes nodes referenced by an active branch or named snapshot (CN4)."
+      },
+      {
+        "id": "C27",
+        "text": "Pruning reports the number of nodes and bytes reclaimed."
+      }
+    ],
+    "stories": [
+      {
+        "id": "S12",
+        "text": "As an operations engineer, I want to prune old snapshots so that unreferenced tree nodes are reclaimed and disk usage is controlled."
+      },
+      {
+        "id": "S13",
+        "text": "As an operations engineer, I want pruning to report how many nodes and bytes were reclaimed so that I can track the effectiveness of my retention policy."
+      },
+      {
+        "id": "S14",
+        "text": "As an operations engineer, I want pruning to guarantee it never deletes nodes referenced by active branches so that live data is never lost."
+      }
+    ],
+    "constraints": [
+      {
+        "id": "CN1",
+        "text": "Fork must complete in O(1) time and O(1) space \u2014 no tree node copying, only root hash recording and empty buffer allocation."
+      },
+      {
+        "id": "CN2",
+        "text": "Three-way merge must visit only subtrees where at least one hash differs across the three trees. Full-tree scan on merge is a correctness bug, not a performance issue."
+      },
+      {
+        "id": "CN3",
+        "text": "Conflict resolution must never silently discard data. LWW is explicit lossy; vector-clock surfaces true conflicts; custom functions receive all three values."
+      },
+      {
+        "id": "CN4",
+        "text": "Snapshot pruning must not delete tree nodes referenced by any active branch or named snapshot. Pruning a live reference is data loss."
+      },
+      {
+        "id": "CN5",
+        "text": "Branch operations must work per-shard: fork = fork each shard's tree, merge = merge each shard's tree. No cross-shard locking or coordination."
+      },
+      {
+        "id": "CN6",
+        "text": "Read-only checkout must not require WAL replay \u2014 it reads directly from the content-addressed node store at the specified root hash."
+      }
+    ],
+    "intention": "Branching is the headline feature \u2014 the reason haematite exists instead of wrapping SQLite. When this cluster is complete, a developer can fork a database in constant time by sharing a root hash, diverge both sides with independent writes, and merge them back by walking only the subtrees that differ. Every committed root hash is a permanent, verifiable snapshot that can be checked out for read-only time-travel at any point in the future. The experience should feel like working with git branches \u2014 cheap to create, cheap to compare, cheap to merge \u2014 but for a live key-value database with concurrent writers. The content-addressed prolly tree from the core cluster is what makes this structural rather than bolted-on: identical subtrees share nodes, fork costs nothing, and merge cost is proportional to differences, not total data.",
+    "design_path": "docs/design/branching",
+    "provenance": {
+      "requested_by": "Tom",
+      "quote": "Branching is the headline feature \u2014 the reason haematite exists instead of wrapping SQLite. When this cluster is complete, a developer can fork a database in constant time by sharing a root hash, dive"
+    }
+  },
+  "verify_fix_cap": 3,
+  "review_cap": 1,
+  "round_backoff_ms": 2000,
+  "review_deadline_ms": 300000
+}

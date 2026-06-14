@@ -1,0 +1,88 @@
+{
+  "cluster": "core",
+  "sections": [
+    {
+      "name": "Crate Setup",
+      "items": [
+        {"id": "C1", "text": "crates/haematite/Cargo.toml exists with blake3, zstd, and beamr dependencies.", "done": false},
+        {"id": "C2", "text": "crates/haematite/src/lib.rs re-exports the public API types.", "done": false}
+      ]
+    },
+    {
+      "name": "Prolly Tree Nodes",
+      "items": [
+        {"id": "C3", "text": "LeafNode type holds sorted key-value pairs and computes its BLAKE3 hash from serialised contents.", "done": false},
+        {"id": "C4", "text": "InternalNode type holds sorted key-childHash pairs and computes its BLAKE3 hash from serialised contents.", "done": false},
+        {"id": "C5", "text": "Node serialisation is deterministic: the same node contents always produce the same byte sequence.", "done": false},
+        {"id": "C6", "text": "Node hash is the BLAKE3 hash of the serialised byte sequence — content is identity (P1).", "done": false},
+        {"id": "C7", "text": "Rolling hash boundary detection splits nodes at content-determined positions with a configurable target size.", "done": false},
+        {"id": "C8", "text": "Boundary detection is history-independent: the same key set produces the same boundaries regardless of insertion order.", "done": false}
+      ]
+    },
+    {
+      "name": "Node Store",
+      "items": [
+        {"id": "C9", "text": "NodeStore trait defines get(hash) -> Option<Node> and put(node) -> Hash.", "done": false},
+        {"id": "C10", "text": "MemoryStore implements NodeStore as HashMap<Hash, Node> for testing.", "done": false},
+        {"id": "C11", "text": "DiskStore implements NodeStore with zstd-compressed nodes written to a directory.", "done": false},
+        {"id": "C12", "text": "DiskStore reads decompress zstd on load; cached nodes are stored decompressed in memory.", "done": false}
+      ]
+    },
+    {
+      "name": "Tree Operations",
+      "items": [
+        {"id": "C13", "text": "get(key) traverses root to leaf and returns Option<Value>.", "done": false},
+        {"id": "C14", "text": "put(key, value) inserts into the tree, splitting nodes at rolling hash boundaries, and rewrites the path to root.", "done": false},
+        {"id": "C15", "text": "delete(key) removes from the tree, merging undersized nodes, and rewrites the path to root.", "done": false},
+        {"id": "C16", "text": "range(from, to) returns an iterator of (key, value) pairs in sorted order.", "done": false},
+        {"id": "C17", "text": "Tree root hash is deterministic: the same key-value set produces the same root hash (CN5).", "done": false},
+        {"id": "C18", "text": "Unmodified subtrees retain their existing hash and node references after mutation (P4).", "done": false}
+      ]
+    },
+    {
+      "name": "Tree Diff",
+      "items": [
+        {"id": "C19", "text": "diff(root_a, root_b) walks both trees and yields only entries that differ.", "done": false},
+        {"id": "C20", "text": "diff skips subtrees whose root hash matches without descending into them.", "done": false},
+        {"id": "C21", "text": "diff cost is proportional to the number of differing entries, not the total tree size.", "done": false}
+      ]
+    },
+    {
+      "name": "WAL Buffer",
+      "items": [
+        {"id": "C22", "text": "WalBuffer accumulates put/delete mutations in memory as a sorted log.", "done": false},
+        {"id": "C23", "text": "WalBuffer.get(key) returns the buffered value, shadowing any tree value (CN6).", "done": false},
+        {"id": "C24", "text": "WalBuffer.commit() flushes all buffered mutations to the prolly tree as a single batch and returns the new root hash.", "done": false},
+        {"id": "C25", "text": "A commit of N buffered writes produces exactly one path-to-root rewrite (CN8).", "done": false},
+        {"id": "C26", "text": "DurableWal appends mutations to an append-only file before buffering.", "done": false},
+        {"id": "C27", "text": "WalRecovery replays the durable WAL from a given root hash forward, reconstructing the buffer state.", "done": false}
+      ]
+    },
+    {
+      "name": "Shard Actor",
+      "items": [
+        {"id": "C28", "text": "ShardActor is a beamr process that owns one prolly tree and one WAL buffer.", "done": false},
+        {"id": "C29", "text": "ShardActor handles get/put/delete/commit/range messages via beamr message passing.", "done": false},
+        {"id": "C30", "text": "ShardActor is the single writer for its key range — no external mutation (P2).", "done": false},
+        {"id": "C31", "text": "ShardActor crash does not affect other shard actors (CN7).", "done": false},
+        {"id": "C32", "text": "ShardActor restarts via WAL replay on crash recovery.", "done": false}
+      ]
+    },
+    {
+      "name": "Shard Router",
+      "items": [
+        {"id": "C33", "text": "ShardRouter maps keys to shard actors via hash(key) % shard_count.", "done": false},
+        {"id": "C34", "text": "Shard count is fixed at database creation and immutable thereafter (ADR-004).", "done": false}
+      ]
+    },
+    {
+      "name": "Database Handle",
+      "items": [
+        {"id": "C35", "text": "Database::create() initialises a new database with a configured shard count.", "done": false},
+        {"id": "C36", "text": "Database::open() opens an existing database and restarts shard actors from persisted state.", "done": false},
+        {"id": "C37", "text": "Database exposes get/put/delete/commit/range that route through the shard router.", "done": false},
+        {"id": "C38", "text": "No configuration has silent defaults — shard count, data directory, and commit policy are all required (P6).", "done": false}
+      ]
+    }
+  ]
+}

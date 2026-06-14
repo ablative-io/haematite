@@ -1,0 +1,150 @@
+{
+  "cluster": "wasm",
+  "title": "WASM Compilation Target with Browser Storage Backends",
+  "intention": "The WASM cluster extends haematite to the browser and edge. When this cluster is complete, the same haematite API \u2014 get, put, range, fork, merge, commit \u2014 runs in a browser tab or Cloudflare Worker, backed by IndexedDB or OPFS instead of the filesystem. Content-addressed nodes are portable across backends: a tree written on a native server can be synced to a browser tab and read there with identical hashes. The experience should feel like the same database everywhere \u2014 write on the server, read in the browser, fork on the edge \u2014 not a separate product with a compatibility layer.",
+  "problem": "Modern applications need client-side data that can sync with the server. IndexedDB is the browser's embedded database, but it has no branching, no structural sync, and no content-addressed deduplication. The alternative \u2014 server round-trips for every read \u2014 destroys offline capability and adds latency.\n\nbeamr-wasm already exists as precedent for running the BEAM actor model in the browser. Haematite's content-addressed prolly tree is backend-agnostic: the same tree structure works whether nodes are stored on a filesystem, in IndexedDB, or in OPFS. The challenge is implementing the NodeStore and WAL interfaces against browser storage APIs, handling the async nature of IndexedDB (which differs from synchronous filesystem I/O), and ensuring that the WASM binary size stays reasonable for browser deployment.\n\nTom explicitly called out WASM compilation as a goal: having a database that runs in the browser with multiple readers and writers.",
+  "solution": "The WASM cluster delivers three components:\n\n1. WASM Build Target\n\nHaematite compiles to wasm32-unknown-unknown with a feature flag that switches the storage backend from filesystem to browser APIs. The BLAKE3 hash function falls back to its portable (non-SIMD) implementation on WASM (per ADR-002). The actor model uses beamr-wasm's existing scheduler, which runs on the browser's event loop via web workers.\n\nThe WASM binary includes the prolly tree, WAL buffer, shard router, and branching/merge logic. Distribution (multi-node sync) is included but operates over WebSocket or WebRTC data channels instead of beamr's native TCP distribution.\n\nBinary size is managed by: cfg-gating the filesystem NodeStore and durable WAL (not needed in browser), using wasm-opt for size optimisation, and avoiding large dependencies that do not compile to WASM.\n\n2. IndexedDB Node Store\n\nImplements the NodeStore trait using IndexedDB as the backing store. Each content-addressed node is stored as an IndexedDB object with the BLAKE3 hash as the key and the zstd-compressed node bytes as the value.\n\nIndexedDB is async (callback/promise-based), while the NodeStore trait is synchronous. The adapter bridges this by running shard actors on web workers where IndexedDB transactions can be awaited, and by using an in-memory write buffer that flushes to IndexedDB asynchronously.\n\nThe LRU cache from the persistence cluster is reused: decompressed nodes are cached in WASM linear memory for fast reads.\n\n3. OPFS Storage Backend\n\nOrigin Private File System (OPFS) provides synchronous file access in web workers \u2014 a better fit than IndexedDB for haematite's append-only WAL pattern. When OPFS is available, it is used for the durable WAL (sequential append) while IndexedDB stores content-addressed tree nodes (key-value lookups).\n\nOPFS availability is detected at runtime. On browsers that do not support OPFS (or in contexts where OPFS is unavailable), the WAL falls back to IndexedDB-backed persistence with a small durability gap: IndexedDB transactions are not guaranteed to flush before the page unloads.\n\nThe OPFS WAL uses the same entry format and CRC32 checksums as the native durable WAL, so WAL files are portable between native and WASM builds.",
+  "principles": [
+    {
+      "id": "P1",
+      "text": "Same API everywhere. The public haematite API is identical in native and WASM builds. Code written against haematite on a server runs in a browser without changes."
+    },
+    {
+      "id": "P2",
+      "text": "Content-addressed nodes are portable. A node's BLAKE3 hash is the same whether it was written on a native server or in a browser. Sync between native and WASM nodes works by hash comparison."
+    },
+    {
+      "id": "P3",
+      "text": "Browser constraints are handled, not hidden. IndexedDB's async nature and OPFS's limited availability are adapter concerns \u2014 the shard actor does not know which backend it runs on."
+    },
+    {
+      "id": "P4",
+      "text": "Binary size matters. Every dependency included in the WASM build costs download time. Filesystem-only code is cfg-gated out."
+    },
+    {
+      "id": "P5",
+      "text": "Graceful degradation. OPFS is preferred for the WAL but not required. IndexedDB-only mode is functional with documented durability limitations."
+    }
+  ],
+  "decisions": [
+    "ADR-002",
+    "ADR-006"
+  ],
+  "goals": [
+    "haematite compiles to wasm32-unknown-unknown and runs in a browser with get/put/range/fork/merge/commit operations.",
+    "Content-addressed nodes written in a native build and synced to a WASM build produce identical BLAKE3 hashes.",
+    "IndexedDB NodeStore passes the same functional tests as the native DiskStore.",
+    "OPFS WAL uses the same entry format and CRC32 checksums as the native durable WAL.",
+    "WASM binary size stays under 2MB (gzipped) with wasm-opt size optimisation.",
+    "Shard actors run on web workers with the beamr-wasm scheduler."
+  ],
+  "non_goals": [
+    {
+      "text": "Native mobile targets (iOS, Android)",
+      "reason": "The WASM target covers mobile browsers. Native mobile SDKs are a separate concern."
+    },
+    {
+      "text": "Service Worker integration",
+      "reason": "Running haematite in a Service Worker is possible but not designed for in this cluster. The focus is on web worker execution."
+    },
+    {
+      "text": "Full offline-first framework",
+      "reason": "Haematite provides the storage layer. Offline-first sync patterns (conflict queues, offline mutation buffers) are application-level concerns built on top of haematite's sync."
+    },
+    {
+      "text": "WebSocket-based distribution protocol implementation",
+      "reason": "The WASM cluster adapts the transport for browser contexts but does not implement a full distribution cluster. See the distribution cluster (RM-007) for the sync protocol."
+    },
+    {
+      "text": "Compression algorithm alternatives for WASM",
+      "reason": "zstd compiles to WASM. No alternative compression is needed for the WASM target."
+    }
+  ],
+  "structure": [
+    {
+      "path": "crates/haematite/src/store/mod.rs",
+      "note": "Node store module root \u2014 pre-existing, modified to register IndexedDB store",
+      "brief": ""
+    },
+    {
+      "path": "crates/haematite/src/lib.rs",
+      "note": "Crate root \u2014 pre-existing, modified for wasm conditional compilation",
+      "brief": ""
+    },
+    {
+      "path": "crates/haematite/Cargo.toml",
+      "note": "Crate manifest \u2014 pre-existing, modified for wasm feature flag",
+      "brief": ""
+    },
+    {
+      "path": "crates/haematite/src/store/indexeddb.rs",
+      "note": "IndexedDB NodeStore: async adapter, key=hash, value=zstd bytes",
+      "brief": "WASM-001"
+    },
+    {
+      "path": "crates/haematite/src/store/opfs.rs",
+      "note": "OPFS WAL backend: synchronous file access in web workers, same entry format as native",
+      "brief": "WASM-002"
+    },
+    {
+      "path": "crates/haematite/src/wasm/mod.rs",
+      "note": "WASM module root \u2014 feature-gated, pub mod declarations only",
+      "brief": "WASM-001"
+    },
+    {
+      "path": "crates/haematite/src/wasm/runtime.rs",
+      "note": "WASM runtime adapter: web worker scheduler, event loop integration",
+      "brief": "WASM-001"
+    },
+    {
+      "path": "crates/haematite/src/wasm/transport.rs",
+      "note": "Browser transport adapter: WebSocket/WebRTC for distribution sync",
+      "brief": "WASM-003"
+    },
+    {
+      "path": "crates/haematite/src/wasm/detect.rs",
+      "note": "Runtime capability detection: OPFS availability, web worker context",
+      "brief": "WASM-002"
+    }
+  ],
+  "inventory": [
+    {
+      "path": "crates/haematite/src/store/mod.rs",
+      "note": "Node store module root with NodeStore trait, defined by core cluster (CORE-001)."
+    },
+    {
+      "path": "crates/haematite/src/wal/mod.rs",
+      "note": "WAL module root, defined by core cluster (CORE-005)."
+    },
+    {
+      "path": "crates/haematite/src/wal/entry.rs",
+      "note": "WAL entry format, defined by persistence cluster (PERSIST-002). Reused by OPFS backend."
+    }
+  ],
+  "constraints": [
+    {
+      "id": "CN1",
+      "text": "WASM build must compile to wasm32-unknown-unknown without any native-only dependencies. All platform-specific code must be behind cfg gates."
+    },
+    {
+      "id": "CN2",
+      "text": "BLAKE3 hashes must be identical between native and WASM builds. The portable BLAKE3 implementation must produce the same output as the SIMD-accelerated one."
+    },
+    {
+      "id": "CN3",
+      "text": "WASM binary size (gzipped) must stay under 2MB. Dependencies that bloat the binary must be cfg-gated or replaced."
+    },
+    {
+      "id": "CN4",
+      "text": "IndexedDB operations are async. The NodeStore adapter must not block the browser's main thread."
+    },
+    {
+      "id": "CN5",
+      "text": "OPFS fallback to IndexedDB must be transparent to the shard actor. The WAL interface is the same regardless of backend."
+    },
+    {
+      "id": "CN6",
+      "text": "The WAL entry format in OPFS must be byte-identical to the native durable WAL format so that WAL files are portable."
+    }
+  ]
+}

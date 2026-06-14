@@ -1,0 +1,43 @@
+{
+  "cluster": "core",
+  "personas": [
+    {
+      "name": "Application Developer",
+      "role": "Embedding haematite as a storage engine",
+      "stories": [
+        {"id": "S1", "text": "As an application developer, I want to create a haematite database with a single function call so that I do not need to manage shard actors, WAL files, or tree structures manually."},
+        {"id": "S2", "text": "As an application developer, I want to put and get key-value pairs without thinking about which shard owns them so that the sharding is transparent."},
+        {"id": "S3", "text": "As an application developer, I want range queries to return results in sorted key order so that I can scan sequential data efficiently."},
+        {"id": "S4", "text": "As an application developer, I want to batch multiple writes into a single atomic commit so that my data is always in a consistent state."},
+        {"id": "S5", "text": "As an application developer, I want the database to recover automatically from crashes so that I do not need to write recovery logic."}
+      ]
+    },
+    {
+      "name": "Aion Engine",
+      "role": "Using haematite as the EventStore backend",
+      "stories": [
+        {"id": "S6", "text": "As the Aion engine, I want to append events to a workflow key with optimistic concurrency (expected_seq) so that two concurrent appends to the same workflow are detected and one is rejected."},
+        {"id": "S7", "text": "As the Aion engine, I want to read a workflow's full event history in sequence order so that I can replay it for recovery."},
+        {"id": "S8", "text": "As the Aion engine, I want to read events from a specific sequence number forward so that I can resume replay without re-reading the entire history."},
+        {"id": "S9", "text": "As the Aion engine, I want to batch-append WorkflowStarted and SearchAttributesUpdated atomically so that a crash between them never leaves an orphaned workflow."}
+      ]
+    },
+    {
+      "name": "Concurrent Writer",
+      "role": "Writing to haematite from multiple beamr processes simultaneously",
+      "stories": [
+        {"id": "S10", "text": "As a concurrent writer, I want to write to different keys from hundreds of beamr processes simultaneously without any of them blocking so that write throughput scales linearly with shard count."},
+        {"id": "S11", "text": "As a concurrent writer, I want a crashed shard to restart without affecting my writes to other shards so that fault isolation is per-shard, not per-database."}
+      ]
+    },
+    {
+      "name": "Debugging Developer",
+      "role": "Inspecting and comparing database states",
+      "stories": [
+        {"id": "S12", "text": "As a debugging developer, I want to get the current root hash of a committed database state so that I can identify and compare snapshots."},
+        {"id": "S13", "text": "As a debugging developer, I want to diff two database states by root hash so that I can see exactly which keys changed between them."},
+        {"id": "S14", "text": "As a debugging developer, I want the diff to run in time proportional to the number of differences, not the total database size, so that diffing large databases with small changes is fast."}
+      ]
+    }
+  ]
+}

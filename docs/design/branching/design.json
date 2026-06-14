@@ -1,0 +1,145 @@
+{
+  "cluster": "branching",
+  "title": "Branching, Merging, Time-Travel, and Snapshots",
+  "intention": "Branching is the headline feature \u2014 the reason haematite exists instead of wrapping SQLite. When this cluster is complete, a developer can fork a database in constant time by sharing a root hash, diverge both sides with independent writes, and merge them back by walking only the subtrees that differ. Every committed root hash is a permanent, verifiable snapshot that can be checked out for read-only time-travel at any point in the future. The experience should feel like working with git branches \u2014 cheap to create, cheap to compare, cheap to merge \u2014 but for a live key-value database with concurrent writers. The content-addressed prolly tree from the core cluster is what makes this structural rather than bolted-on: identical subtrees share nodes, fork costs nothing, and merge cost is proportional to differences, not total data.",
+  "problem": "Existing embedded databases treat branching as an afterthought or don't support it at all. SQLite has no branching concept. LMDB's copy-on-write B-tree could theoretically fork, but there is no merge mechanism. RocksDB checkpoints are full copies. The common workaround \u2014 WAL fork-point overlay \u2014 gives O(branch-writes) merge cost and requires WAL coordination for replication. None of these approaches give structural branching where fork is O(1), merge is O(differences), and sync between arbitrary nodes works by hash negotiation.\n\nAion needs instant fork for what-if workflow debugging: clone a workflow's event history, replay against modified history, discard the branch if the experiment fails. The messaging bus needs speculative execution branches for tentative conversation state. Test environments need to clone production state without copying data. All of these require branching that is genuinely zero-friction \u2014 not technically possible but operationally expensive.",
+  "solution": "The branching cluster adds four capabilities on top of the core cluster's prolly tree and tree diff:\n\n1. Fork (Branch Creation)\n\nA branch is a lightweight handle containing: a reference to the fork-point root hash (the common ancestor), a reference to the current root hash (initially the same as the fork-point), and a set of shard-level WAL buffers for the branch's own writes. Fork is O(1): it records the current root hash and allocates empty WAL buffers. No data is copied. The branch reads from the parent's tree nodes via the shared content-addressed store \u2014 unmodified nodes are shared, not duplicated.\n\nEach shard is forked independently. The branch handle coordinates per-shard fork state so that callers interact with the branch as a single logical database, not N individual shard forks.\n\n2. Merge (Three-Way Structural Diff)\n\nMerge takes two diverged root hashes and their common ancestor, then produces a merged tree. The algorithm walks all three trees simultaneously:\n\n- Subtrees where all three hashes match: unchanged, skip entirely.\n- Subtrees where parent and branch both differ from ancestor: true conflict, needs resolution.\n- Subtrees where only one side differs from ancestor: take the changed side (clean merge).\n\nThe walk descends only into subtrees where at least one hash differs. Cost is O(differing entries), not O(total entries). The merge produces a stream of resolved entries that are committed to the tree as a single batch.\n\nMerge operates per-shard: each shard's tree is merged independently. No cross-shard coordination is needed because keys are deterministically routed to shards.\n\n3. Conflict Resolution\n\nWhen both sides modify the same key, the conflict resolution policy determines the outcome. Three policies are supported:\n\n- Last-write-wins (LWW): the branch value overwrites the parent. Simple, lossy, appropriate for idempotent workloads.\n- Vector-clock: per-key version vectors detect true conflicts (concurrent modifications) vs. dominated updates. True conflicts are surfaced to the caller as unresolved.\n- Custom merge function: a caller-provided function receives (key, ancestor_value, parent_value, branch_value) and returns the resolved value. This is the escape hatch for domain-specific merge logic.\n\nThe policy is specified at merge time, not at fork time \u2014 the same branch can be merged with different policies.\n\n4. Snapshots and Time-Travel\n\nEvery commit produces a root hash that permanently identifies that database state. The snapshot registry maintains a mapping from human-readable names to root hashes, plus a commit log of all root hashes in order.\n\nCheckout opens a read-only view at a named root hash. The view reads directly from the content-addressed node store \u2014 no WAL replay, no sequential scan. Random-access to any historical state.\n\nSnapshot pruning removes named snapshots and reclaims tree nodes that are no longer referenced by any active branch or named snapshot. Pruning walks the node store's reference graph to determine which nodes are still live.",
+  "principles": [
+    {
+      "id": "P1",
+      "text": "Fork is O(1). Creating a branch records a root hash and allocates empty buffers. It never copies tree nodes. The cost of forking a terabyte database is the same as forking an empty one."
+    },
+    {
+      "id": "P2",
+      "text": "Merge cost is proportional to differences. Three-way diff skips subtrees whose hashes match across all three trees. A branch that changed 10 keys out of a million visits only the paths to those 10 keys."
+    },
+    {
+      "id": "P3",
+      "text": "Conflict resolution is explicit. The caller chooses LWW, vector-clock, or custom at merge time. No policy is applied silently \u2014 an unresolved conflict is an error, not a quiet data loss."
+    },
+    {
+      "id": "P4",
+      "text": "Every commit is a permanent snapshot. Root hashes are immutable and content-verified. Checking out a historical state is a pointer dereference, not a replay."
+    },
+    {
+      "id": "P5",
+      "text": "Branches share nodes, not copies. Two branches that diverge on 1% of keys share 99% of their tree nodes via the content-addressed store. Storage cost scales with divergence, not with database size."
+    },
+    {
+      "id": "P6",
+      "text": "Per-shard independence. Fork, merge, and snapshot operate per-shard. No cross-shard coordination is needed because shard routing is deterministic."
+    }
+  ],
+  "decisions": [
+    "ADR-001"
+  ],
+  "goals": [
+    "Fork creates a branch that can be read and written independently of the parent, with O(1) creation cost and zero data copying.",
+    "Merge of two branches produces a tree containing all entries from both sides, with conflicts resolved according to the specified policy.",
+    "Diff between a freshly forked branch and its parent returns zero differences.",
+    "Three-way merge correctly distinguishes clean merges (one side changed) from true conflicts (both sides changed the same key).",
+    "Time-travel checkout provides read-only access to the exact historical state at any named root hash, without WAL replay.",
+    "Snapshot pruning reclaims tree nodes that are no longer referenced by any active branch or named snapshot."
+  ],
+  "non_goals": [
+    {
+      "text": "Cross-shard transactional merge",
+      "reason": "Each shard merges independently. Cross-shard merge coordination adds operational complexity and is not needed when shard routing is deterministic."
+    },
+    {
+      "text": "Branch permissions or access control",
+      "reason": "Access control is an application-level concern, not a storage engine concern."
+    },
+    {
+      "text": "Automatic background merge",
+      "reason": "Merge is always explicit and caller-initiated. Automatic merge introduces ordering questions and conflict ambiguity."
+    },
+    {
+      "text": "Branch garbage collection with reference counting",
+      "reason": "Snapshot pruning covers node reclamation. Full branch GC with automatic reference tracking is deferred."
+    },
+    {
+      "text": "Merge conflict UI or interactive resolution",
+      "reason": "The storage engine surfaces conflicts; the application presents and resolves them."
+    }
+  ],
+  "structure": [
+    {
+      "path": "crates/haematite/src/lib.rs",
+      "note": "Crate root \u2014 pre-existing, modified to re-export branch module",
+      "brief": ""
+    },
+    {
+      "path": "crates/haematite/src/branch/mod.rs",
+      "note": "Branch module root \u2014 pub mod declarations only (CN3 from core)",
+      "brief": "BRANCH-001"
+    },
+    {
+      "path": "crates/haematite/src/branch/handle.rs",
+      "note": "BranchHandle type: fork-point root, current root, per-shard WAL buffer references",
+      "brief": "BRANCH-001"
+    },
+    {
+      "path": "crates/haematite/src/branch/fork.rs",
+      "note": "Fork operation: record root hash, allocate per-shard WAL buffers, return BranchHandle",
+      "brief": "BRANCH-001"
+    },
+    {
+      "path": "crates/haematite/src/branch/merge.rs",
+      "note": "Three-way merge engine: walk ancestor/parent/branch trees, emit resolved entries",
+      "brief": "BRANCH-002"
+    },
+    {
+      "path": "crates/haematite/src/branch/conflict.rs",
+      "note": "Conflict resolution policies: LWW, vector-clock, custom merge function",
+      "brief": "BRANCH-002"
+    },
+    {
+      "path": "crates/haematite/src/branch/snapshot.rs",
+      "note": "Snapshot registry: name-to-root-hash mapping, commit log, listing",
+      "brief": "BRANCH-003"
+    },
+    {
+      "path": "crates/haematite/src/branch/checkout.rs",
+      "note": "Read-only checkout: open historical state at a root hash without WAL",
+      "brief": "BRANCH-003"
+    },
+    {
+      "path": "crates/haematite/src/branch/prune.rs",
+      "note": "Snapshot pruning: reference graph walk, unreferenced node reclamation",
+      "brief": "BRANCH-004"
+    },
+    {
+      "path": "crates/haematite/src/branch/registry.rs",
+      "note": "Branch registry for tracking active branch root hashes",
+      "brief": "BRANCH-001"
+    }
+  ],
+  "inventory": [],
+  "constraints": [
+    {
+      "id": "CN1",
+      "text": "Fork must complete in O(1) time and O(1) space \u2014 no tree node copying, only root hash recording and empty buffer allocation."
+    },
+    {
+      "id": "CN2",
+      "text": "Three-way merge must visit only subtrees where at least one hash differs across the three trees. Full-tree scan on merge is a correctness bug, not a performance issue."
+    },
+    {
+      "id": "CN3",
+      "text": "Conflict resolution must never silently discard data. LWW is explicit lossy; vector-clock surfaces true conflicts; custom functions receive all three values."
+    },
+    {
+      "id": "CN4",
+      "text": "Snapshot pruning must not delete tree nodes referenced by any active branch or named snapshot. Pruning a live reference is data loss."
+    },
+    {
+      "id": "CN5",
+      "text": "Branch operations must work per-shard: fork = fork each shard's tree, merge = merge each shard's tree. No cross-shard locking or coordination."
+    },
+    {
+      "id": "CN6",
+      "text": "Read-only checkout must not require WAL replay \u2014 it reads directly from the content-addressed node store at the specified root hash."
+    }
+  ]
+}

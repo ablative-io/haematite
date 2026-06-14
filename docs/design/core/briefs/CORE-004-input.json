@@ -1,0 +1,260 @@
+{
+  "repo_root": "/Users/tom/Developer/ablative/haematite",
+  "brief_id": "CORE-004",
+  "reviewers": [
+    "Danger Mouse"
+  ],
+  "base_ref": "main",
+  "placement": "local",
+  "isolation": "worktree",
+  "brief_document": {
+    "id": "CORE-004",
+    "cluster": "core",
+    "title": "On-disk node store with zstd compression",
+    "depends_on": [
+      "CORE-001"
+    ],
+    "blocked_by": [],
+    "checklist": [
+      "C11",
+      "C12"
+    ],
+    "stories": [
+      "S5"
+    ],
+    "design_anchor": [
+      "ADR-006"
+    ],
+    "purpose": "Deliver DiskStore, the durable NodeStore implementation that persists content-addressed prolly tree nodes to the filesystem. Every node is written as a zstd-compressed file named by its hex hash; reads decompress on load and cache the decompressed node in memory. This is the component that turns the in-memory prolly tree (CORE-001) into a storage engine that survives process restarts \u2014 it is the persistence layer everything else in the core cluster depends on at runtime.",
+    "task": "Implement DiskStore in crates/haematite/src/store/disk.rs. DiskStore must satisfy the NodeStore trait defined in CORE-001. Each node is stored as a separate file in a caller-supplied directory, with the file name being the lowercase hex encoding of the node's BLAKE3 hash. Writes serialise the node (using the format from CORE-001), compress the bytes with zstd, and write the result atomically. Reads decompress the file contents and deserialise to a Node; the decompressed node is then inserted into an LRU cache so subsequent accesses are served from memory without re-reading or re-decompressing. DiskStore::new(path) requires the directory to already exist \u2014 it SHALL NOT create missing directories (P6). Wire DiskStore into store/mod.rs and re-export it from lib.rs. This brief covers only the disk store \u2014 WAL durable writes are CORE-005, shard actor wiring is CORE-007.",
+    "requirements": [
+      {
+        "id": "R1",
+        "title": "DiskStore struct and constructor",
+        "spec": "THE SYSTEM SHALL define a DiskStore struct that holds: a PathBuf pointing to the storage directory, an LRU cache mapping Hash to Node (decompressed), and a configurable cache capacity. THE SYSTEM SHALL provide DiskStore::new(dir: PathBuf, cache_capacity: usize) -> Result<DiskStore, StoreError> that opens an existing directory. IF the supplied path does not exist or is not a directory, THEN THE SYSTEM SHALL return Err(StoreError::DirectoryNotFound). THE SYSTEM SHALL NOT create the directory when it is absent \u2014 the caller is responsible for provisioning the directory (P6). DiskStore SHALL implement Debug.",
+        "acceptance": [
+          "DiskStore::new with an existing directory returns Ok(DiskStore)",
+          "DiskStore::new with a non-existent path returns Err(StoreError::DirectoryNotFound)",
+          "DiskStore::new with a path that is a file (not a directory) returns Err(StoreError::DirectoryNotFound)",
+          "No directory is created on disk by DiskStore::new under any error path",
+          "DiskStore implements Debug"
+        ],
+        "files": {
+          "create": [
+            "crates/haematite/src/store/disk.rs"
+          ],
+          "modify": [],
+          "delete": []
+        },
+        "checklist": [
+          "C11"
+        ],
+        "stories": []
+      },
+      {
+        "id": "R2",
+        "title": "StoreError type",
+        "spec": "THE SYSTEM SHALL define a StoreError enum in crates/haematite/src/store/disk.rs with at minimum the variants: DirectoryNotFound, Io(std::io::Error), Compression(String), Deserialise(String). THE SYSTEM SHALL implement std::error::Error and Display for StoreError. THE SYSTEM SHALL NOT use unwrap() or expect() in non-test code \u2014 all IO and compression failures propagate as StoreError.",
+        "acceptance": [
+          "StoreError implements std::error::Error",
+          "StoreError implements Display with a human-readable message for each variant",
+          "StoreError::Io wraps std::io::Error",
+          "StoreError::Compression carries a String description of the zstd failure",
+          "cargo clippy -p haematite produces no warnings about unhandled Results in disk.rs"
+        ],
+        "files": {
+          "create": [],
+          "modify": [
+            "crates/haematite/src/store/disk.rs"
+          ],
+          "delete": []
+        },
+        "checklist": [
+          "C11"
+        ],
+        "stories": []
+      },
+      {
+        "id": "R3",
+        "title": "NodeStore::put \u2014 serialise, compress, write",
+        "spec": "WHEN NodeStore::put(node) is called on a DiskStore, THE SYSTEM SHALL serialise the node to bytes using the format defined in CORE-001, compress the serialised bytes with zstd, and write the compressed bytes to a file named <hex-hash> in the configured directory. THE SYSTEM SHALL return the BLAKE3 Hash of the node. IF a file with that name already exists, THE SYSTEM SHALL NOT overwrite it \u2014 the content-addressed scheme guarantees the file already contains the correct bytes. THE SYSTEM SHALL NOT write partial files that are visible to concurrent readers: the write path is write-to-temp-then-rename on the same filesystem.",
+        "acceptance": [
+          "After DiskStore::put(node), a file named by the node's hex hash exists in the directory",
+          "The file contents are zstd-compressed: zstd::decode_all on the file bytes succeeds",
+          "Decompressing and deserialising the file contents produces a node equal to the original",
+          "Calling put with the same node twice does not overwrite the first file (file mtime is unchanged)",
+          "put returns the same Hash as node.hash()"
+        ],
+        "files": {
+          "create": [],
+          "modify": [
+            "crates/haematite/src/store/disk.rs"
+          ],
+          "delete": []
+        },
+        "checklist": [
+          "C11"
+        ],
+        "stories": []
+      },
+      {
+        "id": "R4",
+        "title": "NodeStore::get \u2014 read, decompress, cache",
+        "spec": "WHEN NodeStore::get(hash) is called on a DiskStore and the hash is in the LRU cache, THE SYSTEM SHALL return the cached Node without touching the filesystem. WHEN the hash is not in the cache and a file named by its hex encoding exists in the directory, THE SYSTEM SHALL read the file, decompress the bytes with zstd, deserialise to a Node, insert the decompressed Node into the LRU cache, and return Some(Node). IF no file for that hash exists in the directory, THE SYSTEM SHALL return None. THE SYSTEM SHALL NOT store compressed bytes in the LRU cache \u2014 cached nodes are stored decompressed in memory (ADR-006).",
+        "acceptance": [
+          "DiskStore::get(hash) returns None for a hash that was never put",
+          "DiskStore::get(hash) after a put returns Some(node) equal to the put node",
+          "A second DiskStore::get for the same hash is served from the LRU cache (verified by putting the node with one DiskStore instance, evicting the cache, then getting with a fresh instance that has an empty cache \u2014 file read succeeds)",
+          "The LRU cache holds decompressed Nodes: a cache hit does not call zstd::decode_all",
+          "DiskStore::get with a hash whose file exists but is corrupted returns Err(StoreError::Compression) or Err(StoreError::Deserialise)"
+        ],
+        "files": {
+          "create": [],
+          "modify": [
+            "crates/haematite/src/store/disk.rs"
+          ],
+          "delete": []
+        },
+        "checklist": [
+          "C11",
+          "C12"
+        ],
+        "stories": [
+          "S5"
+        ]
+      },
+      {
+        "id": "R5",
+        "title": "LRU cache eviction and capacity",
+        "spec": "WHILE DiskStore is in operation, THE SYSTEM SHALL maintain an LRU cache of at most cache_capacity decompressed Nodes. WHEN the cache is at capacity and a new Node is inserted, THE SYSTEM SHALL evict the least recently used entry. THE SYSTEM SHALL NOT grow the cache beyond the configured capacity \u2014 unbounded growth is prohibited. THE SYSTEM SHALL use the lru crate (or equivalent) rather than a hand-rolled structure.",
+        "acceptance": [
+          "A DiskStore with cache_capacity=1 holds at most one decompressed Node at a time",
+          "Inserting a second node into a capacity-1 cache evicts the first",
+          "After eviction, getting the evicted hash causes a disk read (not a cache hit)",
+          "DiskStore::new(dir, 0) returns Err(StoreError::InvalidCapacity) \u2014 a zero-capacity cache is an error, not silently unbounded (P6)."
+        ],
+        "files": {
+          "create": [],
+          "modify": [
+            "crates/haematite/src/store/disk.rs",
+            "crates/haematite/Cargo.toml"
+          ],
+          "delete": []
+        },
+        "checklist": [
+          "C12"
+        ],
+        "stories": []
+      },
+      {
+        "id": "R6",
+        "title": "Module wiring and public re-exports",
+        "spec": "THE SYSTEM SHALL add DiskStore and StoreError to store/mod.rs via pub mod disk; and pub use disk::{DiskStore, StoreError}. THE SYSTEM SHALL re-export DiskStore and StoreError from the crate root lib.rs alongside the existing NodeStore and MemoryStore exports. THE SYSTEM SHALL NOT add any logic to mod.rs beyond the declarations and re-exports (CN3).",
+        "acceptance": [
+          "store/mod.rs contains pub mod disk and pub use disk::{DiskStore, StoreError} \u2014 no other additions",
+          "use haematite::{DiskStore, StoreError} compiles in an external crate test",
+          "cargo check -p haematite succeeds after wiring"
+        ],
+        "files": {
+          "create": [],
+          "modify": [
+            "crates/haematite/src/store/mod.rs",
+            "crates/haematite/src/lib.rs"
+          ],
+          "delete": []
+        },
+        "checklist": [],
+        "stories": []
+      }
+    ],
+    "boundaries": [
+      "SHALL NOT implement WAL durable writes or WAL file management \u2014 those are CORE-005",
+      "SHALL NOT implement shard actor wiring or route DiskStore into the shard supervision tree \u2014 that is CORE-007",
+      "SHALL NOT implement branching, merging, or snapshot operations",
+      "SHALL NOT create directories at runtime \u2014 the caller must provision the directory before constructing DiskStore (P6)",
+      "SHALL NOT implement tree traversal or mutation \u2014 those are CORE-002",
+      "SHALL NOT add a second node store implementation beyond DiskStore in this brief"
+    ],
+    "verification": [
+      "cargo check -p haematite succeeds with no errors",
+      "cargo test -p haematite --lib passes all tests including disk store tests",
+      "cargo clippy -p haematite -- -D warnings produces no errors",
+      "grep -rn 'unwrap()\\|expect(' crates/haematite/src/store/disk.rs finds zero matches outside #[cfg(test)] blocks",
+      "grep -n 'fn ' crates/haematite/src/store/mod.rs finds no function definitions (mod.rs must be declarations only)",
+      "wc -l crates/haematite/src/store/disk.rs shows fewer than 500 lines",
+      "ls <data-dir> after a put shows a file whose name matches the hex hash returned by put",
+      "file <data-dir>/<hex-hash> identifies the file as zstd-compressed data (or: zstd -d <file> succeeds)"
+    ]
+  },
+  "resolved_context": {
+    "adrs": [
+      {
+        "id": "ADR-006",
+        "title": "zstd compression per content-addressed node, WAL uncompressed",
+        "decision": "zstd compression per content-addressed tree node, WAL entries uncompressed, over compressing both or neither. The rejected alternatives: compressing WAL entries (poor ratio, added write latency on the hot path); no compression (wasted disk for tree nodes that compress well at ~3:1 for structured data).",
+        "quote": "",
+        "decided_by": "Bono, Frodo Baggins"
+      }
+    ],
+    "checklist": [
+      {
+        "id": "C11",
+        "text": "DiskStore implements NodeStore with zstd-compressed nodes written to a directory."
+      },
+      {
+        "id": "C12",
+        "text": "DiskStore reads decompress zstd on load; cached nodes are stored decompressed in memory."
+      }
+    ],
+    "stories": [
+      {
+        "id": "S5",
+        "text": "As an application developer, I want the database to recover automatically from crashes so that I do not need to write recovery logic."
+      }
+    ],
+    "constraints": [
+      {
+        "id": "CN1",
+        "text": "No file over 500 lines. If a module approaches this limit, extract into submodules."
+      },
+      {
+        "id": "CN2",
+        "text": "No panics in production code. .unwrap() and .expect() only in tests."
+      },
+      {
+        "id": "CN3",
+        "text": "mod.rs contains ONLY pub mod declarations and pub use re-exports. No logic."
+      },
+      {
+        "id": "CN4",
+        "text": "All public types implement Debug. All error types implement std::error::Error."
+      },
+      {
+        "id": "CN5",
+        "text": "The prolly tree root hash for a given key-value set must be deterministic and history-independent: the same keys and values always produce the same root hash regardless of insertion order."
+      },
+      {
+        "id": "CN6",
+        "text": "WAL buffer reads must shadow tree reads: a key written to the buffer but not yet committed must be returned by get, not the stale tree value."
+      },
+      {
+        "id": "CN7",
+        "text": "Shard actor crash must not affect other shards. Supervision restarts only the failed shard."
+      },
+      {
+        "id": "CN8",
+        "text": "Batch append (multiple key-value pairs in one call) must produce exactly one tree commit, not N individual commits."
+      }
+    ],
+    "intention": "Haematite's core is a storage engine where concurrency is free and branching is structural. When this cluster is complete, a developer can open a haematite database, write to it from hundreds of concurrent actors without any locking discipline, fork it instantly by sharing a hash, and merge two forks by walking only the nodes that differ. The experience should feel like working with an in-memory data structure that happens to be durable \u2014 no connection pools, no transaction coordinators, no lock managers. The content-addressed prolly tree is what makes branching zero-friction; the actor-per-shard model is what makes concurrency zero-contention; the WAL buffer is what makes writes fast despite the content-addressing overhead. All three are load-bearing.",
+    "design_path": "docs/design/core",
+    "provenance": {
+      "requested_by": "Tom",
+      "quote": "Haematite's core is a storage engine where concurrency is free and branching is structural. When this cluster is complete, a developer can open a haematite database, write to it from hundreds of concu"
+    }
+  },
+  "verify_fix_cap": 3,
+  "review_cap": 1,
+  "round_backoff_ms": 2000,
+  "review_deadline_ms": 300000
+}

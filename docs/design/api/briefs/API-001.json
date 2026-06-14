@@ -1,0 +1,226 @@
+{
+  "id": "API-001",
+  "cluster": "api",
+  "title": "EventStore API, public types, and error types",
+  "depends_on": [
+    "CORE-007",
+    "CORE-008"
+  ],
+  "blocked_by": [],
+  "checklist": [
+    "C1",
+    "C2",
+    "C3",
+    "C4",
+    "C5",
+    "C6",
+    "C7",
+    "C8",
+    "C14",
+    "C15",
+    "C16",
+    "C17"
+  ],
+  "stories": [
+    "S1",
+    "S2",
+    "S3",
+    "S4",
+    "S5",
+    "S13"
+  ],
+  "design_anchor": [
+    "ADR-003",
+    "ADR-005"
+  ],
+  "purpose": "Deliver the EventStore API that Aion requires: append with optimistic concurrency, sequential reads, read-from-position, scan with predicate, and compare-and-swap. Also defines the public API types (Event, SequenceConflict, CasMismatch) and error types that the KV and TTL briefs build on.",
+  "task": "Implement the EventStore operations (append, read, read_from, scan, cas) routing through the shard router to shard actors. Define the event stream key format that encodes stream key + sequence number for ordered tree range queries. Define public API types and error types. append must be atomic within a shard: sequence check and append happen in the shard actor's message handler with no interleaving. Batch append produces exactly one tree commit. scan traverses all shards. This brief does not implement general KV (API-002) or TTL (API-003).",
+  "requirements": [
+    {
+      "id": "R1",
+      "title": "API module structure and types",
+      "spec": "Create the api module with mod.rs containing only pub mod declarations. Define Event type (sequence number, payload bytes), SequenceConflict error (expected and actual seq), CasMismatch error (expected and actual values), and ScanResult. All error types implement std::error::Error and Debug.",
+      "acceptance": [
+        "crates/haematite/src/api/mod.rs exists with only pub mod and pub use statements",
+        "Event type has seq: u64 and payload: Vec<u8> fields",
+        "SequenceConflict has expected: u64 and actual: u64 fields",
+        "CasMismatch has expected and actual value fields",
+        "All error types implement std::error::Error and Debug"
+      ],
+      "files": {
+        "create": [
+          "crates/haematite/src/api/mod.rs",
+          "crates/haematite/src/api/types.rs",
+          "crates/haematite/src/api/error.rs"
+        ],
+        "modify": [
+          "crates/haematite/src/lib.rs"
+        ],
+        "delete": []
+      },
+      "checklist": [
+        "C14",
+        "C15",
+        "C16",
+        "C17"
+      ],
+      "stories": []
+    },
+    {
+      "id": "R2",
+      "title": "Event stream key format",
+      "spec": "THE SYSTEM SHALL encode event stream keys as (stream_key, sequence_number) pairs in a binary format that sorts lexicographically by stream_key first, then by sequence_number. THE SYSTEM SHALL ensure that range queries on the tree yield events in sequence order within a stream.",
+      "acceptance": [
+        "encode_stream_key(stream_key, seq) produces bytes that sort correctly",
+        "Two keys with the same stream_key sort by sequence number",
+        "Two keys with different stream_keys sort by stream_key first",
+        "decode_stream_key(encoded) recovers the original stream_key and seq"
+      ],
+      "files": {
+        "create": [
+          "crates/haematite/src/api/event_store.rs"
+        ],
+        "modify": [],
+        "delete": []
+      },
+      "checklist": [
+        "C8"
+      ],
+      "stories": []
+    },
+    {
+      "id": "R3",
+      "title": "Atomic append with optimistic concurrency",
+      "spec": "WHEN append(key, events, expected_seq) is called, THE SYSTEM SHALL check the current sequence number within the shard actor's message handler. IF expected_seq matches, THE SYSTEM SHALL append all events atomically as a single batch commit. IF expected_seq does not match, THE SYSTEM SHALL return SequenceConflict without modifying the stream. THE SYSTEM SHALL NOT allow interleaving between the sequence check and the append.",
+      "acceptance": [
+        "append with correct expected_seq appends all events and returns Ok",
+        "append with stale expected_seq returns SequenceConflict without modifying the stream",
+        "Batch append of 5 events produces exactly one tree commit",
+        "After successful append, the stream's sequence number equals expected_seq + events.len()"
+      ],
+      "files": {
+        "create": [],
+        "modify": [
+          "crates/haematite/src/api/event_store.rs"
+        ],
+        "delete": []
+      },
+      "checklist": [
+        "C1",
+        "C2",
+        "C3"
+      ],
+      "stories": [
+        "S1",
+        "S2"
+      ]
+    },
+    {
+      "id": "R4",
+      "title": "Read full event stream",
+      "spec": "WHEN read(key) is called, THE SYSTEM SHALL return the full event stream for the key in sequence order. THE SYSTEM SHALL return an empty Vec for keys with no events.",
+      "acceptance": [
+        "read(key) after appending 10 events returns all 10 in sequence order",
+        "read(unknown_key) returns an empty Vec",
+        "Events are returned with correct sequence numbers and payloads"
+      ],
+      "files": {
+        "create": [],
+        "modify": [
+          "crates/haematite/src/api/event_store.rs"
+        ],
+        "delete": []
+      },
+      "checklist": [
+        "C4"
+      ],
+      "stories": [
+        "S3"
+      ]
+    },
+    {
+      "id": "R5",
+      "title": "Read from sequence position",
+      "spec": "WHEN read_from(key, from_seq) is called, THE SYSTEM SHALL return only events with sequence number >= from_seq. THE SYSTEM SHALL NOT read events before from_seq from the tree.",
+      "acceptance": [
+        "read_from(key, 5) on a stream with 10 events returns events 5-9",
+        "read_from(key, 0) returns the full stream",
+        "read_from(key, beyond_end) returns an empty Vec",
+        "read_from uses a range query starting at from_seq, not a full read with filter"
+      ],
+      "files": {
+        "create": [],
+        "modify": [
+          "crates/haematite/src/api/event_store.rs"
+        ],
+        "delete": []
+      },
+      "checklist": [
+        "C5"
+      ],
+      "stories": [
+        "S4"
+      ]
+    },
+    {
+      "id": "R6",
+      "title": "Scan with predicate",
+      "spec": "WHEN scan(predicate) is called, THE SYSTEM SHALL walk all shards and apply the predicate to each key's metadata. THE SYSTEM SHALL return matching entries. The caller must understand this is O(total entries across all shards).",
+      "acceptance": [
+        "scan with a predicate that matches 3 out of 100 keys returns those 3",
+        "scan with a predicate that matches nothing returns an empty Vec",
+        "scan traverses all shards, not just one"
+      ],
+      "files": {
+        "create": [],
+        "modify": [
+          "crates/haematite/src/api/event_store.rs"
+        ],
+        "delete": []
+      },
+      "checklist": [
+        "C6"
+      ],
+      "stories": [
+        "S5"
+      ]
+    },
+    {
+      "id": "R7",
+      "title": "Compare-and-swap",
+      "spec": "WHEN cas(key, expected, new) is called, THE SYSTEM SHALL atomically replace the value if it matches expected. IF the current value does not match expected, THE SYSTEM SHALL return CasMismatch. THE SYSTEM SHALL execute the compare and swap within the shard actor's message handler.",
+      "acceptance": [
+        "cas with matching expected value updates the key and returns Ok",
+        "cas with non-matching expected value returns CasMismatch with actual value",
+        "cas on a non-existent key with expected=None creates the key",
+        "cas is atomic \u2014 no interleaving between compare and swap"
+      ],
+      "files": {
+        "create": [],
+        "modify": [
+          "crates/haematite/src/api/event_store.rs"
+        ],
+        "delete": []
+      },
+      "checklist": [
+        "C7"
+      ],
+      "stories": [
+        "S13"
+      ]
+    }
+  ],
+  "boundaries": [
+    "SHALL NOT implement general KV operations (get/put/delete/range/commit) \u2014 those are API-002",
+    "SHALL NOT implement TTL or expiry \u2014 that is API-003",
+    "SHALL NOT implement secondary indexes for scan optimisation",
+    "SHALL NOT implement streaming or push-based event delivery"
+  ],
+  "verification": [
+    "cargo check -p haematite succeeds with no errors",
+    "cargo test -p haematite --lib passes all tests",
+    "cargo clippy -p haematite produces no errors",
+    "grep -r 'unwrap()\\|expect(' crates/haematite/src/api/ --include='*.rs' -l finds no non-test files",
+    "No file in crates/haematite/src/api/ exceeds 500 lines"
+  ]
+}

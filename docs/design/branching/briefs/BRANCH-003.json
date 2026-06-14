@@ -1,0 +1,171 @@
+{
+  "id": "BRANCH-003",
+  "cluster": "branching",
+  "title": "Snapshot registry and time-travel checkout",
+  "depends_on": [
+    "CORE-002"
+  ],
+  "blocked_by": [],
+  "checklist": [
+    "C18",
+    "C19",
+    "C20",
+    "C21",
+    "C22",
+    "C23"
+  ],
+  "stories": [
+    "S8",
+    "S9",
+    "S10",
+    "S11"
+  ],
+  "design_anchor": [
+    "ADR-001"
+  ],
+  "purpose": "Deliver the snapshot registry that maps human-readable names to committed root hashes, and the read-only checkout operation that provides instant time-travel access to any historical state. Every commit is a permanent snapshot; this brief makes them nameable and navigable.",
+  "task": "Implement the snapshot registry: a persistent mapping from names to root hashes, plus a commit log of all root hashes in commit order. Implement snapshot(name) to record the current committed root hash under a name. Implement checkout(root_hash) to open a read-only view at that root hash \u2014 direct read from the content-addressed node store, no WAL replay. The read-only view supports get and range but rejects put/delete/commit. Implement snapshot listing with names, hashes, and timestamps. This brief does not implement pruning \u2014 that is BRANCH-004.",
+  "requirements": [
+    {
+      "id": "R1",
+      "title": "Snapshot registry",
+      "spec": "THE SYSTEM SHALL maintain a snapshot registry mapping human-readable names (strings) to root hashes. THE SYSTEM SHALL persist the registry across database restarts. THE SYSTEM SHALL NOT allow two snapshots with the same name \u2014 naming a duplicate is an error.",
+      "acceptance": [
+        "SnapshotRegistry::name(name, root_hash) stores the mapping",
+        "SnapshotRegistry::get(name) returns the root hash for a named snapshot",
+        "SnapshotRegistry::get(name) returns None for unknown names",
+        "Naming a snapshot with a name that already exists returns an error",
+        "SnapshotRegistry implements Debug"
+      ],
+      "files": {
+        "create": [
+          "crates/haematite/src/branch/snapshot.rs"
+        ],
+        "modify": [
+          "crates/haematite/src/branch/mod.rs"
+        ],
+        "delete": []
+      },
+      "checklist": [
+        "C18",
+        "C20"
+      ],
+      "stories": [
+        "S8"
+      ]
+    },
+    {
+      "id": "R2",
+      "title": "Commit log",
+      "spec": "THE SYSTEM SHALL maintain a commit log of all root hashes in commit order. WHEN a commit produces a new root hash, THE SYSTEM SHALL append it to the log with a timestamp. THE SYSTEM SHALL support listing the log in chronological order. The commit log is populated by Database::commit (CORE-009 R5) \u2014 after collecting shard commit hashes, it appends the composite root hash to this log.",
+      "acceptance": [
+        "Each commit appends the new root hash and timestamp to the log",
+        "CommitLog::list() returns entries in chronological order",
+        "Each log entry contains root hash and timestamp",
+        "The log survives database restart"
+      ],
+      "files": {
+        "create": [],
+        "modify": [
+          "crates/haematite/src/branch/snapshot.rs"
+        ],
+        "delete": []
+      },
+      "checklist": [
+        "C19"
+      ],
+      "stories": [
+        "S10"
+      ]
+    },
+    {
+      "id": "R3",
+      "title": "Read-only checkout",
+      "spec": "WHEN checkout(root_hash) is called, THE SYSTEM SHALL return a read-only view at the specified root hash. THE SYSTEM SHALL read directly from the content-addressed node store without WAL replay. THE SYSTEM SHALL NOT allow writes (put, delete, commit) on the read-only view.",
+      "acceptance": [
+        "checkout(root_hash) returns a ReadOnlyView",
+        "ReadOnlyView::get(key) traverses the tree at the specified root hash",
+        "ReadOnlyView::get does not consult any WAL buffer",
+        "ReadOnlyView::put returns an error",
+        "ReadOnlyView::delete returns an error",
+        "ReadOnlyView::commit returns an error"
+      ],
+      "files": {
+        "create": [
+          "crates/haematite/src/branch/checkout.rs"
+        ],
+        "modify": [
+          "crates/haematite/src/branch/mod.rs"
+        ],
+        "delete": []
+      },
+      "checklist": [
+        "C21",
+        "C22"
+      ],
+      "stories": [
+        "S9"
+      ]
+    },
+    {
+      "id": "R4",
+      "title": "Read-only range queries",
+      "spec": "WHILE a read-only checkout is active, THE SYSTEM SHALL support range(from, to) queries that return key-value pairs in sorted order from the historical tree state.",
+      "acceptance": [
+        "ReadOnlyView::range(from, to) returns entries in sorted key order",
+        "Range results reflect the exact state at the checkout root hash",
+        "Range results do not include entries written after the checkout point"
+      ],
+      "files": {
+        "create": [],
+        "modify": [
+          "crates/haematite/src/branch/checkout.rs"
+        ],
+        "delete": []
+      },
+      "checklist": [
+        "C22"
+      ],
+      "stories": [
+        "S9",
+        "S11"
+      ]
+    },
+    {
+      "id": "R5",
+      "title": "Snapshot listing",
+      "spec": "THE SYSTEM SHALL provide a list_snapshots() operation that returns all named snapshots with their root hashes and commit timestamps, in chronological order.",
+      "acceptance": [
+        "list_snapshots() returns a Vec of (name, root_hash, timestamp) tuples",
+        "Results are ordered chronologically by the time the snapshot was named",
+        "An empty registry returns an empty list"
+      ],
+      "files": {
+        "create": [],
+        "modify": [
+          "crates/haematite/src/branch/snapshot.rs"
+        ],
+        "delete": []
+      },
+      "checklist": [
+        "C23"
+      ],
+      "stories": [
+        "S10"
+      ]
+    }
+  ],
+  "boundaries": [
+    "SHALL NOT implement fork or branch handle \u2014 those are BRANCH-001",
+    "SHALL NOT implement merge or conflict resolution \u2014 those are BRANCH-002",
+    "SHALL NOT implement snapshot pruning or node reclamation \u2014 that is BRANCH-004",
+    "SHALL NOT allow writes through a read-only checkout view"
+  ],
+  "verification": [
+    "cargo check -p haematite succeeds with no errors",
+    "cargo test -p haematite --lib passes all tests",
+    "cargo clippy -p haematite produces no errors",
+    "grep -r 'unwrap()\\|expect(' crates/haematite/src/branch/ --include='*.rs' -l finds no non-test files",
+    "No file in crates/haematite/src/branch/ exceeds 500 lines"
+  ]
+}

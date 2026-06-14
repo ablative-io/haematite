@@ -1,0 +1,116 @@
+{
+  "id": "BRANCH-004",
+  "cluster": "branching",
+  "title": "Snapshot pruning and unreferenced node reclamation",
+  "depends_on": [
+    "BRANCH-003",
+    "BRANCH-001"
+  ],
+  "blocked_by": [],
+  "checklist": [
+    "C24",
+    "C25",
+    "C26",
+    "C27"
+  ],
+  "stories": [
+    "S12",
+    "S13",
+    "S14"
+  ],
+  "design_anchor": [
+    "ADR-001"
+  ],
+  "purpose": "Deliver snapshot pruning \u2014 removing named snapshots and reclaiming tree nodes that are no longer referenced by any active branch or named snapshot. This is the storage reclamation mechanism: without pruning, content-addressed nodes accumulate indefinitely.",
+  "task": "Implement prune(name) to remove a named snapshot from the registry. After removal, walk the node store's reference graph to identify nodes no longer referenced by any active branch or remaining snapshot. Delete unreferenced nodes from the store. Pruning must never delete nodes that are still referenced \u2014 this is a safety-critical invariant. Report the number of nodes and bytes reclaimed.",
+  "requirements": [
+    {
+      "id": "R1",
+      "title": "Remove named snapshot",
+      "spec": "WHEN prune(name) is called, THE SYSTEM SHALL remove the named snapshot from the registry. THE SYSTEM SHALL return an error if the name does not exist. THE SYSTEM SHALL NOT remove the snapshot's root hash from the commit log \u2014 the log is append-only.",
+      "acceptance": [
+        "prune(name) removes the snapshot from the registry",
+        "After pruning, SnapshotRegistry::get(name) returns None",
+        "prune(unknown_name) returns an error",
+        "The commit log still contains the pruned snapshot's root hash"
+      ],
+      "files": {
+        "create": [
+          "crates/haematite/src/branch/prune.rs"
+        ],
+        "modify": [
+          "crates/haematite/src/branch/mod.rs"
+        ],
+        "delete": []
+      },
+      "checklist": [
+        "C24"
+      ],
+      "stories": [
+        "S12"
+      ]
+    },
+    {
+      "id": "R2",
+      "title": "Reference graph walk",
+      "spec": "AFTER removing a snapshot, THE SYSTEM SHALL walk the node store's reference graph starting from all live roots (active branches and remaining named snapshots). THE SYSTEM SHALL identify nodes that are not reachable from any live root. THE SYSTEM SHALL NOT mark nodes as unreferenced if they are reachable from any live root.",
+      "acceptance": [
+        "Nodes reachable from any active branch root are not marked for deletion",
+        "Nodes reachable from any remaining named snapshot are not marked for deletion",
+        "Nodes reachable only from the pruned snapshot's root are marked for deletion",
+        "Shared nodes (reachable from multiple roots) are never marked for deletion"
+      ],
+      "files": {
+        "create": [],
+        "modify": [
+          "crates/haematite/src/branch/prune.rs"
+        ],
+        "delete": []
+      },
+      "checklist": [
+        "C25",
+        "C26"
+      ],
+      "stories": [
+        "S14"
+      ]
+    },
+    {
+      "id": "R3",
+      "title": "Unreferenced node deletion",
+      "spec": "THE SYSTEM SHALL delete unreferenced nodes from the node store. THE SYSTEM SHALL report the number of nodes deleted and the total bytes reclaimed. THE SYSTEM SHALL NOT delete nodes while the reference walk is in progress \u2014 collect first, delete second.",
+      "acceptance": [
+        "Unreferenced nodes are deleted from the node store",
+        "prune() returns a PruneReport with node_count and bytes_reclaimed fields",
+        "After pruning, NodeStore::get(deleted_hash) returns None",
+        "Nodes still referenced by live roots remain accessible after pruning"
+      ],
+      "files": {
+        "create": [],
+        "modify": [
+          "crates/haematite/src/branch/prune.rs"
+        ],
+        "delete": []
+      },
+      "checklist": [
+        "C27"
+      ],
+      "stories": [
+        "S13"
+      ]
+    }
+  ],
+  "boundaries": [
+    "SHALL NOT implement fork, merge, or checkout \u2014 those are BRANCH-001 through BRANCH-003",
+    "SHALL NOT modify the commit log \u2014 it is append-only",
+    "SHALL NOT delete nodes that are reachable from any active branch or named snapshot",
+    "SHALL NOT implement automatic pruning scheduling \u2014 pruning is caller-initiated"
+  ],
+  "verification": [
+    "cargo check -p haematite succeeds with no errors",
+    "cargo test -p haematite --lib passes all tests",
+    "cargo clippy -p haematite produces no errors",
+    "grep -r 'unwrap()\\|expect(' crates/haematite/src/branch/ --include='*.rs' -l finds no non-test files",
+    "No file in crates/haematite/src/branch/ exceeds 500 lines"
+  ]
+}

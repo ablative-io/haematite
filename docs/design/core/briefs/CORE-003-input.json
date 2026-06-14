@@ -1,0 +1,313 @@
+{
+  "repo_root": "/Users/tom/Developer/ablative/haematite",
+  "brief_id": "CORE-003",
+  "reviewers": [
+    "Danger Mouse"
+  ],
+  "base_ref": "main",
+  "placement": "local",
+  "isolation": "worktree",
+  "brief_document": {
+    "id": "CORE-003",
+    "cluster": "core",
+    "title": "Structural diff between two prolly trees by root hash comparison",
+    "depends_on": [
+      "CORE-002"
+    ],
+    "blocked_by": [],
+    "checklist": [
+      "C19",
+      "C20",
+      "C21"
+    ],
+    "stories": [
+      "S12",
+      "S13",
+      "S14"
+    ],
+    "design_anchor": [
+      "ADR-001"
+    ],
+    "purpose": "Implement the structural diff operation that walks two prolly trees simultaneously, skipping subtrees whose root hash matches, and yields only the entries that differ. The cost of the diff is O(differences), not O(total tree size) \u2014 this is a direct consequence of P4 (unmodified subtrees are free). The diff operation is the foundation that the branching cluster's merge operation will build on; without it, comparing two database snapshots requires a full scan. A debugging developer must be able to diff two large database states that differ in a handful of keys and receive results in sub-millisecond time.",
+    "task": "Create crates/haematite/src/tree/diff.rs implementing a diff function that takes a NodeStore reference and two root hashes, walks both trees in parallel by key order, and yields DiffEntry items for each key that differs. DiffEntry has three variants: Added(key, value) when a key exists only in tree B, Removed(key, value) when a key exists only in tree A, and Modified(key, old_value, new_value) when a key exists in both trees with different values. The critical invariant: when two nodes at the same tree position share a hash, the function MUST NOT descend into them \u2014 the entire subtree is identical and can be skipped. This brief covers the diff algorithm and its types only. Branching, merging, and three-way merge are out of scope \u2014 those belong to the branching cluster.",
+    "requirements": [
+      {
+        "id": "R1",
+        "title": "DiffEntry type with Added, Removed, and Modified variants",
+        "spec": "THE SYSTEM SHALL define a DiffEntry enum with three variants: Added { key: Vec<u8>, value: Vec<u8> }, Removed { key: Vec<u8>, value: Vec<u8> }, and Modified { key: Vec<u8>, old_value: Vec<u8>, new_value: Vec<u8> }. THE SYSTEM SHALL implement Debug and PartialEq on DiffEntry. THE SYSTEM SHALL NOT include hash values in DiffEntry \u2014 callers work with keys and values, not internal tree identifiers.",
+        "acceptance": [
+          "DiffEntry::Added { key, value } is constructible",
+          "DiffEntry::Removed { key, value } is constructible",
+          "DiffEntry::Modified { key, old_value, new_value } is constructible",
+          "DiffEntry implements Debug",
+          "DiffEntry implements PartialEq so tests can use assert_eq!",
+          "DiffEntry fields use Vec<u8> for keys and values \u2014 no hash fields present"
+        ],
+        "files": {
+          "create": [
+            "crates/haematite/src/tree/diff.rs"
+          ],
+          "modify": [],
+          "delete": []
+        },
+        "checklist": [
+          "C19"
+        ],
+        "stories": [
+          "S13"
+        ]
+      },
+      {
+        "id": "R2",
+        "title": "diff function signature and NodeStore integration",
+        "spec": "THE SYSTEM SHALL expose a diff function with the signature diff<S: NodeStore>(store: &S, root_a: &Hash, root_b: &Hash) -> Result<Vec<DiffEntry>, DiffError>. WHEN root_a and root_b are equal, THE SYSTEM SHALL return an empty Vec without loading any nodes from the store. THE SYSTEM SHALL NOT require the caller to hold the trees in memory \u2014 all node access MUST go through the NodeStore trait defined in CORE-001. IF a required node hash is not found in the store, THEN THE SYSTEM SHALL return DiffError::MissingNode(hash).",
+        "acceptance": [
+          "diff(store, hash, hash) where both hashes are identical returns Ok(vec![]) without any store.get calls",
+          "diff(store, root_a, root_b) returns Ok(entries) when both roots are reachable",
+          "diff(store, root_a, root_b) returns Err(DiffError::MissingNode(h)) when a node at hash h is absent from the store",
+          "DiffError implements std::error::Error and Debug",
+          "The function accepts any S: NodeStore \u2014 it is not coupled to MemoryStore"
+        ],
+        "files": {
+          "create": [],
+          "modify": [
+            "crates/haematite/src/tree/diff.rs"
+          ],
+          "delete": []
+        },
+        "checklist": [
+          "C19",
+          "C20"
+        ],
+        "stories": [
+          "S12",
+          "S13"
+        ]
+      },
+      {
+        "id": "R3",
+        "title": "Subtree skipping when hashes match (P4)",
+        "spec": "WHILE walking both trees simultaneously, WHEN the current node hash in tree A equals the current node hash in tree B at the same position, THE SYSTEM SHALL skip that subtree entirely and produce no DiffEntry items for any key beneath it. THE SYSTEM SHALL NOT call store.get on a node whose hash matches the opposing tree's node hash at the same position \u2014 descending is prohibited when hashes match. This is P4: unmodified subtrees are free.",
+        "acceptance": [
+          "A store that panics on get for shared-hash nodes does not panic during diff of two trees that share a subtree",
+          "diff of two trees that share all subtrees except one leaf returns only the entries from that leaf \u2014 not entries from shared subtrees",
+          "store.get is not called for any node whose hash appears identically on both sides of the comparison at the same tree position",
+          "A test with a 1000-entry tree where one key is modified records fewer than 20 store.get calls"
+        ],
+        "files": {
+          "create": [],
+          "modify": [
+            "crates/haematite/src/tree/diff.rs"
+          ],
+          "delete": []
+        },
+        "checklist": [
+          "C20",
+          "C21"
+        ],
+        "stories": [
+          "S14"
+        ]
+      },
+      {
+        "id": "R4",
+        "title": "Parallel in-order traversal of leaf entries",
+        "spec": "WHEN both trees descend to leaf nodes at the same position, THE SYSTEM SHALL merge their key-value entry lists with a two-pointer scan in sorted key order. WHEN a key exists in leaf A but not leaf B, THE SYSTEM SHALL yield DiffEntry::Removed. WHEN a key exists in leaf B but not leaf A, THE SYSTEM SHALL yield DiffEntry::Added. WHEN a key exists in both leaves with differing values, THE SYSTEM SHALL yield DiffEntry::Modified. WHEN a key exists in both leaves with identical values, THE SYSTEM SHALL NOT yield any DiffEntry for that key.",
+        "acceptance": [
+          "diff of leaf A = [(b, 2), (c, 3)] and leaf B = [(a, 1), (c, 3)] yields [Added(a,1), Removed(b,2)] in key order",
+          "diff of leaf A = [(k, old)] and leaf B = [(k, new)] yields [Modified(k, old, new)]",
+          "diff of leaf A = [(k, v)] and leaf B = [(k, v)] yields [] \u2014 identical values produce no entry",
+          "diff results are in ascending key order"
+        ],
+        "files": {
+          "create": [],
+          "modify": [
+            "crates/haematite/src/tree/diff.rs"
+          ],
+          "delete": []
+        },
+        "checklist": [
+          "C19"
+        ],
+        "stories": [
+          "S13"
+        ]
+      },
+      {
+        "id": "R5",
+        "title": "Asymmetric descent when one side is a leaf and the other is internal",
+        "spec": "WHEN one tree has a leaf node at a given position and the other has an internal node (due to structural divergence from unequal key sets), THE SYSTEM SHALL expand the internal node by descending its children while treating the leaf as a terminal on its side. THE SYSTEM SHALL yield Added or Removed entries for all keys reachable under the internal subtree that are absent from the leaf side. THE SYSTEM SHALL NOT assume both trees are structurally identical \u2014 prolly tree boundaries are content-determined and two trees with different key sets will have different node shapes.",
+        "acceptance": [
+          "diff where tree A has a single leaf with keys [a, b] and tree B has an internal node whose children span [a, b, c, d] yields Added entries for c and d",
+          "diff where tree A has keys [a, b, c] as one leaf and tree B has the same keys split across two leaves under an internal node yields []",
+          "No panic or error occurs when node depth differs between the two trees at a given key range"
+        ],
+        "files": {
+          "create": [],
+          "modify": [
+            "crates/haematite/src/tree/diff.rs"
+          ],
+          "delete": []
+        },
+        "checklist": [
+          "C19",
+          "C21"
+        ],
+        "stories": [
+          "S13",
+          "S14"
+        ]
+      },
+      {
+        "id": "R6",
+        "title": "Wire diff module into tree module root and crate public API",
+        "spec": "THE SYSTEM SHALL add diff as a public module in crates/haematite/src/tree/mod.rs using a pub mod declaration. THE SYSTEM SHALL re-export diff, DiffEntry, and DiffError from the crate root lib.rs. tree/mod.rs SHALL NOT contain logic \u2014 only pub mod diff and the existing pub mod declarations from CORE-001 and CORE-002.",
+        "acceptance": [
+          "crates/haematite/src/tree/mod.rs contains pub mod diff and no logic",
+          "haematite::diff is callable from outside the crate",
+          "haematite::DiffEntry is accessible from outside the crate",
+          "haematite::DiffError is accessible from outside the crate",
+          "cargo check -p haematite succeeds"
+        ],
+        "files": {
+          "create": [],
+          "modify": [
+            "crates/haematite/src/tree/mod.rs",
+            "crates/haematite/src/lib.rs"
+          ],
+          "delete": []
+        },
+        "checklist": [
+          "C19"
+        ],
+        "stories": [
+          "S12"
+        ]
+      },
+      {
+        "id": "R7",
+        "title": "Cost proportionality test: diff is O(differences) not O(tree size)",
+        "spec": "WHEN two trees share all but a small number of differing keys, THE SYSTEM SHALL complete the diff in time proportional to the number of differing keys, not the total number of keys. The store.get call count provides the observable proxy for this: the number of nodes fetched SHALL NOT grow linearly with the total key count when the difference count is held constant. THE SYSTEM SHALL NOT traverse shared subtrees to verify this \u2014 hash equality at a node is sufficient proof of subtree identity (P1).",
+        "acceptance": [
+          "A test builds two trees each containing 10 000 entries where exactly 3 keys differ, runs diff, and asserts the DiffEntry count is 3",
+          "The same test asserts that store.get was called fewer than 100 times (substantially less than 10 000)",
+          "A test builds two entirely disjoint trees of 100 entries each and asserts diff returns 200 entries (100 Added, 100 Removed)",
+          "diff on two empty trees (empty root hashes represented as the hash of an empty node) returns []"
+        ],
+        "files": {
+          "create": [],
+          "modify": [
+            "crates/haematite/src/tree/diff.rs"
+          ],
+          "delete": []
+        },
+        "checklist": [
+          "C21"
+        ],
+        "stories": [
+          "S14"
+        ]
+      }
+    ],
+    "boundaries": [
+      "SHALL NOT implement three-way merge or conflict resolution \u2014 those belong to the branching cluster",
+      "SHALL NOT implement fork or branch creation \u2014 those belong to the branching cluster",
+      "SHALL NOT implement WAL buffer diffing \u2014 diff operates on committed tree roots only",
+      "SHALL NOT implement streaming or async iteration \u2014 diff returns a collected Vec<DiffEntry>",
+      "SHALL NOT implement cross-shard diff \u2014 each call to diff operates on a single shard's tree; multi-shard coordination is the caller's responsibility",
+      "SHALL NOT introduce new serialisation formats \u2014 node loading uses the NodeStore trait from CORE-001 exclusively"
+    ],
+    "verification": [
+      "cargo check -p haematite succeeds with no errors",
+      "cargo test -p haematite --lib passes all tests",
+      "cargo clippy -p haematite produces no errors",
+      "grep -r 'unwrap()\\|expect(' crates/haematite/src/tree/diff.rs finds no occurrences outside #[cfg(test)] blocks",
+      "wc -l crates/haematite/src/tree/diff.rs reports fewer than 500 lines",
+      "grep 'pub mod diff' crates/haematite/src/tree/mod.rs confirms the module is wired",
+      "grep 'pub use' crates/haematite/src/lib.rs | grep -E 'diff|DiffEntry|DiffError' confirms all three are re-exported"
+    ]
+  },
+  "resolved_context": {
+    "adrs": [
+      {
+        "id": "ADR-001",
+        "title": "Content-addressed prolly tree over B+ tree with WAL overlay",
+        "decision": "Content-addressed prolly tree over B+ tree with WAL overlay, because branching/merging/sync is the headline feature and must be structural (O(differences), history-independent) rather than overlaid (O(branch-writes), order-dependent). The rejected alternative (B+ tree + WAL overlay) makes branching an afterthought \u2014 functional but O(branch-writes) for merge and requiring WAL coordination for replication.",
+        "quote": "",
+        "decided_by": "Bono, Frodo Baggins, Sir Patick Stewart"
+      }
+    ],
+    "checklist": [
+      {
+        "id": "C19",
+        "text": "diff(root_a, root_b) walks both trees and yields only entries that differ."
+      },
+      {
+        "id": "C20",
+        "text": "diff skips subtrees whose root hash matches without descending into them."
+      },
+      {
+        "id": "C21",
+        "text": "diff cost is proportional to the number of differing entries, not the total tree size."
+      }
+    ],
+    "stories": [
+      {
+        "id": "S12",
+        "text": "As a debugging developer, I want to get the current root hash of a committed database state so that I can identify and compare snapshots."
+      },
+      {
+        "id": "S13",
+        "text": "As a debugging developer, I want to diff two database states by root hash so that I can see exactly which keys changed between them."
+      },
+      {
+        "id": "S14",
+        "text": "As a debugging developer, I want the diff to run in time proportional to the number of differences, not the total database size, so that diffing large databases with small changes is fast."
+      }
+    ],
+    "constraints": [
+      {
+        "id": "CN1",
+        "text": "No file over 500 lines. If a module approaches this limit, extract into submodules."
+      },
+      {
+        "id": "CN2",
+        "text": "No panics in production code. .unwrap() and .expect() only in tests."
+      },
+      {
+        "id": "CN3",
+        "text": "mod.rs contains ONLY pub mod declarations and pub use re-exports. No logic."
+      },
+      {
+        "id": "CN4",
+        "text": "All public types implement Debug. All error types implement std::error::Error."
+      },
+      {
+        "id": "CN5",
+        "text": "The prolly tree root hash for a given key-value set must be deterministic and history-independent: the same keys and values always produce the same root hash regardless of insertion order."
+      },
+      {
+        "id": "CN6",
+        "text": "WAL buffer reads must shadow tree reads: a key written to the buffer but not yet committed must be returned by get, not the stale tree value."
+      },
+      {
+        "id": "CN7",
+        "text": "Shard actor crash must not affect other shards. Supervision restarts only the failed shard."
+      },
+      {
+        "id": "CN8",
+        "text": "Batch append (multiple key-value pairs in one call) must produce exactly one tree commit, not N individual commits."
+      }
+    ],
+    "intention": "Haematite's core is a storage engine where concurrency is free and branching is structural. When this cluster is complete, a developer can open a haematite database, write to it from hundreds of concurrent actors without any locking discipline, fork it instantly by sharing a hash, and merge two forks by walking only the nodes that differ. The experience should feel like working with an in-memory data structure that happens to be durable \u2014 no connection pools, no transaction coordinators, no lock managers. The content-addressed prolly tree is what makes branching zero-friction; the actor-per-shard model is what makes concurrency zero-contention; the WAL buffer is what makes writes fast despite the content-addressing overhead. All three are load-bearing.",
+    "design_path": "docs/design/core",
+    "provenance": {
+      "requested_by": "Tom",
+      "quote": "Haematite's core is a storage engine where concurrency is free and branching is structural. When this cluster is complete, a developer can open a haematite database, write to it from hundreds of concu"
+    }
+  },
+  "verify_fix_cap": 3,
+  "review_cap": 1,
+  "round_backoff_ms": 2000,
+  "review_deadline_ms": 300000
+}

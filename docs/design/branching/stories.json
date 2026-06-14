@@ -1,0 +1,51 @@
+{
+  "cluster": "branching",
+  "personas": [
+    {
+      "name": "Application Developer",
+      "role": "Using branching for speculative and experimental work",
+      "stories": [
+        {"id": "S1", "text": "As an application developer, I want to fork a database in constant time so that I can create experimental branches without waiting for data to copy."},
+        {"id": "S2", "text": "As an application developer, I want to merge a branch back into the parent with automatic clean-merge handling so that non-conflicting changes are applied without manual intervention."},
+        {"id": "S3", "text": "As an application developer, I want to choose a conflict resolution policy at merge time so that I can pick the strategy that fits the specific merge scenario."},
+        {"id": "S4", "text": "As an application developer, I want to provide a custom merge function so that I can implement domain-specific conflict resolution logic."}
+      ]
+    },
+    {
+      "name": "Aion Engine",
+      "role": "Using branching for what-if workflow debugging",
+      "stories": [
+        {"id": "S5", "text": "As the Aion engine, I want to fork a workflow's event history so that I can replay against modified history for what-if debugging without affecting the live workflow."},
+        {"id": "S6", "text": "As the Aion engine, I want to discard a branch without affecting the parent so that failed experiments leave no trace in the live database."},
+        {"id": "S7", "text": "As the Aion engine, I want to merge a successful experimental branch back into the parent so that validated changes can be promoted to the live workflow."}
+      ]
+    },
+    {
+      "name": "Debugging Developer",
+      "role": "Inspecting historical database states",
+      "stories": [
+        {"id": "S8", "text": "As a debugging developer, I want to name a committed root hash as a snapshot so that I can return to that exact state later for investigation."},
+        {"id": "S9", "text": "As a debugging developer, I want to check out a historical snapshot for read-only access so that I can inspect past state without replaying the entire write history."},
+        {"id": "S10", "text": "As a debugging developer, I want to list all named snapshots with their timestamps so that I can find the right snapshot to investigate."},
+        {"id": "S11", "text": "As a debugging developer, I want to diff two snapshots so that I can see exactly what changed between two points in time."}
+      ]
+    },
+    {
+      "name": "Operations Engineer",
+      "role": "Managing database storage and lifecycle",
+      "stories": [
+        {"id": "S12", "text": "As an operations engineer, I want to prune old snapshots so that unreferenced tree nodes are reclaimed and disk usage is controlled."},
+        {"id": "S13", "text": "As an operations engineer, I want pruning to report how many nodes and bytes were reclaimed so that I can track the effectiveness of my retention policy."},
+        {"id": "S14", "text": "As an operations engineer, I want pruning to guarantee it never deletes nodes referenced by active branches so that live data is never lost."}
+      ]
+    },
+    {
+      "name": "Test Environment",
+      "role": "Cloning production state for testing",
+      "stories": [
+        {"id": "S15", "text": "As a test environment, I want to fork production state into an isolated branch so that tests run against real data without risking production."},
+        {"id": "S16", "text": "As a test environment, I want the fork to share tree nodes with production so that cloning a large database does not double the storage cost."}
+      ]
+    }
+  ]
+}

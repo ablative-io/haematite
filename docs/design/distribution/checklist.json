@@ -1,0 +1,49 @@
+{
+  "cluster": "distribution",
+  "sections": [
+    {
+      "name": "Hash-Based Sync Protocol",
+      "items": [
+        {"id": "C1", "text": "Sync begins with root hash exchange between source and target for a specific shard.", "done": false},
+        {"id": "C2", "text": "Identical root hashes short-circuit: sync completes immediately with no node transfer.", "done": false},
+        {"id": "C3", "text": "Differing root hashes trigger a simultaneous tree walk that descends only into subtrees where hashes differ.", "done": false},
+        {"id": "C4", "text": "Missing content-addressed nodes are transferred from source to target (CN1).", "done": false},
+        {"id": "C5", "text": "Sync operates per-shard: each shard syncs independently (CN2).", "done": false},
+        {"id": "C6", "text": "Sync uses beamr's existing distribution connections (CN5).", "done": false}
+      ]
+    },
+    {
+      "name": "Pull and Push",
+      "items": [
+        {"id": "C7", "text": "Pull sync: the target initiates, sends its root hash, and receives missing nodes from the source.", "done": false},
+        {"id": "C8", "text": "Push sync: the source responds to pull requests by walking its tree and sending requested nodes.", "done": false},
+        {"id": "C9", "text": "Received nodes are applied to the target's local node store.", "done": false},
+        {"id": "C10", "text": "A sync failure (network partition, crash) does not corrupt either node's local state (CN6).", "done": false}
+      ]
+    },
+    {
+      "name": "Sync-Time Merge",
+      "items": [
+        {"id": "C11", "text": "When both nodes have diverged (independent writes to the same key), sync performs a merge using the configured conflict resolution policy.", "done": false},
+        {"id": "C12", "text": "Divergent writes are never silently dropped — they are resolved or surfaced (CN4).", "done": false},
+        {"id": "C13", "text": "The merged result is committed to the target's tree as a new root hash.", "done": false}
+      ]
+    },
+    {
+      "name": "Consistency Modes",
+      "items": [
+        {"id": "C14", "text": "Eventual consistency mode syncs at configurable intervals without blocking the write path.", "done": false},
+        {"id": "C15", "text": "Strong consistency mode waits for quorum (N/2+1) acknowledgments before returning from a write (CN3).", "done": false},
+        {"id": "C16", "text": "Consistency mode is configurable per-operation.", "done": false}
+      ]
+    },
+    {
+      "name": "Topology and Scheduling",
+      "items": [
+        {"id": "C17", "text": "Sync topology is configurable: full-mesh, ring, or custom sync pairs.", "done": false},
+        {"id": "C18", "text": "Sync scheduler triggers periodic syncs based on the configured topology and interval.", "done": false},
+        {"id": "C19", "text": "Any topology converges to consistency given sufficient sync rounds.", "done": false}
+      ]
+    }
+  ]
+}

@@ -1,0 +1,159 @@
+{
+  "repo_root": "/Users/tom/Developer/ablative/haematite",
+  "brief_id": "WASM-003",
+  "reviewers": [
+    "Danger Mouse"
+  ],
+  "base_ref": "main",
+  "placement": "local",
+  "isolation": "worktree",
+  "brief_document": {
+    "id": "WASM-003",
+    "cluster": "wasm",
+    "title": "Browser transport adapter for distribution sync",
+    "depends_on": [
+      "WASM-001",
+      "DIST-001"
+    ],
+    "blocked_by": [],
+    "checklist": [
+      "C17",
+      "C18"
+    ],
+    "stories": [
+      "S5"
+    ],
+    "design_anchor": [
+      "ADR-001"
+    ],
+    "purpose": "Deliver the browser transport adapter that enables distribution sync between WASM and native haematite nodes over WebSocket or WebRTC data channels. The sync protocol payload is identical to native \u2014 only the transport layer differs.",
+    "task": "Implement a transport adapter that bridges haematite's distribution sync protocol (DIST-001) to browser-compatible transports: WebSocket for server-to-browser sync and WebRTC data channels for browser-to-browser sync. The sync protocol payload (root hash exchange, tree walk, node transfer) is identical to native. The adapter translates between beamr distribution messages and WebSocket/WebRTC frames. Does not implement the sync protocol itself (DIST-001) or merge logic (DIST-002).",
+    "requirements": [
+      {
+        "id": "R1",
+        "title": "WebSocket transport",
+        "spec": "THE SYSTEM SHALL implement a WebSocket transport that carries haematite sync protocol messages between a browser and a server. THE SYSTEM SHALL serialise sync messages into WebSocket binary frames. THE SYSTEM SHALL deserialise incoming frames back into sync messages.",
+        "acceptance": [
+          "The WebSocket transport connects to a server endpoint",
+          "Sync protocol messages are serialised into binary WebSocket frames",
+          "Incoming frames are deserialised into sync protocol messages",
+          "A full pull-sync completes over WebSocket"
+        ],
+        "files": {
+          "create": [
+            "crates/haematite/src/wasm/transport.rs"
+          ],
+          "modify": [
+            "crates/haematite/src/wasm/mod.rs"
+          ],
+          "delete": []
+        },
+        "checklist": [
+          "C17"
+        ],
+        "stories": [
+          "S5"
+        ]
+      },
+      {
+        "id": "R2",
+        "title": "Protocol payload parity",
+        "spec": "THE SYSTEM SHALL use identical sync protocol payloads in the browser transport as in the native distribution transport. THE SYSTEM SHALL NOT introduce browser-specific message formats. The only difference is the transport layer \u2014 WebSocket instead of TCP.",
+        "acceptance": [
+          "The sync message format is identical between native and WASM builds",
+          "A native node can sync with a WASM node via WebSocket",
+          "Root hash exchange, tree walk, and node transfer messages are byte-compatible"
+        ],
+        "files": {
+          "create": [],
+          "modify": [
+            "crates/haematite/src/wasm/transport.rs"
+          ],
+          "delete": []
+        },
+        "checklist": [
+          "C18"
+        ],
+        "stories": [
+          "S5"
+        ]
+      }
+    ],
+    "boundaries": [
+      "SHALL NOT implement the sync protocol \u2014 that is DIST-001",
+      "SHALL NOT implement merge or consistency modes \u2014 that is DIST-002",
+      "SHALL NOT implement a WebRTC signaling server \u2014 signaling is application-level",
+      "SHALL NOT implement the IndexedDB NodeStore or OPFS WAL \u2014 those are WASM-001 and WASM-002",
+      "SHALL NOT implement WebRTC data channel transport \u2014 deferred to future phase. WebSocket only for MVP."
+    ],
+    "verification": [
+      "cargo check -p haematite --target wasm32-unknown-unknown --features wasm succeeds",
+      "cargo test -p haematite --lib passes all tests (native)",
+      "cargo clippy -p haematite produces no errors",
+      "No file in crates/haematite/src/wasm/ exceeds 500 lines"
+    ]
+  },
+  "resolved_context": {
+    "adrs": [
+      {
+        "id": "ADR-001",
+        "title": "Content-addressed prolly tree over B+ tree with WAL overlay",
+        "decision": "Content-addressed prolly tree over B+ tree with WAL overlay, because branching/merging/sync is the headline feature and must be structural (O(differences), history-independent) rather than overlaid (O(branch-writes), order-dependent). The rejected alternative (B+ tree + WAL overlay) makes branching an afterthought \u2014 functional but O(branch-writes) for merge and requiring WAL coordination for replication.",
+        "quote": "",
+        "decided_by": "Bono, Frodo Baggins, Sir Patick Stewart"
+      }
+    ],
+    "checklist": [
+      {
+        "id": "C17",
+        "text": "Distribution sync in the WASM build operates over WebSocket data channels."
+      },
+      {
+        "id": "C18",
+        "text": "The sync protocol payload is identical to the native distribution sync \u2014 only the transport differs."
+      }
+    ],
+    "stories": [
+      {
+        "id": "S5",
+        "text": "As an application developer, I want the browser haematite instance to sync with the server by exchanging content-addressed nodes so that offline changes merge cleanly when connectivity returns."
+      }
+    ],
+    "constraints": [
+      {
+        "id": "CN1",
+        "text": "WASM build must compile to wasm32-unknown-unknown without any native-only dependencies. All platform-specific code must be behind cfg gates."
+      },
+      {
+        "id": "CN2",
+        "text": "BLAKE3 hashes must be identical between native and WASM builds. The portable BLAKE3 implementation must produce the same output as the SIMD-accelerated one."
+      },
+      {
+        "id": "CN3",
+        "text": "WASM binary size (gzipped) must stay under 2MB. Dependencies that bloat the binary must be cfg-gated or replaced."
+      },
+      {
+        "id": "CN4",
+        "text": "IndexedDB operations are async. The NodeStore adapter must not block the browser's main thread."
+      },
+      {
+        "id": "CN5",
+        "text": "OPFS fallback to IndexedDB must be transparent to the shard actor. The WAL interface is the same regardless of backend."
+      },
+      {
+        "id": "CN6",
+        "text": "The WAL entry format in OPFS must be byte-identical to the native durable WAL format so that WAL files are portable."
+      }
+    ],
+    "intention": "The WASM cluster extends haematite to the browser and edge. When this cluster is complete, the same haematite API \u2014 get, put, range, fork, merge, commit \u2014 runs in a browser tab or Cloudflare Worker, backed by IndexedDB or OPFS instead of the filesystem. Content-addressed nodes are portable across backends: a tree written on a native server can be synced to a browser tab and read there with identical hashes. The experience should feel like the same database everywhere \u2014 write on the server, read in the browser, fork on the edge \u2014 not a separate product with a compatibility layer.",
+    "design_path": "docs/design/wasm",
+    "provenance": {
+      "requested_by": "Tom",
+      "quote": "The WASM cluster extends haematite to the browser and edge. When this cluster is complete, the same haematite API \u2014 get, put, range, fork, merge, commit \u2014 runs in a browser tab or Cloudflare Worker, b"
+    }
+  },
+  "verify_fix_cap": 3,
+  "review_cap": 1,
+  "round_backoff_ms": 2000,
+  "review_deadline_ms": 300000
+}

@@ -1,0 +1,115 @@
+{
+  "id": "PERSIST-003",
+  "cluster": "persistence",
+  "title": "Crash recovery via WAL replay",
+  "depends_on": ["PERSIST-001", "PERSIST-002"],
+  "blocked_by": [],
+  "checklist": ["C15", "C16", "C17", "C18", "C19", "C20"],
+  "stories": ["S2", "S5", "S6", "S7", "S10"],
+  "design_anchor": ["ADR-001", "ADR-003"],
+  "purpose": "Deliver automatic crash recovery for shard actors by replaying the durable WAL from the last committed root hash. Each shard recovers independently. Corrupted WAL entries are detected by CRC mismatch and recovery replays up to the last valid entry.",
+  "task": "Implement crash recovery: on shard actor startup, read the last truncation marker to find the committed root hash, verify it exists in the disk node store, replay all WAL entries after the marker to reconstruct the in-memory buffer, and resume normal operation. CRC32 validation on each entry — corrupted entries stop replay at the last valid entry. Recovery is per-shard: each shard recovers independently without blocking others.",
+  "requirements": [
+    {
+      "id": "R1",
+      "title": "Read last truncation marker",
+      "spec": "WHEN a shard actor starts, THE SYSTEM SHALL read the last truncation marker from the durable WAL file to find the committed root hash. IF no truncation marker exists (fresh database), THE SYSTEM SHALL start with an empty tree.",
+      "acceptance": [
+        "Recovery reads the truncation marker and extracts the committed root hash",
+        "A fresh database with no WAL file starts with an empty tree",
+        "A WAL file with only a truncation marker (no uncommitted entries) starts at the committed state"
+      ],
+      "files": {
+        "create": [],
+        "modify": ["crates/haematite/src/wal/recovery.rs"],
+        "delete": []
+      },
+      "checklist": ["C15"],
+      "stories": ["S2"]
+    },
+    {
+      "id": "R2",
+      "title": "Verify committed root hash",
+      "spec": "WHEN recovery reads the committed root hash, THE SYSTEM SHALL verify that the root hash exists in the disk node store. IF the root hash is missing, THE SYSTEM SHALL report a fatal error — the committed tree state is corrupted.",
+      "acceptance": [
+        "Recovery succeeds when the committed root hash exists in the node store",
+        "Recovery reports a fatal error when the committed root hash is missing from the node store",
+        "The error message includes the missing root hash"
+      ],
+      "files": {
+        "create": [],
+        "modify": ["crates/haematite/src/wal/recovery.rs"],
+        "delete": []
+      },
+      "checklist": ["C16"],
+      "stories": []
+    },
+    {
+      "id": "R3",
+      "title": "WAL entry replay",
+      "spec": "WHEN recovery finds WAL entries after the truncation marker, THE SYSTEM SHALL replay each entry in order, reconstructing the in-memory WAL buffer. THE SYSTEM SHALL validate the CRC32 checksum of each entry before replaying it. THE SYSTEM SHALL stop replay at the first corrupted entry (CRC mismatch) and log a warning.",
+      "acceptance": [
+        "N entries after the truncation marker produce an in-memory buffer with N mutations",
+        "The buffer state after replay matches the state before crash",
+        "A corrupted entry (CRC mismatch) stops replay at that point",
+        "Entries before the corrupted one are replayed successfully",
+        "A warning is logged when corruption is detected"
+      ],
+      "files": {
+        "create": [],
+        "modify": ["crates/haematite/src/wal/recovery.rs"],
+        "delete": []
+      },
+      "checklist": ["C17", "C18"],
+      "stories": ["S5", "S7"]
+    },
+    {
+      "id": "R4",
+      "title": "Per-shard independent recovery",
+      "spec": "THE SYSTEM SHALL recover each shard independently from its own WAL file. THE SYSTEM SHALL NOT wait for all shards to recover before any shard accepts writes. A slow-recovering shard SHALL NOT block other shards from starting.",
+      "acceptance": [
+        "Shard 0 can accept writes while shard 5 is still recovering",
+        "Each shard reads only its own WAL file",
+        "A shard with a large WAL does not delay other shards"
+      ],
+      "files": {
+        "create": [],
+        "modify": ["crates/haematite/src/wal/recovery.rs"],
+        "delete": []
+      },
+      "checklist": ["C19"],
+      "stories": ["S6"]
+    },
+    {
+      "id": "R5",
+      "title": "Resume normal operation after recovery",
+      "spec": "WHEN WAL replay is complete, THE SYSTEM SHALL transition the shard actor to normal operation, accepting new writes. THE SYSTEM SHALL append new WAL entries after the replayed entries.",
+      "acceptance": [
+        "After recovery, put/get/delete operations work normally",
+        "New writes are appended to the WAL after the replayed entries",
+        "commit() after recovery truncates the WAL and produces a new root hash",
+        "The shard is indistinguishable from one that never crashed"
+      ],
+      "files": {
+        "create": [],
+        "modify": ["crates/haematite/src/wal/recovery.rs"],
+        "delete": []
+      },
+      "checklist": ["C20"],
+      "stories": ["S2", "S10"]
+    }
+  ],
+  "boundaries": [
+    "SHALL NOT implement the disk node store — that is PERSIST-001",
+    "SHALL NOT implement the durable WAL writer — that is PERSIST-002",
+    "SHALL NOT implement WAL compaction or archival",
+    "SHALL NOT recover from a missing committed root hash — that is a fatal error, not a recoverable state"
+  ],
+  "verification": [
+    "cargo check -p haematite succeeds with no errors",
+    "cargo test -p haematite --lib passes all tests",
+    "cargo clippy -p haematite produces no errors",
+    "grep -r 'unwrap()\\|expect(' crates/haematite/src/wal/recovery.rs -l finds nothing",
+    "No file in crates/haematite/src/wal/ exceeds 500 lines"
+  ]
+}

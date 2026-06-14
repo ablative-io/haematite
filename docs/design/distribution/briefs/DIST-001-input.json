@@ -1,0 +1,345 @@
+{
+  "repo_root": "/Users/tom/Developer/ablative/haematite",
+  "brief_id": "DIST-001",
+  "reviewers": [
+    "Danger Mouse"
+  ],
+  "base_ref": "main",
+  "placement": "local",
+  "isolation": "worktree",
+  "brief_document": {
+    "id": "DIST-001",
+    "cluster": "distribution",
+    "title": "Hash-based sync protocol with pull and push",
+    "depends_on": [
+      "CORE-001",
+      "CORE-003"
+    ],
+    "blocked_by": [],
+    "checklist": [
+      "C1",
+      "C2",
+      "C3",
+      "C4",
+      "C5",
+      "C6",
+      "C7",
+      "C8",
+      "C9",
+      "C10"
+    ],
+    "stories": [
+      "S1",
+      "S4",
+      "S5",
+      "S8",
+      "S11",
+      "S12"
+    ],
+    "design_anchor": [
+      "ADR-001"
+    ],
+    "purpose": "Deliver the hash-based sync protocol that enables two haematite nodes to synchronise a shard by comparing root hashes and exchanging only the differing content-addressed nodes. This is the transport-layer foundation for multi-node haematite \u2014 merge logic and consistency modes build on it in DIST-002.",
+    "task": "Implement the sync protocol: root hash exchange, simultaneous tree walk descending only into differing subtrees, and node transfer. Implement pull sync (target initiates, requests missing nodes) and push sync (source responds with requested nodes). Sync operates per-shard over beamr's existing distribution connections. Received nodes are applied to the target's local node store. Partial sync (crash mid-transfer) must not corrupt either node's state. Does not implement merge logic (DIST-002) or topology (DIST-003).",
+    "requirements": [
+      {
+        "id": "R1",
+        "title": "Sync module structure",
+        "spec": "Create the sync module with mod.rs containing only pub mod declarations. Create protocol.rs, pull.rs, and push.rs as sub-modules.",
+        "acceptance": [
+          "crates/haematite/src/sync/mod.rs exists with only pub mod and pub use statements",
+          "crates/haematite/src/sync/protocol.rs exists",
+          "crates/haematite/src/sync/pull.rs exists",
+          "crates/haematite/src/sync/push.rs exists"
+        ],
+        "files": {
+          "create": [
+            "crates/haematite/src/sync/mod.rs",
+            "crates/haematite/src/sync/protocol.rs",
+            "crates/haematite/src/sync/pull.rs",
+            "crates/haematite/src/sync/push.rs"
+          ],
+          "modify": [
+            "crates/haematite/src/lib.rs"
+          ],
+          "delete": []
+        },
+        "checklist": [],
+        "stories": []
+      },
+      {
+        "id": "R2",
+        "title": "Root hash exchange",
+        "spec": "WHEN sync is initiated for a shard, THE SYSTEM SHALL exchange root hashes between source and target. IF root hashes are identical, THE SYSTEM SHALL complete immediately with no node transfer. IF root hashes differ, THE SYSTEM SHALL proceed to the tree walk phase.",
+        "acceptance": [
+          "Sync between two nodes with identical root hashes completes with zero node transfers",
+          "Sync between two nodes with different root hashes proceeds to tree walk",
+          "The root hash exchange uses beamr's distribution connection"
+        ],
+        "files": {
+          "create": [],
+          "modify": [
+            "crates/haematite/src/sync/protocol.rs"
+          ],
+          "delete": []
+        },
+        "checklist": [
+          "C1",
+          "C2"
+        ],
+        "stories": [
+          "S11"
+        ]
+      },
+      {
+        "id": "R3",
+        "title": "Differential tree walk",
+        "spec": "WHEN root hashes differ, THE SYSTEM SHALL walk both trees simultaneously from root to leaves, descending only into subtrees where hashes differ. THE SYSTEM SHALL skip subtrees where both hashes match. THE SYSTEM SHALL identify nodes present in the source but absent in the target.",
+        "acceptance": [
+          "The walk descends only into subtrees where hashes differ",
+          "Matching subtrees are skipped entirely",
+          "The walk identifies the minimal set of missing nodes",
+          "Two databases sharing 99% of nodes transfer only the differing 1%"
+        ],
+        "files": {
+          "create": [],
+          "modify": [
+            "crates/haematite/src/sync/protocol.rs"
+          ],
+          "delete": []
+        },
+        "checklist": [
+          "C3",
+          "C4"
+        ],
+        "stories": [
+          "S12"
+        ]
+      },
+      {
+        "id": "R4",
+        "title": "Pull sync \u2014 target-initiated",
+        "spec": "THE SYSTEM SHALL implement pull sync where the target initiates, sends its root hash, and receives missing nodes from the source. THE SYSTEM SHALL apply received nodes to the target's local node store.",
+        "acceptance": [
+          "The target initiates the sync by sending its root hash",
+          "The target receives missing nodes from the source",
+          "Received nodes are stored in the target's node store",
+          "After pull sync, the target has all nodes present in the source"
+        ],
+        "files": {
+          "create": [],
+          "modify": [
+            "crates/haematite/src/sync/pull.rs"
+          ],
+          "delete": []
+        },
+        "checklist": [
+          "C7",
+          "C9"
+        ],
+        "stories": [
+          "S1",
+          "S5"
+        ]
+      },
+      {
+        "id": "R5",
+        "title": "Push sync \u2014 source responds",
+        "spec": "THE SYSTEM SHALL implement push sync where the source responds to pull requests by walking its tree and sending requested nodes. THE SYSTEM SHALL send only nodes the target does not have.",
+        "acceptance": [
+          "The source responds to a pull request with missing nodes",
+          "The source sends only nodes not present in the target",
+          "The source does not need to track target state \u2014 hash comparison determines the delta"
+        ],
+        "files": {
+          "create": [],
+          "modify": [
+            "crates/haematite/src/sync/push.rs"
+          ],
+          "delete": []
+        },
+        "checklist": [
+          "C8"
+        ],
+        "stories": [
+          "S8"
+        ]
+      },
+      {
+        "id": "R6",
+        "title": "Per-shard sync over beamr distribution",
+        "spec": "THE SYSTEM SHALL sync per-shard: each shard's tree syncs independently. THE SYSTEM SHALL route sync messages through beamr's existing distribution connection manager. THE SYSTEM SHALL NOT create separate TCP connections for sync.",
+        "acceptance": [
+          "Sync on shard 5 does not affect or block shards 0-4",
+          "Sync messages are sent via beamr distribution connections",
+          "No separate TCP connections are created for sync"
+        ],
+        "files": {
+          "create": [],
+          "modify": [
+            "crates/haematite/src/sync/protocol.rs"
+          ],
+          "delete": []
+        },
+        "checklist": [
+          "C5",
+          "C6"
+        ],
+        "stories": [
+          "S4"
+        ]
+      },
+      {
+        "id": "R7",
+        "title": "Partial sync safety",
+        "spec": "IF sync fails (network partition, node crash mid-transfer), THE SYSTEM SHALL NOT corrupt either node's local state. THE SYSTEM SHALL leave both nodes in a consistent state that can be retried.",
+        "acceptance": [
+          "A crash after receiving 50% of missing nodes leaves the target with those 50% stored correctly",
+          "The target's existing data is not modified during sync",
+          "A retry after partial sync succeeds without re-sending already-received nodes"
+        ],
+        "files": {
+          "create": [],
+          "modify": [
+            "crates/haematite/src/sync/pull.rs"
+          ],
+          "delete": []
+        },
+        "checklist": [
+          "C10"
+        ],
+        "stories": [
+          "S4"
+        ]
+      }
+    ],
+    "boundaries": [
+      "SHALL NOT implement sync-time merge or conflict resolution \u2014 that is DIST-002",
+      "SHALL NOT implement consistency modes (eventual/strong) \u2014 that is DIST-002",
+      "SHALL NOT implement topology or sync scheduling \u2014 that is DIST-003",
+      "SHALL NOT create separate TCP connections \u2014 all sync uses beamr distribution"
+    ],
+    "verification": [
+      "cargo check -p haematite succeeds with no errors",
+      "cargo test -p haematite --lib passes all tests",
+      "cargo clippy -p haematite produces no errors",
+      "grep -r 'unwrap()\\|expect(' crates/haematite/src/sync/ --include='*.rs' -l finds no non-test files",
+      "No file in crates/haematite/src/sync/ exceeds 500 lines"
+    ]
+  },
+  "resolved_context": {
+    "adrs": [
+      {
+        "id": "ADR-001",
+        "title": "Content-addressed prolly tree over B+ tree with WAL overlay",
+        "decision": "Content-addressed prolly tree over B+ tree with WAL overlay, because branching/merging/sync is the headline feature and must be structural (O(differences), history-independent) rather than overlaid (O(branch-writes), order-dependent). The rejected alternative (B+ tree + WAL overlay) makes branching an afterthought \u2014 functional but O(branch-writes) for merge and requiring WAL coordination for replication.",
+        "quote": "",
+        "decided_by": "Bono, Frodo Baggins, Sir Patick Stewart"
+      }
+    ],
+    "checklist": [
+      {
+        "id": "C1",
+        "text": "Sync begins with root hash exchange between source and target for a specific shard."
+      },
+      {
+        "id": "C2",
+        "text": "Identical root hashes short-circuit: sync completes immediately with no node transfer."
+      },
+      {
+        "id": "C3",
+        "text": "Differing root hashes trigger a simultaneous tree walk that descends only into subtrees where hashes differ."
+      },
+      {
+        "id": "C4",
+        "text": "Missing content-addressed nodes are transferred from source to target (CN1)."
+      },
+      {
+        "id": "C5",
+        "text": "Sync operates per-shard: each shard syncs independently (CN2)."
+      },
+      {
+        "id": "C6",
+        "text": "Sync uses beamr's existing distribution connections (CN5)."
+      },
+      {
+        "id": "C7",
+        "text": "Pull sync: the target initiates, sends its root hash, and receives missing nodes from the source."
+      },
+      {
+        "id": "C8",
+        "text": "Push sync: the source responds to pull requests by walking its tree and sending requested nodes."
+      },
+      {
+        "id": "C9",
+        "text": "Received nodes are applied to the target's local node store."
+      },
+      {
+        "id": "C10",
+        "text": "A sync failure (network partition, crash) does not corrupt either node's local state (CN6)."
+      }
+    ],
+    "stories": [
+      {
+        "id": "S1",
+        "text": "As an operations engineer, I want to add a new node to the cluster and have it sync automatically so that scaling out does not require manual data migration."
+      },
+      {
+        "id": "S4",
+        "text": "As an operations engineer, I want a failed sync to be retryable without risk of data corruption so that network glitches do not require manual intervention."
+      },
+      {
+        "id": "S5",
+        "text": "As the Aion engine, I want workflow event histories to be replicated across nodes so that a node failure does not lose workflow state."
+      },
+      {
+        "id": "S8",
+        "text": "As an application developer, I want to read from any node and get eventually-consistent data so that I can distribute reads across the cluster for throughput."
+      },
+      {
+        "id": "S11",
+        "text": "As a debugging developer, I want to compare root hashes between two nodes for a specific shard so that I can verify whether they are in sync."
+      },
+      {
+        "id": "S12",
+        "text": "As a debugging developer, I want sync operations to report how many nodes were transferred so that I can understand the magnitude of divergence."
+      }
+    ],
+    "constraints": [
+      {
+        "id": "CN1",
+        "text": "Sync must transfer only content-addressed nodes that the target does not have. Full database copies on sync are a correctness bug."
+      },
+      {
+        "id": "CN2",
+        "text": "Sync must operate per-shard. A sync on shard 5 must not block or affect shards 0-4 and 6-N."
+      },
+      {
+        "id": "CN3",
+        "text": "Strong consistency mode must wait for quorum (N/2+1) acknowledgments before returning. Returning early is a durability violation."
+      },
+      {
+        "id": "CN4",
+        "text": "Divergent writes must be resolved by the configured conflict resolution policy, never silently dropped."
+      },
+      {
+        "id": "CN5",
+        "text": "Sync must use beamr's existing distribution connections. No separate TCP connections or custom transport."
+      },
+      {
+        "id": "CN6",
+        "text": "A sync failure (network partition, node crash mid-sync) must not corrupt either node's local state. Partial syncs are safe to retry."
+      }
+    ],
+    "intention": "Distribution extends haematite from a single-node storage engine to a multi-node system where databases on different machines stay in sync by exchanging content-addressed tree nodes. When this cluster is complete, two haematite nodes can sync a database by comparing root hashes and exchanging only the missing nodes \u2014 the same mechanism git uses for fetch and push, applied to a live key-value store. There is no primary-replica relationship, no replication log to manage, no WAL coordination. Any node can sync with any other node. The experience should feel like git remote: add a remote, push, pull, and the content-addressed structure guarantees that the minimal set of data moves.",
+    "design_path": "docs/design/distribution",
+    "provenance": {
+      "requested_by": "Tom",
+      "quote": "Distribution extends haematite from a single-node storage engine to a multi-node system where databases on different machines stay in sync by exchanging content-addressed tree nodes. When this cluster"
+    }
+  },
+  "verify_fix_cap": 3,
+  "review_cap": 1,
+  "round_backoff_ms": 2000,
+  "review_deadline_ms": 300000
+}

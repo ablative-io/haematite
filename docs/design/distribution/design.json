@@ -1,0 +1,136 @@
+{
+  "cluster": "distribution",
+  "title": "Multi-Node Hash-Based Sync and Replication",
+  "intention": "Distribution extends haematite from a single-node storage engine to a multi-node system where databases on different machines stay in sync by exchanging content-addressed tree nodes. When this cluster is complete, two haematite nodes can sync a database by comparing root hashes and exchanging only the missing nodes \u2014 the same mechanism git uses for fetch and push, applied to a live key-value store. There is no primary-replica relationship, no replication log to manage, no WAL coordination. Any node can sync with any other node. The experience should feel like git remote: add a remote, push, pull, and the content-addressed structure guarantees that the minimal set of data moves.",
+  "problem": "Single-node haematite is durable but not available \u2014 a node failure means the database is offline until that node recovers. For Aion and the messaging bus, this is unacceptable in production. Conventional replication (primary-replica with WAL shipping or replication log) requires a designated primary, log management, and careful failover coordination.\n\nHaematite's content-addressed structure offers a fundamentally different approach: sync by hash negotiation. Two nodes compare root hashes; if they differ, they walk the trees and exchange missing nodes. The cost is proportional to the differences, not the total data. This works between arbitrary nodes \u2014 no primary, no replica, no replication log. But this approach needs to be designed and built on top of beamr's existing distribution protocol.",
+  "solution": "The distribution cluster adds three capabilities:\n\n1. Hash-Based Sync Protocol\n\nTwo nodes sync a shard by comparing root hashes:\n\n- Exchange root hashes for the target shard.\n- If hashes match, the shard is in sync \u2014 done.\n- If hashes differ, walk both trees simultaneously from root to leaves, descending only into subtrees where hashes differ.\n- For each differing subtree, the source node sends the missing content-addressed nodes to the target.\n- The target applies the received nodes to its local node store and computes the merged root.\n\nThis is a pull model: the target initiates sync and pulls missing nodes from the source. The source does not need to track what the target has \u2014 the hash comparison determines the delta at sync time.\n\nThe sync operates per-shard. Each shard's tree syncs independently, matching the actor-per-shard model. The shard-level sync message is routed through beamr's existing distribution connection manager.\n\n2. Consistency Model\n\nEventual consistency by default: nodes sync asynchronously at configurable intervals. Each node accepts writes independently to its local shards. Sync propagates changes lazily.\n\nStrong consistency per-operation: for operations that require it, the caller can request synchronous sync \u2014 the write is not acknowledged until a quorum of nodes has the data. This is implemented by waiting for sync acknowledgments from N/2+1 nodes before returning.\n\nConflict resolution during sync uses the same policies as the branching cluster's merge: LWW, vector-clock, or custom merge function. A sync that discovers divergence (both nodes wrote to the same key) is a merge, not a replication.\n\n3. Node Discovery and Topology\n\nBuilt on beamr's distribution protocol (Phase 3, B-112 through B-125). Haematite does not implement its own node discovery \u2014 it uses beamr's existing node connection manager, challenge-response handshake, and per-connection atom cache.\n\nThe sync topology is configurable: full-mesh (every node syncs with every other), ring (each node syncs with its successor), or custom (explicit sync pairs). The topology determines sync patterns but not correctness \u2014 any topology converges given enough sync rounds.\n\nShard ownership in a distributed deployment: each node hosts all shards (full replicas) or a subset (partitioned). Full-replica mode prioritises availability; partitioned mode prioritises storage efficiency. The initial implementation supports full-replica mode only.",
+  "principles": [
+    {
+      "id": "P1",
+      "text": "Sync is structural, not log-based. Two nodes sync by comparing content-addressed hashes and exchanging missing nodes. No replication log, no WAL shipping, no primary-replica relationship."
+    },
+    {
+      "id": "P2",
+      "text": "Sync cost is proportional to differences. Two databases that share 99% of their data exchange only the 1% that differs. Hash comparison prunes identical subtrees."
+    },
+    {
+      "id": "P3",
+      "text": "Any node can sync with any node. There is no designated primary. Every node is a full participant that can both send and receive data."
+    },
+    {
+      "id": "P4",
+      "text": "Divergence is merge, not conflict. When two nodes have independently written to the same key, sync merges them using the same conflict resolution policies as the branching cluster."
+    },
+    {
+      "id": "P5",
+      "text": "Distribution builds on beamr. Node discovery, connection management, and message routing use beamr's existing distribution protocol. Haematite adds the sync payload, not the transport."
+    }
+  ],
+  "decisions": [
+    "ADR-001"
+  ],
+  "goals": [
+    "Two haematite nodes can sync a shard by comparing root hashes and exchanging only the differing content-addressed nodes.",
+    "Sync between two nodes that share 99% of their data transfers only the differing 1%.",
+    "Eventual consistency mode propagates writes between nodes at configurable intervals without blocking the write path.",
+    "Strong consistency mode waits for quorum acknowledgment before returning from a write operation.",
+    "Divergent writes (both nodes wrote to the same key independently) are resolved using the configured conflict resolution policy.",
+    "Sync operates per-shard and uses beamr's existing distribution connections \u2014 no separate transport."
+  ],
+  "non_goals": [
+    {
+      "text": "Partitioned shard mode (subset of shards per node)",
+      "reason": "Initial implementation is full-replica only. Partitioned mode requires shard migration and consistent hashing, deferred to a future phase."
+    },
+    {
+      "text": "Custom node discovery or gossip protocol",
+      "reason": "beamr's distribution protocol handles node discovery and connection management. Haematite does not implement a separate discovery layer."
+    },
+    {
+      "text": "Automatic failover or leader election",
+      "reason": "The peer-to-peer model has no leader. Application-level routing decides which node to query. Automatic failover is an application concern."
+    },
+    {
+      "text": "Cross-datacenter optimisations",
+      "reason": "WAN-specific compression, batching, and bandwidth management are deferred. The sync protocol works over any beamr distribution connection."
+    },
+    {
+      "text": "Dynamic resharding across nodes",
+      "reason": "Shard count is fixed at creation per ADR-004. Resharding across distributed nodes is deferred."
+    }
+  ],
+  "structure": [
+    {
+      "path": "crates/haematite/src/lib.rs",
+      "note": "Crate root \u2014 pre-existing, modified to re-export distribution module",
+      "brief": ""
+    },
+    {
+      "path": "crates/haematite/src/sync/mod.rs",
+      "note": "Sync module root \u2014 pub mod declarations only",
+      "brief": "DIST-001"
+    },
+    {
+      "path": "crates/haematite/src/sync/protocol.rs",
+      "note": "Hash-based sync protocol: root hash exchange, tree walk, node transfer",
+      "brief": "DIST-001"
+    },
+    {
+      "path": "crates/haematite/src/sync/pull.rs",
+      "note": "Pull sync: target initiates, compares hashes, requests missing nodes",
+      "brief": "DIST-001"
+    },
+    {
+      "path": "crates/haematite/src/sync/push.rs",
+      "note": "Push sync: source responds to pull requests, sends missing nodes",
+      "brief": "DIST-001"
+    },
+    {
+      "path": "crates/haematite/src/sync/merge.rs",
+      "note": "Sync-time merge: apply received nodes, resolve divergence using conflict policies",
+      "brief": "DIST-002"
+    },
+    {
+      "path": "crates/haematite/src/sync/consistency.rs",
+      "note": "Consistency modes: eventual (async interval) and strong (quorum wait)",
+      "brief": "DIST-002"
+    },
+    {
+      "path": "crates/haematite/src/sync/topology.rs",
+      "note": "Sync topology configuration: full-mesh, ring, custom pairs",
+      "brief": "DIST-003"
+    },
+    {
+      "path": "crates/haematite/src/sync/scheduler.rs",
+      "note": "Sync scheduler: periodic sync triggers based on topology and interval",
+      "brief": "DIST-003"
+    }
+  ],
+  "inventory": [],
+  "constraints": [
+    {
+      "id": "CN1",
+      "text": "Sync must transfer only content-addressed nodes that the target does not have. Full database copies on sync are a correctness bug."
+    },
+    {
+      "id": "CN2",
+      "text": "Sync must operate per-shard. A sync on shard 5 must not block or affect shards 0-4 and 6-N."
+    },
+    {
+      "id": "CN3",
+      "text": "Strong consistency mode must wait for quorum (N/2+1) acknowledgments before returning. Returning early is a durability violation."
+    },
+    {
+      "id": "CN4",
+      "text": "Divergent writes must be resolved by the configured conflict resolution policy, never silently dropped."
+    },
+    {
+      "id": "CN5",
+      "text": "Sync must use beamr's existing distribution connections. No separate TCP connections or custom transport."
+    },
+    {
+      "id": "CN6",
+      "text": "A sync failure (network partition, node crash mid-sync) must not corrupt either node's local state. Partial syncs are safe to retry."
+    }
+  ]
+}
