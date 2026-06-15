@@ -1,5 +1,8 @@
-pub mod node;
 pub mod boundary;
 pub mod cursor;
-pub mod mutate;
 pub mod diff;
+pub mod mutate;
+pub mod node;
+
+pub use boundary::BoundaryDetector;
+pub use node::{Hash, InternalNode, LeafNode, Node, NodeError};

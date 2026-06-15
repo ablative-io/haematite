@@ -10,7 +10,7 @@ authors = ["Tom Whiting <tom@ablative.com.au>"]
 [dependencies]
 blake3 = "1"
 zstd = "0.13"
-beamr = { version = "0.6.3", path = "../../../beamr/crates/beamr" }
+beamr = "0.6.3"
 
 [lints.rust]
 unsafe_code = "forbid"
