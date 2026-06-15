@@ -1,6 +1,7 @@
 {
   "project": "haematite",
   "updated": "2026-06-13",
+  "repo_url": "https://github.com/ablative-io/haematite.git",
   "items": [
     {
       "id": "RM-001",
@@ -16,7 +17,10 @@
       },
       "links": {
         "cluster": "core",
-        "decisions": ["ADR-001", "ADR-002"],
+        "decisions": [
+          "ADR-001",
+          "ADR-002"
+        ],
         "briefs": [],
         "commits": []
       },
@@ -37,11 +41,15 @@
       },
       "links": {
         "cluster": "core",
-        "decisions": ["ADR-003"],
+        "decisions": [
+          "ADR-003"
+        ],
         "briefs": [],
         "commits": []
       },
-      "depends_on": ["RM-001"],
+      "depends_on": [
+        "RM-001"
+      ],
       "notes": ""
     },
     {
@@ -54,15 +62,20 @@
         "requested_by": "Bono",
         "date": "2026-06-13",
         "quote": "",
-        "context": "The fundamental architecture decision. BEAM's actor model eliminates the single-writer lock problem that every embedded database has. Each shard is a single-writer process — no locks needed because there is no shared mutable state."
+        "context": "The fundamental architecture decision. BEAM's actor model eliminates the single-writer lock problem that every embedded database has. Each shard is a single-writer process \u2014 no locks needed because there is no shared mutable state."
       },
       "links": {
         "cluster": "core",
-        "decisions": ["ADR-004"],
+        "decisions": [
+          "ADR-004"
+        ],
         "briefs": [],
         "commits": []
       },
-      "depends_on": ["RM-001", "RM-002"],
+      "depends_on": [
+        "RM-001",
+        "RM-002"
+      ],
       "notes": ""
     },
     {
@@ -75,15 +88,20 @@
         "requested_by": "Tom",
         "date": "2026-06-13",
         "quote": "why can't you have a database that you're sort of able to function almost like it was a kind of a git repository right",
-        "context": "Tom proposed branchable/graftable databases during the product vision discussion. The content-addressed prolly tree makes this O(1) fork, O(differences) merge — genuinely zero-friction, not bolted-on."
+        "context": "Tom proposed branchable/graftable databases during the product vision discussion. The content-addressed prolly tree makes this O(1) fork, O(differences) merge \u2014 genuinely zero-friction, not bolted-on."
       },
       "links": {
         "cluster": "branching",
-        "decisions": ["ADR-001"],
+        "decisions": [
+          "ADR-001"
+        ],
         "briefs": [],
         "commits": []
       },
-      "depends_on": ["RM-001", "RM-003"],
+      "depends_on": [
+        "RM-001",
+        "RM-003"
+      ],
       "notes": ""
     },
     {
@@ -104,7 +122,9 @@
         "briefs": [],
         "commits": []
       },
-      "depends_on": ["RM-003"],
+      "depends_on": [
+        "RM-003"
+      ],
       "notes": ""
     },
     {
@@ -125,7 +145,10 @@
         "briefs": [],
         "commits": []
       },
-      "depends_on": ["RM-001", "RM-002"],
+      "depends_on": [
+        "RM-001",
+        "RM-002"
+      ],
       "notes": ""
     },
     {
@@ -138,15 +161,20 @@
         "requested_by": "Sir Patick Stewart",
         "date": "2026-06-13",
         "quote": "",
-        "context": "Content-addressed structure enables sync-by-hash-negotiation between arbitrary nodes — no WAL coordination, no replication log management. Same mechanism as git fetch/push applied to a key-value tree."
+        "context": "Content-addressed structure enables sync-by-hash-negotiation between arbitrary nodes \u2014 no WAL coordination, no replication log management. Same mechanism as git fetch/push applied to a key-value tree."
       },
       "links": {
         "cluster": "distribution",
-        "decisions": ["ADR-001"],
+        "decisions": [
+          "ADR-001"
+        ],
         "briefs": [],
         "commits": []
       },
-      "depends_on": ["RM-003", "RM-006"],
+      "depends_on": [
+        "RM-003",
+        "RM-006"
+      ],
       "notes": ""
     },
     {
@@ -167,7 +195,9 @@
         "briefs": [],
         "commits": []
       },
-      "depends_on": ["RM-004"],
+      "depends_on": [
+        "RM-004"
+      ],
       "notes": ""
     },
     {
@@ -188,7 +218,9 @@
         "briefs": [],
         "commits": []
       },
-      "depends_on": ["RM-003"],
+      "depends_on": [
+        "RM-003"
+      ],
       "notes": ""
     },
     {
@@ -209,7 +241,10 @@
         "briefs": [],
         "commits": []
       },
-      "depends_on": ["RM-003", "RM-006"],
+      "depends_on": [
+        "RM-003",
+        "RM-006"
+      ],
       "notes": ""
     }
   ]

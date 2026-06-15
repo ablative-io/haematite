@@ -2,7 +2,7 @@
   "repo_root": "/Users/tom/Developer/ablative/haematite",
   "brief_id": "DIST-001",
   "reviewers": [
-    "Danger Mouse"
+    "Waffles the Terrible"
   ],
   "base_ref": "main",
   "placement": "local",
@@ -341,5 +341,7 @@
   "verify_fix_cap": 3,
   "review_cap": 1,
   "round_backoff_ms": 2000,
-  "review_deadline_ms": 300000
+  "review_deadline_ms": 300000,
+  "workspace_id": "2d5fdd51-1f25-45a4-8f86-4d4c978d1355",
+  "clone_url": "https://github.com/ablative-io/haematite.git"
 }
