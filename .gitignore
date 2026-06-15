@@ -6,3 +6,5 @@
 .DS_Store
 **/.DS_Store
 Cargo.lock
+.meridian/worksites/
+aion.db
