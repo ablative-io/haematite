@@ -6,3 +6,14 @@ members = ["crates/haematite"]
 license = "Apache-2.0"
 repository = "https://github.com/tomWhiting/haematite"
 authors = ["Tom Whiting <tom@ablative.com.au>"]
+
+# Release builds are tuned for WASM binary size (WASM-001 R7, CN3): optimise for
+# size, fold the whole dependency graph with LTO, emit a single codegen unit, and
+# abort on panic to drop unwinding tables. `wasm-opt` is applied on top of this by
+# the `wasm-pack build --release` pipeline to reach the <2MB-gzipped target.
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true

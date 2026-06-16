@@ -1,0 +1,4 @@
+# Proper nouns that appear in prose doc comments and must not be treated as
+# missing-backtick identifiers by clippy::doc_markdown. ".." keeps clippy's
+# built-in defaults.
+doc-valid-idents = ["IndexedDB", "OPFS", "BLAKE3", ".."]

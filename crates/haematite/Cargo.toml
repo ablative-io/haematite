@@ -7,12 +7,59 @@ description = "Content-addressed, branchable, actor-native storage engine"
 repository = "https://github.com/tomWhiting/haematite"
 authors = ["Tom Whiting <tom@ablative.com.au>"]
 
+[features]
+# Browser / edge target. Cfg-gates out filesystem-only code (DiskStore, the
+# native durable WAL) so the crate links against IndexedDB-backed storage and
+# the web-worker runtime instead. See `src/wasm`. (WASM-001 R1, CN1)
+wasm = []
+
 [dependencies]
+# BLAKE3 is shared across native and WASM. The crate selects the portable
+# (non-SIMD) backend automatically on wasm32 and SIMD on native; both produce
+# identical 32-byte hashes, which is what makes hash-based sync portable.
+# (WASM-001 R2, CN2 / ADR-002)
 blake3 = "1"
+lru = "0.12"
+# Pure-Rust zstd. Used by the IndexedDB node codec on every target so the WASM
+# build needs no C toolchain, and its frames are byte-compatible with the C
+# `zstd` crate used by the native DiskStore. (WASM-001 R4 / ADR-006, CN6)
+ruzstd = "0.8"
+
+# Native-only dependencies. None of these compile to wasm32-unknown-unknown
+# (zstd-sys needs a C toolchain, beamr's scheduler needs crossbeam/num_cpus,
+# tempfile needs a real filesystem), so they are excluded from the WASM
+# dependency tree entirely. (WASM-001 R1, CN1)
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 zstd = "0.13"
 beamr = "0.6.4"
-lru = "0.12"
 tempfile = "3"
+
+# WASM-only dependencies: browser bindings for the IndexedDB NodeStore and the
+# web-worker runtime adapter.
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+wasm-bindgen = "0.2"
+wasm-bindgen-futures = "0.4"
+js-sys = "0.3"
+web-sys = { version = "0.3", features = [
+    "DomException",
+    "IdbDatabase",
+    "IdbFactory",
+    "IdbObjectStore",
+    "IdbOpenDbRequest",
+    "IdbRequest",
+    "IdbTransaction",
+    "IdbTransactionMode",
+    "IdbVersionChangeEvent",
+    "Worker",
+    "WorkerGlobalScope",
+    "WorkerOptions",
+    "WorkerType",
+] }
+
+[dev-dependencies]
+# Drives the async IndexedDbStore API to completion in native unit tests, where
+# the in-memory blob backend resolves immediately.
+pollster = "0.4"
 
 [lints.rust]
 unsafe_code = "forbid"
@@ -29,3 +76,7 @@ module_name_repetitions = "allow"
 must_use_candidate = "allow"
 missing_errors_doc = "allow"
 missing_panics_doc = "allow"
+# The IndexedDB store and web-worker runtime are single-threaded: futures are
+# driven on a worker's local event loop via `spawn_local`, never moved across
+# threads, so `Send` is intentionally not required. (WASM-001 R3/R4, CN4)
+future_not_send = "allow"
