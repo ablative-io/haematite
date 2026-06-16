@@ -13,7 +13,7 @@ mod error;
 
 pub use db::Database;
 pub use error::Error;
-pub use store::{DiskStore, MemoryStore, NodeStore, StoreError};
+pub use store::{CacheError, DeleteNode, DiskStore, LruCache, MemoryStore, NodeStore, StoreError};
 pub use tree::{
     BoundaryDetector, Cursor, Hash, InternalNode, LeafNode, Node, NodeError, TreeError,
     batch_mutate, delete, insert,

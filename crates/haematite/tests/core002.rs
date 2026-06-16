@@ -140,7 +140,8 @@ fn cursor_is_shared_lazy_and_debuggable() -> Result<(), Box<dyn Error>> {
 
     let cursor: Cursor<'_, CountingStore> = Cursor::new(&store, root);
     let trait_store: &dyn NodeStore<Error = std::convert::Infallible> = &store;
-    let object_cursor: Cursor<'_, dyn NodeStore<Error = std::convert::Infallible>> = Cursor::new(trait_store, root);
+    let object_cursor: Cursor<'_, dyn NodeStore<Error = std::convert::Infallible>> =
+        Cursor::new(trait_store, root);
 
     assert_eq!(cursor.root_hash(), root);
     assert_eq!(object_cursor.root_hash(), root);
