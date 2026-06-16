@@ -11,6 +11,8 @@ authors = ["Tom Whiting <tom@ablative.com.au>"]
 blake3 = "1"
 zstd = "0.13"
 beamr = "0.6.4"
+lru = "0.12"
+tempfile = "3"
 
 [lints.rust]
 unsafe_code = "forbid"
