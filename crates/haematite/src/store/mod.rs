@@ -5,4 +5,5 @@ pub mod indexeddb;
 pub mod memory;
 pub mod opfs;
 
+pub use disk::{DiskStore, StoreError};
 pub use memory::{MemoryStore, NodeStore};

@@ -1,12 +1,15 @@
 use std::collections::HashMap;
+use std::convert::Infallible;
 use std::fmt::Debug;
 
 use crate::tree::{Hash, Node};
 
 pub trait NodeStore: Debug {
-    fn get(&self, hash: &Hash) -> Option<Node>;
+    type Error: std::error::Error;
 
-    fn put(&mut self, node: &Node) -> Hash;
+    fn get(&self, hash: &Hash) -> Result<Option<Node>, Self::Error>;
+
+    fn put(&mut self, node: &Node) -> Result<Hash, Self::Error>;
 }
 
 #[derive(Debug, Default, Clone)]
@@ -18,25 +21,35 @@ impl MemoryStore {
     pub fn new() -> Self {
         Self::default()
     }
-}
 
-impl NodeStore for MemoryStore {
-    fn get(&self, hash: &Hash) -> Option<Node> {
+    pub fn get(&self, hash: &Hash) -> Option<Node> {
         self.nodes
             .get(hash)
             .and_then(|serialised| Node::deserialise(serialised).ok())
     }
 
-    fn put(&mut self, node: &Node) -> Hash {
+    pub fn put(&mut self, node: &Node) -> Hash {
         let hash = node.hash();
         self.nodes.insert(hash, node.serialise());
         hash
     }
 }
 
+impl NodeStore for MemoryStore {
+    type Error = Infallible;
+
+    fn get(&self, hash: &Hash) -> Result<Option<Node>, Self::Error> {
+        Ok(Self::get(self, hash))
+    }
+
+    fn put(&mut self, node: &Node) -> Result<Hash, Self::Error> {
+        Ok(Self::put(self, node))
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{MemoryStore, NodeStore};
+    use super::MemoryStore;
     use crate::tree::{Hash, LeafNode, Node, NodeError};
 
     fn node() -> Result<Node, NodeError> {
