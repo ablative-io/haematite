@@ -261,7 +261,9 @@ fn store_leaf<S: NodeStore + ?Sized>(
 ) -> Result<ChildRef, TreeError> {
     let separator = first_entry_key(entries.as_slice())?;
     let leaf = LeafNode::new(entries)?;
-    let hash = store.put(&Node::Leaf(leaf)).map_err(|_| TreeError::InvalidNode)?;
+    let hash = store
+        .put(&Node::Leaf(leaf))
+        .map_err(|_| TreeError::InvalidNode)?;
     Ok((separator, hash))
 }
 
@@ -271,7 +273,9 @@ fn store_internal<S: NodeStore + ?Sized>(
 ) -> Result<ChildRef, TreeError> {
     let separator = first_child_key(children.as_slice())?;
     let internal = InternalNode::new(children)?;
-    let hash = store.put(&Node::Internal(internal)).map_err(|_| TreeError::InvalidNode)?;
+    let hash = store
+        .put(&Node::Internal(internal))
+        .map_err(|_| TreeError::InvalidNode)?;
     Ok((separator, hash))
 }
 
@@ -300,7 +304,9 @@ fn store_root_internal<S: NodeStore + ?Sized>(
 ) -> Result<Hash, TreeError> {
     let children = root_children(store, children)?;
     let internal = InternalNode::new(children)?;
-    store.put(&Node::Internal(internal)).map_err(|_| TreeError::InvalidNode)
+    store
+        .put(&Node::Internal(internal))
+        .map_err(|_| TreeError::InvalidNode)
 }
 
 fn root_children<S: NodeStore + ?Sized>(
@@ -384,7 +390,9 @@ fn store_internal_subtree<S: NodeStore + ?Sized>(
 
 fn store_empty_leaf<S: NodeStore + ?Sized>(store: &mut S) -> Result<Hash, TreeError> {
     let leaf = LeafNode::new(Vec::new())?;
-    store.put(&Node::Leaf(leaf)).map_err(|_| TreeError::InvalidNode)
+    store
+        .put(&Node::Leaf(leaf))
+        .map_err(|_| TreeError::InvalidNode)
 }
 
 fn first_entry_key(entries: &[Entry]) -> Result<Vec<u8>, TreeError> {
