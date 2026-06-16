@@ -11,6 +11,10 @@ pub mod wasm;
 mod db;
 mod error;
 
+pub use branch::{
+    CheckoutError, CommitLog, CommitLogEntry, ReadOnlyView, SnapshotEntry, SnapshotError,
+    SnapshotRegistry, Timestamp, checkout, current_timestamp,
+};
 pub use db::Database;
 pub use error::Error;
 pub use store::{CacheError, DeleteNode, DiskStore, LruCache, MemoryStore, NodeStore, StoreError};
