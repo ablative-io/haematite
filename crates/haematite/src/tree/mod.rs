@@ -5,4 +5,6 @@ pub mod mutate;
 pub mod node;
 
 pub use boundary::BoundaryDetector;
+pub use cursor::{Cursor, TreeError};
+pub use mutate::{batch_mutate, delete, insert};
 pub use node::{Hash, InternalNode, LeafNode, Node, NodeError};
