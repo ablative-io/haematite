@@ -19,7 +19,7 @@ pub use db::Database;
 pub use error::Error;
 pub use store::{CacheError, DeleteNode, DiskStore, LruCache, MemoryStore, NodeStore, StoreError};
 pub use tree::{
-    BoundaryDetector, Cursor, Hash, InternalNode, LeafNode, Node, NodeError, TreeError,
+    BoundaryDetector, Cursor, Hash, InternalNode, LeafNode, Node, NodeError, RangeIter, TreeError,
     batch_mutate, delete, insert,
 };
 pub use tree::{DiffEntry, DiffError, diff};

@@ -147,5 +147,13 @@ pub fn write_atomic(path: &Path, bytes: &[u8]) -> Result<(), CodecError> {
     temp_file
         .persist(path)
         .map(drop)
-        .map_err(|error| CodecError::Io(error.error))
+        .map_err(|error| CodecError::Io(error.error))?;
+
+    // The rename above is durable only once the directory entry is flushed.
+    // Without this, a crash after `persist` can leave the new entry unwritten
+    // even though the file contents were synced — the metadata appears empty on
+    // restart. Directory fsync is a harmless no-op on platforms that ignore it.
+    fs::File::open(parent)
+        .and_then(|dir| dir.sync_all())
+        .map_err(CodecError::Io)
 }

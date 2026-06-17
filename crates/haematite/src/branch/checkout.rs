@@ -4,6 +4,13 @@
 //! view reads directly from the content-addressed node store via a [`Cursor`],
 //! with no WAL replay (CN6), and supports `get` (R3) and `range` (R4). Writes
 //! — `put`, `delete`, `commit` — are rejected with [`CheckoutError::ReadOnly`].
+//!
+//! CN6 is enforced structurally: a [`ReadOnlyView`] holds only a [`Cursor`] over
+//! a raw [`NodeStore`], with no reference to a WAL buffer or database head.
+//! Callers must pass the underlying durable node store directly — never a
+//! WAL-overlay or write-buffer wrapper — or the view would observe uncommitted
+//! state. (When CORE-005 lands a real WAL buffer, add an integration test here
+//! asserting a post-checkout WAL write is invisible to the view.)
 
 use std::fmt;
 
@@ -90,6 +97,12 @@ impl<S: NodeStore + ?Sized> ReadOnlyView<'_, S> {
 ///
 /// No WAL replay occurs (CN6): the returned view traverses the content-addressed
 /// node store at the given root hash.
+///
+/// This call does not validate that `root_hash` is present in `store`. If it is
+/// absent, the view is still returned, but the first [`ReadOnlyView::get`] or
+/// [`ReadOnlyView::range`] call reports
+/// [`CheckoutError::Tree(TreeError::MissingNode)`](TreeError::MissingNode). A
+/// missing root is therefore surfaced as an error, never as an empty tree.
 pub const fn checkout<S: NodeStore + ?Sized>(store: &S, root_hash: Hash) -> ReadOnlyView<'_, S> {
     ReadOnlyView {
         cursor: Cursor::new(store, root_hash),
@@ -100,7 +113,7 @@ pub const fn checkout<S: NodeStore + ?Sized>(store: &S, root_hash: Hash) -> Read
 mod tests {
     use super::{CheckoutError, checkout};
     use crate::store::MemoryStore;
-    use crate::tree::{Hash, LeafNode, Node, TreeError, insert};
+    use crate::tree::{Hash, InternalNode, LeafNode, Node, TreeError, insert};
 
     type TestResult = Result<(), TreeError>;
     type Pairs = Vec<(Vec<u8>, Vec<u8>)>;
@@ -190,6 +203,60 @@ mod tests {
             ]
         );
         Ok(())
+    }
+
+    /// Builds a two-leaf tree by hand so range traversal must cross a leaf
+    /// boundary (the public `insert` path only splits after thousands of keys).
+    fn two_leaf_tree(store: &mut MemoryStore) -> Result<Hash, TreeError> {
+        let left = LeafNode::new(vec![
+            (b"a".to_vec(), b"1".to_vec()),
+            (b"b".to_vec(), b"2".to_vec()),
+        ])?;
+        let right = LeafNode::new(vec![
+            (b"m".to_vec(), b"3".to_vec()),
+            (b"n".to_vec(), b"4".to_vec()),
+        ])?;
+        let left_hash = store.put(&Node::Leaf(left));
+        let right_hash = store.put(&Node::Leaf(right));
+        let root = InternalNode::new(vec![
+            (b"a".to_vec(), left_hash),
+            (b"m".to_vec(), right_hash),
+        ])?;
+        Ok(store.put(&Node::Internal(root)))
+    }
+
+    #[test]
+    fn checkout_range_spans_multiple_leaves() -> TestResult {
+        let mut store = MemoryStore::new();
+        let root = two_leaf_tree(&mut store)?;
+
+        let view = checkout(&store, root);
+        // A range from the first leaf into the second must descend, exhaust the
+        // left leaf, pop back to the internal node, and advance to the right.
+        assert_eq!(
+            collect_range(&view, b"a", b"z")?,
+            vec![
+                (b"a".to_vec(), b"1".to_vec()),
+                (b"b".to_vec(), b"2".to_vec()),
+                (b"m".to_vec(), b"3".to_vec()),
+                (b"n".to_vec(), b"4".to_vec()),
+            ]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn checkout_with_missing_root_errors_on_read() {
+        let store = MemoryStore::new();
+        let absent = Hash::from_bytes([0xff; 32]);
+
+        // The view is constructed, but the absent root surfaces as an error on
+        // the first read — never as an empty tree.
+        let view = checkout(&store, absent);
+        assert!(matches!(
+            view.get(b"any"),
+            Err(CheckoutError::Tree(TreeError::MissingNode { .. }))
+        ));
     }
 
     #[test]

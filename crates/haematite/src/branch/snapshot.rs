@@ -2,9 +2,12 @@
 //!
 //! The snapshot registry (R1) maps human-readable names to committed root
 //! hashes and persists across restarts. The commit log (R2) records every
-//! committed root hash in commit order with a timestamp. Snapshot listing
-//! (R5) returns named snapshots with their hashes and timestamps in
-//! chronological order.
+//! committed root hash in commit order with a timestamp. Snapshot listing (R5)
+//! returns named snapshots with their hashes and timestamps in chronological
+//! order.
+//!
+//! Timestamp semantics: an entry's timestamp is *naming time* (when `name` was
+//! called), not the root's commit time (which lives in the [`CommitLog`]).
 
 use std::collections::HashMap;
 use std::fmt;
@@ -21,10 +24,8 @@ pub type Timestamp = u64;
 const REGISTRY_MAGIC: &[u8; 4] = b"HSR1";
 const LOG_MAGIC: &[u8; 4] = b"HCL1";
 
-/// Captures the current wall-clock time as a [`Timestamp`].
-///
-/// A clock reading before the Unix epoch (which a sane host clock never
-/// produces) collapses to `0` rather than panicking.
+/// Captures the current wall-clock time as a [`Timestamp`]. A reading before the
+/// Unix epoch (which a sane host clock never produces) collapses to `0`.
 pub fn current_timestamp() -> Timestamp {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -115,8 +116,7 @@ impl SnapshotRegistry {
         }
     }
 
-    /// Opens (or creates) a registry persisted at `path`, loading any existing
-    /// entries.
+    /// Opens (or creates) a registry persisted at `path`, loading any entries.
     pub fn open<P: AsRef<Path>>(path: P) -> Result<Self, SnapshotError> {
         let path = path.as_ref().to_path_buf();
         let entries = match fs::read(&path) {
@@ -135,7 +135,7 @@ impl SnapshotRegistry {
         })
     }
 
-    /// Binds `name` to `root_hash`, stamped with the current time.
+    /// Binds `name` to `root_hash`, stamped with the current naming time.
     ///
     /// Returns [`SnapshotError::DuplicateName`] if the name is already taken,
     /// leaving the registry unchanged.
@@ -174,7 +174,7 @@ impl SnapshotRegistry {
     }
 
     /// Lists every named snapshot as `(name, root_hash, timestamp)` tuples in
-    /// chronological (naming) order.
+    /// chronological (naming) order; `timestamp` is naming time (see module doc).
     pub fn list_snapshots(&self) -> Vec<(String, Hash, Timestamp)> {
         self.entries
             .iter()
@@ -398,6 +398,18 @@ mod tests {
                 ("second".to_owned(), hash(2), 200),
                 ("third".to_owned(), hash(3), 300),
             ]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn snapshot_timestamp_is_naming_time_not_commit_time() -> Result<(), SnapshotError> {
+        // A long-committed root named now lists with the naming timestamp.
+        let mut registry = SnapshotRegistry::new();
+        registry.name_at("tagged", hash(1), 999)?;
+        assert_eq!(
+            registry.list_snapshots(),
+            vec![("tagged".to_owned(), hash(1), 999)]
         );
         Ok(())
     }
