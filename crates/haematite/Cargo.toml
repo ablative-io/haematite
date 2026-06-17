@@ -9,6 +9,7 @@ authors = ["Tom Whiting <tom@ablative.com.au>"]
 
 [dependencies]
 blake3 = "1"
+crc32fast = "1"
 zstd = "0.13"
 beamr = "0.6.4"
 lru = "0.12"

@@ -19,3 +19,4 @@ pub use tree::{
     batch_mutate, delete, insert,
 };
 pub use tree::{DiffEntry, DiffError, diff};
+pub use wal::{DurableWal, LookupResult, Mutation, WalBuffer, WalError};
