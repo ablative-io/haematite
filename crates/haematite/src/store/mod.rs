@@ -2,6 +2,10 @@ pub mod cache;
 pub mod gc;
 pub mod indexeddb;
 pub mod memory;
+
+// WASM-002: OPFS-backed WAL store (out of scope for WASM-001). Placeholder
+// module; hidden from public docs until implemented.
+#[doc(hidden)]
 pub mod opfs;
 
 // The filesystem-backed node store is native-only: it depends on the C `zstd`

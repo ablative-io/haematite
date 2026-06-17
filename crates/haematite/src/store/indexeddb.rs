@@ -43,8 +43,11 @@ pub trait BlobStore {
     /// if the key is absent.
     async fn load(&self, key: &Hash) -> Result<Option<Vec<u8>>, Self::Error>;
 
-    /// Persist `bytes` under `key`. Callers guarantee `key` is not already
-    /// present, so implementations need not deduplicate.
+    /// Persist `bytes` under `key`. Content addressing makes the bytes for a
+    /// given key immutable, so implementations must be idempotent: storing a key
+    /// that already exists overwrites it with identical bytes and must not error.
+    /// (`IndexedDbStore::put` checks [`contains`](BlobStore::contains) first as
+    /// an optimisation, but that check is not atomic with this write.)
     async fn store(&self, key: &Hash, bytes: Vec<u8>) -> Result<(), Self::Error>;
 
     /// Report whether `key` is already present, used to make writes idempotent
@@ -418,6 +421,33 @@ mod tests {
 
         let result = block_on(store.get(&hash));
         assert!(matches!(result, Err(IndexedDbError::Decompression(_))));
+        Ok(())
+    }
+
+    // Cross-backend portability (CN6): the WASM store's `ruzstd` frames and the
+    // native DiskStore's C `zstd` frames must be mutually decodable, so a node
+    // written on one platform reads on the other without translation. These run
+    // on native, where both encoders are available.
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn ruzstd_frame_decodes_with_native_zstd() -> TestResult {
+        use super::compress_node;
+        let original = repetitive_leaf_node(80)?.serialise();
+        let frame = compress_node(&original);
+        let decoded = zstd::stream::decode_all(frame.as_slice())?;
+        assert_eq!(decoded, original);
+        Ok(())
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn native_zstd_frame_decodes_with_ruzstd() -> TestResult {
+        use super::decompress_node;
+        use std::convert::Infallible;
+        let original = repetitive_leaf_node(80)?.serialise();
+        let frame = zstd::stream::encode_all(original.as_slice(), 0)?;
+        let decoded = decompress_node::<Infallible>(&frame)?;
+        assert_eq!(decoded, original);
         Ok(())
     }
 }

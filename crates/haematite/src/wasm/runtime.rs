@@ -7,13 +7,18 @@
 // parallelism across threads, and `wasm_bindgen_futures::spawn_local` to drive
 // each actor's async IndexedDB work cooperatively on its worker's event loop.
 //
-// This adapter owns the worker pool and the dispatch policy; the shard-actor
-// message protocol itself is layered on top by the shard cluster. Constructing
-// the runtime is the seam that guarantees actors are placed off the main thread.
+// This adapter owns the worker pool, the dispatch policy, and the result/error
+// return path (`spawn_actor` posts to a worker; `set_message_handler` receives
+// what the worker posts back). The shard-actor *message protocol* — the request
+// envelope, response correlation, and serialisation of get/put/range/fork/merge
+// — is deliberately out of scope here and is layered on top by the shard cluster
+// (CORE actor briefs). Constructing the runtime is the seam that guarantees
+// actors are placed off the main thread (R3, C5).
 
 use std::cell::Cell;
 use std::future::Future;
 
+use js_sys::Function;
 use wasm_bindgen::{JsCast, JsValue};
 use web_sys::{Worker, WorkerOptions, WorkerType};
 
@@ -69,6 +74,16 @@ impl WorkerRuntime {
         worker
             .post_message(message)
             .map_err(|error| RuntimeError::from_js("post message", &error))
+    }
+
+    /// Register a handler for messages workers post back to the main thread,
+    /// closing the return path for shard-actor results and errors. The handler
+    /// is a JS function so the shard cluster can decode its own response envelope
+    /// (C5 result/error propagation across the worker boundary).
+    pub fn set_message_handler(&self, handler: &Function) {
+        for worker in &self.workers {
+            worker.set_onmessage(Some(handler));
+        }
     }
 
     fn next_worker(&self) -> Option<&Worker> {

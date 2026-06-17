@@ -114,6 +114,12 @@ fn key_value(hash: &Hash) -> JsValue {
 }
 
 /// Create the object store the first time the database is opened.
+///
+/// Only creates the store when it is genuinely absent. Creating a store that
+/// already exists is the one error worth ignoring; any other failure
+/// (`create_object_store` raising for a wrong transaction context, for example)
+/// is left to propagate by aborting the version-change transaction, which
+/// surfaces through the open request's error event.
 fn install_upgrade_handler(open_request: &IdbOpenDbRequest, store_name: String) {
     let on_upgrade = wasm_bindgen::closure::Closure::once_into_js(move |event: Event| {
         let Some(target) = event.target() else {
@@ -126,8 +132,13 @@ fn install_upgrade_handler(open_request: &IdbOpenDbRequest, store_name: String) 
             return;
         };
         if let Ok(db) = result.dyn_into::<IdbDatabase>() {
-            // Ignored: a concurrent upgrade may have already created the store.
-            let _ = db.create_object_store(&store_name);
+            // Only the "already exists" case is benign, and we detect it
+            // explicitly. If creation genuinely fails the store stays absent, so
+            // the first `object_store` call surfaces it as an `IdbError` rather
+            // than this no-result callback silently masking it.
+            if !db.object_store_names().contains(&store_name) {
+                let _ = db.create_object_store(&store_name);
+            }
         }
     });
     open_request.set_onupgradeneeded(Some(on_upgrade.unchecked_ref()));

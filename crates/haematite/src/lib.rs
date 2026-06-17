@@ -1,3 +1,12 @@
+// The `wasm` feature and the wasm32 target are two sides of the same build:
+// the feature cfg-gates the code, the target cfg-gates the dependencies. Tie
+// them together so a half-configured build fails loudly instead of silently
+// producing a degenerate crate (e.g. no durable storage). (WASM-001 R1, CN1)
+#[cfg(all(target_arch = "wasm32", not(feature = "wasm")))]
+compile_error!("building haematite for wasm32 requires `--features wasm`");
+#[cfg(all(feature = "wasm", not(target_arch = "wasm32")))]
+compile_error!("the `wasm` feature is only valid when targeting wasm32");
+
 pub mod api;
 pub mod branch;
 pub mod shard;

@@ -1,3 +1,7 @@
+// This suite exercises native in-memory APIs and is not built for wasm32, where
+// the wasm.rs suite provides browser-target coverage. (WASM-001 R1)
+#![cfg(not(target_arch = "wasm32"))]
+
 use std::cell::Cell;
 use std::error::Error;
 

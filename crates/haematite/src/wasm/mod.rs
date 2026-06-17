@@ -14,12 +14,16 @@
 
 pub mod detect;
 
-// The runtime adapter binds to `web_sys` worker APIs and only compiles for the
-// browser target.
+// The runtime adapter and JS bindings bind to `web_sys` worker APIs and only
+// compile for the browser target.
+#[cfg(target_arch = "wasm32")]
+pub mod bindings;
 #[cfg(target_arch = "wasm32")]
 pub mod runtime;
 
 // WASM-003: browser transport for hash-based sync (out of scope for WASM-001).
+// Placeholder module; hidden from public docs until implemented.
+#[doc(hidden)]
 pub mod transport;
 
 #[cfg(test)]

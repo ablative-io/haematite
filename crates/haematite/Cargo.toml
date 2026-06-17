@@ -7,6 +7,11 @@ description = "Content-addressed, branchable, actor-native storage engine"
 repository = "https://github.com/tomWhiting/haematite"
 authors = ["Tom Whiting <tom@ablative.com.au>"]
 
+# `cdylib` is the artifact `wasm-pack` links into a `.wasm` module; `rlib` keeps
+# the crate usable as a normal Rust dependency on native. (WASM-001 R7)
+[lib]
+crate-type = ["cdylib", "rlib"]
+
 [features]
 # Browser / edge target. Cfg-gates out filesystem-only code (DiskStore, the
 # native durable WAL) so the crate links against IndexedDB-backed storage and
@@ -42,6 +47,7 @@ wasm-bindgen-futures = "0.4"
 js-sys = "0.3"
 web-sys = { version = "0.3", features = [
     "DomException",
+    "DomStringList",
     "IdbDatabase",
     "IdbFactory",
     "IdbObjectStore",
@@ -50,6 +56,7 @@ web-sys = { version = "0.3", features = [
     "IdbTransaction",
     "IdbTransactionMode",
     "IdbVersionChangeEvent",
+    "MessageEvent",
     "Worker",
     "WorkerGlobalScope",
     "WorkerOptions",
@@ -60,6 +67,14 @@ web-sys = { version = "0.3", features = [
 # Drives the async IndexedDbStore API to completion in native unit tests, where
 # the in-memory blob backend resolves immediately.
 pollster = "0.4"
+
+# Browser-target test harness. Runs `#[wasm_bindgen_test]` cases under
+# `wasm-pack test --headless`, exercising the real wasm32 portable BLAKE3 and the
+# cooperative-future execution model that native `#[test]`s cannot reach.
+# (WASM-001 R2/R3/R4)
+[target.'cfg(target_arch = "wasm32")'.dev-dependencies]
+wasm-bindgen-test = "0.3"
+blake3 = "1"
 
 [lints.rust]
 unsafe_code = "forbid"

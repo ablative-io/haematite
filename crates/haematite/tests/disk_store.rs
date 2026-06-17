@@ -1,3 +1,7 @@
+// The DiskStore is filesystem-backed and native-only; this suite does not apply
+// to the wasm32 target. (WASM-001 R1)
+#![cfg(not(target_arch = "wasm32"))]
+
 use std::fs;
 use std::io;
 use std::thread;
