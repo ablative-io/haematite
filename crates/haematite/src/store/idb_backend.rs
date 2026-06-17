@@ -14,7 +14,7 @@ use js_sys::{Function, Promise, Uint8Array};
 use wasm_bindgen::{JsCast, JsValue};
 use wasm_bindgen_futures::JsFuture;
 use web_sys::{
-    Event, IdbDatabase, IdbObjectStore, IdbOpenDbRequest, IdbRequest, IdbTransaction,
+    Event, IdbDatabase, IdbFactory, IdbObjectStore, IdbOpenDbRequest, IdbRequest, IdbTransaction,
     IdbTransactionMode, WorkerGlobalScope,
 };
 
@@ -36,13 +36,7 @@ impl IdbBlobStore {
     /// Returns an error if called off a web worker, if IndexedDB is unavailable,
     /// or if the open transaction fails.
     pub async fn open(db_name: &str, store_name: &str) -> Result<Self, IdbError> {
-        let scope = js_sys::global()
-            .dyn_into::<WorkerGlobalScope>()
-            .map_err(|_| IdbError::new("IndexedDB store must be opened on a web worker"))?;
-        let factory = scope
-            .indexed_db()
-            .map_err(|error| IdbError::from_js("indexedDB access", &error))?
-            .ok_or_else(|| IdbError::new("indexedDB is not available in this worker"))?;
+        let factory = worker_factory()?;
 
         let open_request = factory
             .open_with_u32(db_name, 1)
@@ -58,6 +52,20 @@ impl IdbBlobStore {
             db,
             store_name: store_name.to_owned(),
         })
+    }
+
+    /// Delete the named database on the current web worker. Deleting an absent
+    /// database is a no-op, so this is safe to call to reset durable state.
+    ///
+    /// # Errors
+    /// Returns an error if called off a web worker, if IndexedDB is unavailable,
+    /// or if the delete request fails.
+    pub async fn delete_database(db_name: &str) -> Result<(), IdbError> {
+        let factory = worker_factory()?;
+        let request = factory
+            .delete_database(db_name)
+            .map_err(|error| IdbError::from_js("delete database", &error))?;
+        await_request(request.unchecked_ref()).await.map(|_| ())
     }
 
     fn object_store(&self, mode: IdbTransactionMode) -> Result<IdbObjectStore, IdbError> {
@@ -108,6 +116,20 @@ impl BlobStore for IdbBlobStore {
     }
 }
 
+/// Obtain the IndexedDB factory from the current web-worker global scope.
+///
+/// Acquiring the factory from `WorkerGlobalScope` (rather than `Window`) is what
+/// pins all IndexedDB work to a worker thread and off the UI thread (R4, CN4).
+fn worker_factory() -> Result<IdbFactory, IdbError> {
+    let scope = js_sys::global()
+        .dyn_into::<WorkerGlobalScope>()
+        .map_err(|_| IdbError::new("IndexedDB store must be opened on a web worker"))?;
+    scope
+        .indexed_db()
+        .map_err(|error| IdbError::from_js("indexedDB access", &error))?
+        .ok_or_else(|| IdbError::new("indexedDB is not available in this worker"))
+}
+
 /// Render a content hash as the string key used in IndexedDB.
 fn key_value(hash: &Hash) -> JsValue {
     JsValue::from_str(&hash.to_string())
@@ -132,12 +154,18 @@ fn install_upgrade_handler(open_request: &IdbOpenDbRequest, store_name: String) 
             return;
         };
         if let Ok(db) = result.dyn_into::<IdbDatabase>() {
-            // Only the "already exists" case is benign, and we detect it
-            // explicitly. If creation genuinely fails the store stays absent, so
-            // the first `object_store` call surfaces it as an `IdbError` rather
-            // than this no-result callback silently masking it.
-            if !db.object_store_names().contains(&store_name) {
-                let _ = db.create_object_store(&store_name);
+            // The benign "already exists" case is excluded by the name check, so
+            // a failure here is genuine. Abort the version-change transaction so
+            // the open request fires `onerror` and the failure surfaces as an
+            // `IdbError`. Swallowing it would let the transaction auto-commit a
+            // database with no object store — a state that never self-heals,
+            // because no later open at the same version re-runs this handler, so
+            // every subsequent operation would fail permanently.
+            if !db.object_store_names().contains(&store_name)
+                && db.create_object_store(&store_name).is_err()
+                && let Some(transaction) = request.transaction()
+            {
+                let _ = transaction.abort();
             }
         }
     });

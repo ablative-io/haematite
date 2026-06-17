@@ -93,21 +93,25 @@ async fn cache_hit_avoids_backend() -> Result<(), JsValue> {
 
 /// The real IndexedDB path: open a database in the worker, write a node, then
 /// read it back through a cold-cache store to force a decode from IndexedDB.
+///
+/// Deletes the database up front so the test is independent of any durable
+/// state left by a previous run — IndexedDB persists across runs in the same
+/// browser profile. The delete runs before any connection is opened, so it
+/// cannot be blocked by an in-flight transaction.
 #[wasm_bindgen_test]
 async fn indexeddb_backend_round_trips_in_worker() -> Result<(), JsValue> {
-    let writer = IndexedDbStore::new(
-        IdbBlobStore::open("haematite-test", "nodes")
-            .await
-            .map_err(to_js)?,
-    )
-    .map_err(to_js)?;
+    const DB_NAME: &str = "haematite-test-roundtrip";
+    IdbBlobStore::delete_database(DB_NAME)
+        .await
+        .map_err(to_js)?;
+
+    let writer = IndexedDbStore::new(IdbBlobStore::open(DB_NAME, "nodes").await.map_err(to_js)?)
+        .map_err(to_js)?;
     let node = leaf(b"browser", b"node")?;
     let hash = writer.put(&node).await.map_err(to_js)?;
 
     let reader = IndexedDbStore::with_cache_capacity(
-        IdbBlobStore::open("haematite-test", "nodes")
-            .await
-            .map_err(to_js)?,
+        IdbBlobStore::open(DB_NAME, "nodes").await.map_err(to_js)?,
         4,
     )
     .map_err(to_js)?;

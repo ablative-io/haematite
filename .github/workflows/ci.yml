@@ -1,0 +1,56 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  native:
+    name: Native gates
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+      - uses: Swatinem/rust-cache@v2
+      - name: fmt
+        run: cargo fmt --all --check
+      - name: clippy
+        run: cargo clippy -p haematite --all-targets -- -D warnings
+      - name: test
+        run: cargo test -p haematite --all-targets
+      - name: git diff --check
+        run: git diff --check
+
+  wasm:
+    name: WASM build, browser tests, size budget
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      # Prebuilt tooling: the wasm-bindgen test runner (version-matched to the
+      # wasm-bindgen dependency) and binaryen for `wasm-opt` in the size gate.
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: wasm-bindgen-cli@0.2.125,binaryen
+      - name: check (wasm)
+        run: cargo check -p haematite --target wasm32-unknown-unknown --features wasm
+      - name: clippy (wasm)
+        run: cargo clippy -p haematite --target wasm32-unknown-unknown --features wasm --all-targets -- -D warnings
+      # Firefox and geckodriver are preinstalled on ubuntu-latest; the runner
+      # auto-detects geckodriver on PATH and drives it headless.
+      - name: wasm-bindgen browser tests (headless Firefox)
+        env:
+          CARGO_TARGET_WASM32_UNKNOWN_UNKNOWN_RUNNER: wasm-bindgen-test-runner
+        run: cargo test -p haematite --target wasm32-unknown-unknown --features wasm --test wasm
+      - name: wasm size budget (<2 MiB gzipped)
+        run: bash scripts/wasm-size-check.sh
