@@ -149,11 +149,29 @@ pub fn write_atomic(path: &Path, bytes: &[u8]) -> Result<(), CodecError> {
         .map(drop)
         .map_err(|error| CodecError::Io(error.error))?;
 
-    // The rename above is durable only once the directory entry is flushed.
-    // Without this, a crash after `persist` can leave the new entry unwritten
-    // even though the file contents were synced — the metadata appears empty on
-    // restart. Directory fsync is a harmless no-op on platforms that ignore it.
+    sync_parent_dir(parent)
+}
+
+/// Flushes the directory entry created by the atomic rename.
+///
+/// The rename is durable only once the directory entry itself is synced: a
+/// synced file with an unsynced directory entry can still vanish on power loss,
+/// leaving the metadata apparently empty on restart.
+///
+/// This is Unix-only. Opening a directory to fsync it requires
+/// `FILE_FLAG_BACKUP_SEMANTICS` on Windows, which `std` does not set — there
+/// `File::open` on a directory hard-errors rather than no-ops, so attempting it
+/// would fail every persist. On non-Unix platforms the directory-entry sync is
+/// therefore skipped; the file contents are still synced via `sync_all` above,
+/// but crash-durability of the directory entry is not guaranteed there.
+#[cfg(unix)]
+fn sync_parent_dir(parent: &Path) -> Result<(), CodecError> {
     fs::File::open(parent)
         .and_then(|dir| dir.sync_all())
         .map_err(CodecError::Io)
+}
+
+#[cfg(not(unix))]
+fn sync_parent_dir(_parent: &Path) -> Result<(), CodecError> {
+    Ok(())
 }

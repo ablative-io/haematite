@@ -257,6 +257,12 @@ mod tests {
             view.get(b"any"),
             Err(CheckoutError::Tree(TreeError::MissingNode { .. }))
         ));
+        // `range` shares the same node loader, so it too errors rather than
+        // yielding an empty iterator over a missing root.
+        assert!(matches!(
+            view.range(b"a", b"z").next(),
+            Some(Err(TreeError::MissingNode { .. }))
+        ));
     }
 
     #[test]
