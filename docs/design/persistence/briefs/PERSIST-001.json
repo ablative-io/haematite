@@ -2,13 +2,31 @@
   "id": "PERSIST-001",
   "cluster": "persistence",
   "title": "Disk node store with zstd compression and LRU cache",
-  "depends_on": ["CORE-001"],
+  "depends_on": [
+    "CORE-001"
+  ],
   "blocked_by": [],
-  "checklist": ["C1", "C2", "C3", "C4", "C5", "C6", "C7", "C8"],
-  "stories": ["S1", "S8", "S9"],
-  "design_anchor": ["ADR-001", "ADR-006"],
-  "purpose": "Deliver the disk-backed NodeStore implementation that persists content-addressed tree nodes with zstd compression and an LRU cache for fast reads. This is the durability layer for the prolly tree — without it, tree nodes exist only in memory.",
-  "task": "Implement DiskStore implementing the NodeStore trait. Nodes are stored as files in a content-addressed directory layout (first 2 hex bytes of hash as directory, remaining as filename). Nodes are compressed with zstd before writing. Reads decompress on load. An LRU cache holds recently-accessed decompressed nodes in memory. Node writes are idempotent — writing a hash that already exists is a no-op. Expose a delete-by-hash method for snapshot pruning coordination. Does not implement WAL durability (PERSIST-002) or crash recovery (PERSIST-003).",
+  "checklist": [
+    "C1",
+    "C2",
+    "C3",
+    "C4",
+    "C5",
+    "C6",
+    "C7",
+    "C8"
+  ],
+  "stories": [
+    "S1",
+    "S8",
+    "S9"
+  ],
+  "design_anchor": [
+    "ADR-001",
+    "ADR-006"
+  ],
+  "purpose": "Deliver the disk-backed NodeStore implementation that persists content-addressed tree nodes with zstd compression and an LRU cache for fast reads. This is the durability layer for the prolly tree \u2014 without it, tree nodes exist only in memory.",
+  "task": "Implement DiskStore implementing the NodeStore trait. Nodes are stored as files in a content-addressed directory layout (first 2 hex bytes of hash as directory, remaining as filename). Nodes are compressed with zstd before writing. Reads decompress on load. An LRU cache holds recently-accessed decompressed nodes in memory. Node writes are idempotent \u2014 writing a hash that already exists is a no-op. Expose a delete-by-hash method for snapshot pruning coordination. Does not implement WAL durability (PERSIST-002) or crash recovery (PERSIST-003).",
   "requirements": [
     {
       "id": "R1",
@@ -21,12 +39,20 @@
         "DiskStore implements Debug"
       ],
       "files": {
-        "create": ["crates/haematite/src/store/disk.rs"],
-        "modify": ["crates/haematite/src/store/mod.rs"],
+        "create": [
+          "crates/haematite/src/store/disk.rs"
+        ],
+        "modify": [
+          "crates/haematite/src/store/mod.rs"
+        ],
         "delete": []
       },
-      "checklist": ["C1"],
-      "stories": ["S1"]
+      "checklist": [
+        "C1"
+      ],
+      "stories": [
+        "S1"
+      ]
     },
     {
       "id": "R2",
@@ -40,11 +66,17 @@
       ],
       "files": {
         "create": [],
-        "modify": ["crates/haematite/src/store/disk.rs"],
+        "modify": [
+          "crates/haematite/src/store/disk.rs"
+        ],
         "delete": []
       },
-      "checklist": ["C2"],
-      "stories": ["S8"]
+      "checklist": [
+        "C2"
+      ],
+      "stories": [
+        "S8"
+      ]
     },
     {
       "id": "R3",
@@ -57,10 +89,14 @@
       ],
       "files": {
         "create": [],
-        "modify": ["crates/haematite/src/store/disk.rs"],
+        "modify": [
+          "crates/haematite/src/store/disk.rs"
+        ],
         "delete": []
       },
-      "checklist": ["C3"],
+      "checklist": [
+        "C3"
+      ],
       "stories": []
     },
     {
@@ -74,17 +110,27 @@
         "A second get on the same hash hits the cache"
       ],
       "files": {
-        "create": ["crates/haematite/src/store/cache.rs"],
-        "modify": ["crates/haematite/src/store/disk.rs", "crates/haematite/src/store/mod.rs"],
+        "create": [
+          "crates/haematite/src/store/cache.rs"
+        ],
+        "modify": [
+          "crates/haematite/src/store/disk.rs",
+          "crates/haematite/src/store/mod.rs"
+        ],
         "delete": []
       },
-      "checklist": ["C4", "C6"],
-      "stories": ["S9"]
+      "checklist": [
+        "C4",
+        "C6"
+      ],
+      "stories": [
+        "S9"
+      ]
     },
     {
       "id": "R5",
       "title": "Idempotent writes",
-      "spec": "WHEN put(node) is called for a hash that already exists on disk, THE SYSTEM SHALL return the hash without writing. THE SYSTEM SHALL NOT error or overwrite — content addressing guarantees the content is identical.",
+      "spec": "WHEN put(node) is called for a hash that already exists on disk, THE SYSTEM SHALL return the hash without writing. THE SYSTEM SHALL NOT error or overwrite \u2014 content addressing guarantees the content is identical.",
       "acceptance": [
         "put(node) twice returns the same hash both times",
         "The second put does not perform a disk write",
@@ -92,16 +138,20 @@
       ],
       "files": {
         "create": [],
-        "modify": ["crates/haematite/src/store/disk.rs"],
+        "modify": [
+          "crates/haematite/src/store/disk.rs"
+        ],
         "delete": []
       },
-      "checklist": ["C5"],
+      "checklist": [
+        "C5"
+      ],
       "stories": []
     },
     {
       "id": "R6",
       "title": "Cache configuration and eviction",
-      "spec": "THE SYSTEM SHALL accept a configurable maximum cache size. WHEN the cache exceeds the maximum, THE SYSTEM SHALL evict the least-recently-used entry. Cache eviction SHALL NOT affect correctness — a miss falls through to disk read.",
+      "spec": "THE SYSTEM SHALL accept a configurable maximum cache size. WHEN the cache exceeds the maximum, THE SYSTEM SHALL evict the least-recently-used entry. Cache eviction SHALL NOT affect correctness \u2014 a miss falls through to disk read.",
       "acceptance": [
         "LruCache::new(max_entries) creates a cache with the given capacity",
         "Inserting beyond capacity evicts the LRU entry",
@@ -110,11 +160,18 @@
       ],
       "files": {
         "create": [],
-        "modify": ["crates/haematite/src/store/cache.rs"],
+        "modify": [
+          "crates/haematite/src/store/cache.rs"
+        ],
         "delete": []
       },
-      "checklist": ["C6", "C7"],
-      "stories": ["S9"]
+      "checklist": [
+        "C6",
+        "C7"
+      ],
+      "stories": [
+        "S9"
+      ]
     },
     {
       "id": "R7",
@@ -127,19 +184,25 @@
         "delete(unknown_hash) returns Ok"
       ],
       "files": {
-        "create": ["crates/haematite/src/store/gc.rs"],
-        "modify": ["crates/haematite/src/store/mod.rs"],
+        "create": [
+          "crates/haematite/src/store/gc.rs"
+        ],
+        "modify": [
+          "crates/haematite/src/store/mod.rs"
+        ],
         "delete": []
       },
-      "checklist": ["C8"],
+      "checklist": [
+        "C8"
+      ],
       "stories": []
     }
   ],
   "boundaries": [
-    "SHALL NOT implement WAL durability — that is PERSIST-002",
-    "SHALL NOT implement crash recovery — that is PERSIST-003",
+    "SHALL NOT implement WAL durability \u2014 that is PERSIST-002",
+    "SHALL NOT implement crash recovery \u2014 that is PERSIST-003",
     "SHALL NOT implement node compression algorithms other than zstd",
-    "SHALL NOT initiate node deletion on its own — deletion is triggered by snapshot pruning (BRANCH-004)"
+    "SHALL NOT initiate node deletion on its own \u2014 deletion is triggered by snapshot pruning (BRANCH-004)"
   ],
   "verification": [
     "cargo check -p haematite succeeds with no errors",
@@ -147,5 +210,27 @@
     "cargo clippy -p haematite produces no errors",
     "grep -r 'unwrap()\\|expect(' crates/haematite/src/store/ --include='*.rs' -l finds no non-test files (excluding memory.rs from CORE-001)",
     "No file in crates/haematite/src/store/ exceeds 500 lines"
-  ]
+  ],
+  "execution": {
+    "status": "landed",
+    "workflow_id": "PERSIST-001",
+    "branch": "stacked-dev-PERSIST-001",
+    "session_id": "stacked-dev-PERSIST-001",
+    "gate": {
+      "fmt": true,
+      "clippy": true,
+      "tests": true,
+      "fix_rounds": 0
+    },
+    "attestation": {
+      "no_panics": true,
+      "no_unsafe": true,
+      "boundaries_respected": true,
+      "tests_pass": true
+    },
+    "review_verdict": "approved",
+    "landed_commit": "",
+    "merged_into": "main",
+    "completed_at": "0"
+  }
 }

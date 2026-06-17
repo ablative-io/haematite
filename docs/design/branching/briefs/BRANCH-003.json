@@ -167,5 +167,27 @@
     "cargo clippy -p haematite produces no errors",
     "grep -r 'unwrap()\\|expect(' crates/haematite/src/branch/ --include='*.rs' -l finds no non-test files",
     "No file in crates/haematite/src/branch/ exceeds 500 lines"
-  ]
+  ],
+  "execution": {
+    "status": "landed",
+    "workflow_id": "BRANCH-003",
+    "branch": "stacked-dev-BRANCH-003",
+    "session_id": "stacked-dev-BRANCH-003",
+    "gate": {
+      "fmt": true,
+      "clippy": true,
+      "tests": true,
+      "fix_rounds": 0
+    },
+    "attestation": {
+      "no_panics": true,
+      "no_unsafe": true,
+      "boundaries_respected": true,
+      "tests_pass": true
+    },
+    "review_verdict": "approved",
+    "landed_commit": "",
+    "merged_into": "main",
+    "completed_at": "0"
+  }
 }
