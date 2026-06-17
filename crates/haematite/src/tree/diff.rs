@@ -31,6 +31,11 @@ pub enum DiffEntry {
 pub enum DiffError {
     /// A hash reachable from one of the roots was absent from the store.
     MissingNode(Hash),
+    /// The store failed to return a node that may well exist — an I/O or
+    /// deserialisation fault, distinct from the node being absent. Carries the
+    /// hash and the underlying error's message; callers should retry rather than
+    /// treat it as data loss.
+    Store { hash: Hash, message: String },
     /// A node decoded into a shape the diff could not interpret.
     InvalidNode,
 }
@@ -39,6 +44,9 @@ impl fmt::Display for DiffError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::MissingNode(hash) => write!(formatter, "missing tree node {hash}"),
+            Self::Store { hash, message } => {
+                write!(formatter, "store failed to load node {hash}: {message}")
+            }
             Self::InvalidNode => write!(formatter, "invalid tree node"),
         }
     }
@@ -360,10 +368,14 @@ fn below_upper(upper: Option<&[u8]>, key: &[u8]) -> bool {
 }
 
 fn load<S: NodeStore>(store: &S, hash: Hash) -> Result<Node, DiffError> {
-    store
-        .get(&hash)
-        .map_err(|_error| DiffError::MissingNode(hash))?
-        .ok_or(DiffError::MissingNode(hash))
+    match store.get(&hash) {
+        Ok(Some(node)) => Ok(node),
+        Ok(None) => Err(DiffError::MissingNode(hash)),
+        Err(error) => Err(DiffError::Store {
+            hash,
+            message: error.to_string(),
+        }),
+    }
 }
 
 #[cfg(test)]

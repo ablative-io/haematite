@@ -55,6 +55,41 @@ impl NodeStore for ObservingStore {
     }
 }
 
+/// A fallible store error, fully present nodes and all.
+#[derive(Debug)]
+struct IoFault;
+
+impl std::fmt::Display for IoFault {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "simulated io fault")
+    }
+}
+
+impl std::error::Error for IoFault {}
+
+/// Wraps a store so `get` returns an I/O-style error for one specific hash that
+/// is otherwise present, exercising the store-error path.
+#[derive(Debug)]
+struct FaultyStore {
+    inner: MemoryStore,
+    fail_on: Hash,
+}
+
+impl NodeStore for FaultyStore {
+    type Error = IoFault;
+
+    fn get(&self, hash: &Hash) -> Result<Option<Node>, Self::Error> {
+        if *hash == self.fail_on {
+            return Err(IoFault);
+        }
+        Ok(self.inner.get(hash))
+    }
+
+    fn put(&mut self, node: &Node) -> Result<Hash, Self::Error> {
+        Ok(self.inner.put(node))
+    }
+}
+
 fn key(index: usize) -> Vec<u8> {
     (index as u32).to_be_bytes().to_vec()
 }
@@ -136,16 +171,75 @@ fn identical_roots_return_empty_without_touching_store() -> TestResult {
     Ok(())
 }
 
-// R2: an absent node hash surfaces as MissingNode.
+// R2: an absent root reports MissingNode for the first hash actually attempted.
 #[test]
-fn missing_node_is_reported() {
+fn missing_root_is_reported() {
     let store = MemoryStore::new();
-    let present = Hash::from_bytes([1; 32]);
-    let absent = Hash::from_bytes([2; 32]);
+    let attempted_root = Hash::from_bytes([1; 32]);
+    let unreached_root = Hash::from_bytes([2; 32]);
+    // Both roots are absent; the left root is loaded first, so it names the error.
     assert_eq!(
-        diff(&store, &present, &absent),
-        Err(DiffError::MissingNode(present))
+        diff(&store, &attempted_root, &unreached_root),
+        Err(DiffError::MissingNode(attempted_root))
     );
+}
+
+// R2: with root_a present but root_b absent, the error names root_b.
+#[test]
+fn missing_second_root_is_reported() -> TestResult {
+    let mut store = MemoryStore::new();
+    let root_a = leaf(&mut store, &[kv(b"a", b"1")])?;
+    let root_b_absent = Hash::from_bytes([9; 32]);
+    assert_eq!(
+        diff(&store, &root_a, &root_b_absent),
+        Err(DiffError::MissingNode(root_b_absent))
+    );
+    Ok(())
+}
+
+// R2: a child hash absent partway through descent names that child, not a root.
+#[test]
+fn missing_child_is_reported() -> TestResult {
+    let mut store = MemoryStore::new();
+    let shared = leaf(&mut store, &[kv(b"a", b"1"), kv(b"b", b"2")])?;
+    let right_b = leaf(&mut store, &[kv(b"m", b"1"), kv(b"n", b"changed")])?;
+    // Hash of a leaf that is deliberately never stored.
+    let absent_child = LeafNode::new(vec![kv(b"m", b"1"), kv(b"n", b"2")])?.hash();
+    let root_a = internal(
+        &mut store,
+        vec![(b"a".to_vec(), shared), (b"m".to_vec(), absent_child)],
+    )?;
+    let root_b = internal(
+        &mut store,
+        vec![(b"a".to_vec(), shared), (b"m".to_vec(), right_b)],
+    )?;
+    // The shared "a" child is skipped; descending the diverging "m" child hits
+    // the absent node.
+    assert_eq!(
+        diff(&store, &root_a, &root_b),
+        Err(DiffError::MissingNode(absent_child))
+    );
+    Ok(())
+}
+
+// R2: a store fault on a node that exists is reported as Store, not MissingNode,
+// so callers can retry instead of treating it as data loss.
+#[test]
+fn store_fault_is_distinct_from_missing_node() -> TestResult {
+    let mut backing = MemoryStore::new();
+    let root_a = leaf(&mut backing, &[kv(b"k", b"old")])?;
+    let root_b = leaf(&mut backing, &[kv(b"k", b"new")])?;
+    let store = FaultyStore {
+        inner: backing,
+        fail_on: root_b,
+    };
+
+    let result = diff(&store, &root_a, &root_b);
+    assert!(
+        matches!(&result, Err(DiffError::Store { hash, .. }) if *hash == root_b),
+        "expected Store error for {root_b}, got {result:?}"
+    );
+    Ok(())
 }
 
 // R2: DiffError is a std::error::Error with Debug + Display.
