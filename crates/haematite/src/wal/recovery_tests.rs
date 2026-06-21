@@ -5,6 +5,9 @@ use crate::wal::entry::{TAG_DELETE, TAG_PUT, WalEntry};
 use crate::wal::{DurableWal, FsyncPolicy};
 use std::path::{Path, PathBuf};
 
+#[path = "recovery_persist_003_tests.rs"]
+mod persist_003;
+
 #[derive(Debug)]
 struct TempWal {
     dir: tempfile::TempDir,
@@ -270,25 +273,6 @@ fn recover_accepts_truncated_tail_after_commit() -> Result<(), WalError> {
 
     assert_eq!(buffer.len(), 1);
     assert_eq!(buffer.get(b"b"), LookupResult::BufferedValue(b"2".to_vec()));
-    Ok(())
-}
-
-#[test]
-fn recover_rejects_corrupt_frame_after_commit() -> Result<(), WalError> {
-    let temp = temp_path("corrupt-after-commit.wal")?;
-    let mut corrupt = entry_frame(&WalEntry::put(b"bad".to_vec(), b"crc".to_vec()));
-    if let Some(byte) = corrupt.last_mut() {
-        *byte ^= 0xff;
-    }
-    let mut bytes = entry_frame(&WalEntry::put(b"a".to_vec(), b"1".to_vec()));
-    bytes.extend_from_slice(&commit_frame(Hash::from_bytes([3; 32])));
-    bytes.extend_from_slice(&corrupt);
-    std::fs::write(temp.path(), bytes)?;
-
-    assert!(matches!(
-        recover_file(temp.path()),
-        Err(WalError::ChecksumMismatch { .. })
-    ));
     Ok(())
 }
 

@@ -62,6 +62,8 @@ pub enum WalError {
     LengthOverflow,
     /// A batched fsync policy must use a non-zero interval.
     InvalidFsyncPolicy { interval: usize },
+    /// A committed root marker names a root hash that is absent from the node store.
+    MissingCommittedRoot { root: Hash },
 }
 
 impl fmt::Display for WalError {
@@ -93,6 +95,10 @@ impl fmt::Display for WalError {
                 formatter,
                 "invalid wal fsync policy: batched interval must be greater than zero, got {interval}"
             ),
+            Self::MissingCommittedRoot { root } => write!(
+                formatter,
+                "wal committed root is missing from the node store: {root}"
+            ),
         }
     }
 }
@@ -107,7 +113,8 @@ impl std::error::Error for WalError {
             | Self::Truncated
             | Self::TrailingBytes { .. }
             | Self::LengthOverflow
-            | Self::InvalidFsyncPolicy { .. } => None,
+            | Self::InvalidFsyncPolicy { .. }
+            | Self::MissingCommittedRoot { .. } => None,
         }
     }
 }
