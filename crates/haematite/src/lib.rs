@@ -25,5 +25,5 @@ pub use tree::{
 pub use tree::{DiffEntry, DiffError, diff};
 pub use wal::{
     DurableWal, FsyncPolicy, LookupResult, Mutation, OperationType, WalBuffer, WalEntry, WalError,
-    WalFileContents,
+    WalFileContents, WalRecovery,
 };
