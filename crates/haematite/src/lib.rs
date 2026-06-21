@@ -17,15 +17,20 @@ pub use branch::{
     Timestamp, checkout, current_timestamp, fork, fork_registered, fork_shards,
     fork_shards_registered,
 };
+
 pub use db::Database;
+
 pub use error::Error;
+
 pub use store::{CacheError, DeleteNode, DiskStore, LruCache, MemoryStore, NodeStore, StoreError};
+
 pub use tree::{
     BoundaryDetector, Cursor, Hash, InternalNode, LeafNode, Node, NodeError, RangeIter, TreeError,
     batch_mutate, delete, insert,
 };
 pub use tree::{DiffEntry, DiffError, diff};
+
 pub use wal::{
     DurableWal, FsyncPolicy, LookupResult, Mutation, OperationType, WalBuffer, WalEntry, WalError,
-    WalFileContents,
+    WalFileContents, WalRecovery,
 };

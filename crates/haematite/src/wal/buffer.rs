@@ -40,6 +40,9 @@ pub enum LookupResult {
     NotBuffered,
 }
 
+pub(crate) const RECOVERY_UNKNOWN_TAG_EXPECTED: u32 = 0xffff_fffe;
+pub(crate) const RECOVERY_MALFORMED_PAYLOAD_EXPECTED: u32 = 0xffff_fffd;
+
 /// Errors raised by the WAL buffer and the durable WAL writer.
 #[derive(Debug)]
 pub enum WalError {
@@ -65,6 +68,14 @@ impl fmt::Display for WalError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Io(error) => write!(formatter, "wal i/o error: {error}"),
+            Self::ChecksumMismatch {
+                expected: RECOVERY_UNKNOWN_TAG_EXPECTED,
+                actual,
+            } => write!(formatter, "wal corruption: unknown tag {actual:#04x}"),
+            Self::ChecksumMismatch {
+                expected: RECOVERY_MALFORMED_PAYLOAD_EXPECTED,
+                ..
+            } => write!(formatter, "wal corruption: malformed payload fields"),
             Self::ChecksumMismatch { expected, actual } => write!(
                 formatter,
                 "wal checksum mismatch: expected {expected:#010x}, got {actual:#010x}"
