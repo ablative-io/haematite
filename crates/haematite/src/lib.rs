@@ -12,8 +12,10 @@ mod db;
 mod error;
 
 pub use branch::{
-    CheckoutError, CommitLog, CommitLogEntry, ReadOnlyView, SnapshotEntry, SnapshotError,
-    SnapshotRegistry, Timestamp, checkout, current_timestamp,
+    BranchError, BranchHandle, BranchRegistry, BranchWalBuffer, CheckoutError, CommitLog,
+    CommitLogEntry, ReadOnlyView, ShardId, SnapshotEntry, SnapshotError, SnapshotRegistry,
+    Timestamp, checkout, current_timestamp, fork, fork_registered, fork_shards,
+    fork_shards_registered,
 };
 pub use db::Database;
 pub use error::Error;
