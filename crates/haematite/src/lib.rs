@@ -23,4 +23,7 @@ pub use tree::{
     batch_mutate, delete, insert,
 };
 pub use tree::{DiffEntry, DiffError, diff};
-pub use wal::{DurableWal, LookupResult, Mutation, WalBuffer, WalError};
+pub use wal::{
+    DurableWal, FsyncPolicy, LookupResult, Mutation, OperationType, WalBuffer, WalEntry, WalError,
+    WalFileContents,
+};

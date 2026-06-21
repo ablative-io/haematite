@@ -49,6 +49,16 @@ pub enum WalError {
     ChecksumMismatch { expected: u32, actual: u32 },
     /// The prolly tree rejected the batch flush during `commit`.
     TreeError(String),
+    /// A WAL frame or entry used an unknown tag byte.
+    InvalidTag { found: u8 },
+    /// Encoded bytes ended before the declared field or frame was complete.
+    Truncated,
+    /// Encoded bytes remained after a complete field, frame, or entry.
+    TrailingBytes { trailing: usize },
+    /// An encoded length cannot fit on this platform or overflowed an offset.
+    LengthOverflow,
+    /// A batched fsync policy must use a non-zero interval.
+    InvalidFsyncPolicy { interval: usize },
 }
 
 impl fmt::Display for WalError {
@@ -60,6 +70,18 @@ impl fmt::Display for WalError {
                 "wal checksum mismatch: expected {expected:#010x}, got {actual:#010x}"
             ),
             Self::TreeError(message) => write!(formatter, "wal tree error: {message}"),
+            Self::InvalidTag { found } => write!(formatter, "invalid wal tag: {found:#04x}"),
+            Self::Truncated => write!(formatter, "wal bytes ended before the frame was complete"),
+            Self::TrailingBytes { trailing } => {
+                write!(formatter, "wal bytes contain {trailing} trailing bytes")
+            }
+            Self::LengthOverflow => {
+                write!(formatter, "encoded wal length cannot fit on this platform")
+            }
+            Self::InvalidFsyncPolicy { interval } => write!(
+                formatter,
+                "invalid wal fsync policy: batched interval must be greater than zero, got {interval}"
+            ),
         }
     }
 }
@@ -68,7 +90,13 @@ impl std::error::Error for WalError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::Io(error) => Some(error),
-            Self::ChecksumMismatch { .. } | Self::TreeError(_) => None,
+            Self::ChecksumMismatch { .. }
+            | Self::TreeError(_)
+            | Self::InvalidTag { .. }
+            | Self::Truncated
+            | Self::TrailingBytes { .. }
+            | Self::LengthOverflow
+            | Self::InvalidFsyncPolicy { .. } => None,
         }
     }
 }
@@ -101,15 +129,18 @@ impl WalBuffer {
     ///
     /// # Durability
     ///
-    /// This is an in-memory operation only. The "durably append before it
-    /// enters the buffer" invariant (R7/C26) is **not** enforced here — the
-    /// type system cannot stop a caller from buffering without a prior
-    /// [`DurableWal::append`]. The caller is responsible for calling
-    /// `DurableWal::append` for this mutation *before* calling `put`. The
-    /// unbypassable combined append-then-buffer cycle is introduced by the
-    /// shard actor (CORE-007); until then this ordering is caller discipline.
+    /// This is an in-memory operation only. The "durably append before it enters
+    /// the buffer" invariant (R3/C11) is **not** enforced here — the type system
+    /// cannot stop a caller from buffering without first writing the matching
+    /// [`WalEntry`] via [`DurableWal::append`] (or using
+    /// [`DurableWal::append_mutation`]). The caller is responsible for making
+    /// that durable append *before* calling `put`. The unbypassable combined
+    /// append-then-buffer cycle is introduced by the shard actor; until then
+    /// this ordering is caller discipline.
     ///
     /// [`DurableWal::append`]: super::durable::DurableWal::append
+    /// [`DurableWal::append_mutation`]: super::durable::DurableWal::append_mutation
+    /// [`WalEntry`]: super::entry::WalEntry
     pub fn put<K: AsRef<[u8]>, V: AsRef<[u8]>>(&mut self, key: K, value: V) {
         let key = key.as_ref().to_vec();
         self.mutations.insert(
@@ -126,11 +157,14 @@ impl WalBuffer {
     /// # Durability
     ///
     /// Like [`put`](Self::put), this is in-memory only. The caller must call
-    /// [`DurableWal::append`] for this deletion *before* calling `delete`; the
-    /// ordering is caller discipline until CORE-007 introduces the combined
-    /// append-then-buffer commit cycle.
+    /// [`DurableWal::append`] with the corresponding delete [`WalEntry`] (or
+    /// [`DurableWal::append_mutation`]) *before* calling `delete`; the ordering
+    /// is caller discipline until the shard actor introduces the combined
+    /// append-then-buffer acknowledgement cycle.
     ///
     /// [`DurableWal::append`]: super::durable::DurableWal::append
+    /// [`DurableWal::append_mutation`]: super::durable::DurableWal::append_mutation
+    /// [`WalEntry`]: super::entry::WalEntry
     pub fn delete<K: AsRef<[u8]>>(&mut self, key: K) {
         let key = key.as_ref().to_vec();
         self.mutations.insert(key.clone(), Mutation::Delete { key });
@@ -411,7 +445,8 @@ mod tests {
 
         impl NodeStore for MissingRootStore {
             type Error = NeverHappens;
-            fn get(&self, _hash: &Hash) -> Result<Option<Node>, Self::Error> {
+            fn get(&self, hash: &Hash) -> Result<Option<Node>, Self::Error> {
+                debug_assert_eq!(hash.as_bytes().len(), 32);
                 Ok(None)
             }
             fn put(&mut self, node: &Node) -> Result<Hash, Self::Error> {
