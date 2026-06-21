@@ -9,8 +9,10 @@ pub mod registry;
 pub mod snapshot;
 
 pub use checkout::{CheckoutError, ReadOnlyView, checkout};
+pub use conflict::{ConflictError, ConflictInput, ConflictPolicy, CustomMergeFn};
 pub use fork::{fork, fork_registered, fork_shards, fork_shards_registered};
 pub use handle::{BranchError, BranchHandle, BranchWalBuffer, ShardId};
+pub use merge::{MergeError, merge};
 pub use registry::BranchRegistry;
 pub use snapshot::{
     CommitLog, CommitLogEntry, SnapshotEntry, SnapshotError, SnapshotRegistry, Timestamp,
