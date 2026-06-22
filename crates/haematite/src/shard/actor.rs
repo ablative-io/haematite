@@ -1,5 +1,10 @@
 // CORE-007: Shard actor — owns tree + WAL buffer, handles get/put/delete/commit messages
 
+pub mod handle;
+pub mod native;
+
+pub use handle::{RangeItem, ShardError, ShardHandle};
+
 use crate::store::NodeStore;
 use crate::tree::{Cursor, Hash, LeafNode, Node, batch_mutate};
 use crate::wal::{DurableWal, LookupResult, Mutation, RecoveredWal, WalBuffer, WalError};
@@ -146,7 +151,11 @@ fn tree_error(error: impl std::fmt::Display) -> WalError {
 }
 
 #[cfg(test)]
-mod tests {
+#[path = "actor/tests.rs"]
+mod tests;
+
+#[cfg(test)]
+mod storage_tests {
     use super::ShardActor;
     use crate::store::MemoryStore;
     use crate::tree::{Hash, LeafNode, Node, batch_mutate};
