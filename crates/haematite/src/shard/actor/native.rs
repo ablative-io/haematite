@@ -291,3 +291,125 @@ const fn assert_disk_store_send() {
 
 #[cfg(test)]
 const _: () = assert_disk_store_send();
+
+#[cfg(test)]
+mod boot_failure_tests {
+    use super::ShardNativeHandler;
+    use crate::shard::actor::handle::{
+        CommandQueue, RangeItem, ShardCommand, ShardCommandKind, ShardError,
+    };
+    use beamr::NativeOutcome;
+    use beamr::process::ExitReason;
+    use std::collections::VecDeque;
+    use std::error::Error;
+    use std::sync::mpsc;
+    use std::sync::{Arc, Mutex};
+
+    /// Build a handler whose boot DETERMINISTICALLY fails: the store path is a
+    /// regular file, so `DiskStore::new` errors and the handler boots into the
+    /// sentinel (`state = None`, `startup_error = Some`). The `TempDir` is
+    /// returned so the caller keeps it alive.
+    fn boot_failed_handler(
+        commands: CommandQueue,
+    ) -> Result<(ShardNativeHandler, tempfile::TempDir), Box<dyn Error>> {
+        let dir = tempfile::tempdir()?;
+        let store_path = dir.path().join("store-is-a-file");
+        std::fs::write(&store_path, b"not a directory")?;
+        let wal_path = dir.path().join("shard.wal");
+        let handler = ShardNativeHandler::build(&store_path, &wal_path, commands);
+        Ok((handler, dir))
+    }
+
+    /// The queued-at-boot drain path: a command already on the queue when a
+    /// boot-failed shard runs its sentinel slice must fail fast with
+    /// [`ShardError::Spawn`] (never hang, never a storage error), the sentinel
+    /// must stop the process, and the queue must be fully drained. One command of
+    /// EACH kind exercises every `reply_startup_error` arm. This covers the path
+    /// that is racy to force through the live scheduler (the host runs the first
+    /// slice before an external command can be enqueued), so it is asserted here
+    /// against the sentinel directly.
+    #[test]
+    fn fail_startup_drains_every_command_kind_with_spawn_then_stops() -> Result<(), Box<dyn Error>>
+    {
+        let commands: CommandQueue = Arc::new(Mutex::new(VecDeque::new()));
+        let (get_tx, get_rx) = mpsc::sync_channel(1);
+        let (put_tx, put_rx) = mpsc::sync_channel(1);
+        let (del_tx, del_rx) = mpsc::sync_channel(1);
+        let (commit_tx, commit_rx) = mpsc::sync_channel(1);
+        let (range_tx, range_rx) = mpsc::sync_channel::<Result<Vec<RangeItem>, ShardError>>(1);
+        {
+            let mut queue = commands.lock().map_err(|_| "queue poisoned")?;
+            queue.push_back(ShardCommand {
+                id: 1,
+                kind: ShardCommandKind::Get {
+                    key: b"k".to_vec(),
+                    reply: get_tx,
+                },
+            });
+            queue.push_back(ShardCommand {
+                id: 2,
+                kind: ShardCommandKind::Put {
+                    key: b"k".to_vec(),
+                    value: b"v".to_vec(),
+                    reply: put_tx,
+                },
+            });
+            queue.push_back(ShardCommand {
+                id: 3,
+                kind: ShardCommandKind::Delete {
+                    key: b"k".to_vec(),
+                    reply: del_tx,
+                },
+            });
+            queue.push_back(ShardCommand {
+                id: 4,
+                kind: ShardCommandKind::Commit { reply: commit_tx },
+            });
+            queue.push_back(ShardCommand {
+                id: 5,
+                kind: ShardCommandKind::Range {
+                    from: b"a".to_vec(),
+                    to: b"z".to_vec(),
+                    reply: range_tx,
+                },
+            });
+        }
+
+        let (handler, _dir) = boot_failed_handler(Arc::clone(&commands))?;
+        assert!(handler.state.is_none(), "boot must have failed");
+        assert!(handler.startup_error.is_some(), "startup_error must be set");
+
+        let outcome = handler.fail_startup();
+
+        assert!(
+            matches!(get_rx.try_recv(), Ok(Err(ShardError::Spawn(_)))),
+            "Get arm"
+        );
+        assert!(
+            matches!(put_rx.try_recv(), Ok(Err(ShardError::Spawn(_)))),
+            "Put arm"
+        );
+        assert!(
+            matches!(del_rx.try_recv(), Ok(Err(ShardError::Spawn(_)))),
+            "Delete arm"
+        );
+        assert!(
+            matches!(commit_rx.try_recv(), Ok(Err(ShardError::Spawn(_)))),
+            "Commit arm"
+        );
+        assert!(
+            matches!(range_rx.try_recv(), Ok(Err(ShardError::Spawn(_)))),
+            "Range arm"
+        );
+
+        assert!(
+            matches!(outcome, NativeOutcome::Stop(ExitReason::Error)),
+            "sentinel stops"
+        );
+        assert!(
+            commands.lock().map_err(|_| "queue poisoned")?.is_empty(),
+            "queue fully drained"
+        );
+        Ok(())
+    }
+}

@@ -290,25 +290,18 @@ fn boot_failure_keeps_scheduler_usable_and_fails_the_command() -> Result<(), Box
     // return a value, and the scheduler must not panic (it stays usable: a
     // second spawn below still works).
     //
-    // The exact error KIND is timing-dependent and NOT deterministically the
-    // `ShardError::Spawn` documented for a *queued-at-boot* command. The
-    // `Spawn`-draining path in `ShardNativeHandler::fail_startup` only fires for
-    // a command already on the queue when the sentinel runs its first slice. But
-    // beamr schedules a freshly spawned native process to run IMMEDIATELY
-    // (`spawn_native` pushes it onto the woken set and notifies the condvar), so
-    // the sentinel's first slice runs with an empty queue and stops the process
-    // BEFORE any externally-issued command can be enqueued. From the public
-    // `ShardHandle` API there is no seam to pre-load a command onto the queue
-    // ahead of that first slice, so the `Spawn` path is not deterministically
-    // reachable from outside. In practice this caller observes `ReplyTimeout`
-    // (the wake is accepted against the just-stopped pid but no further slice
-    // drains the command). We therefore assert the contract that IS
-    // deterministic: a boot failure never yields a successful command.
-    //
-    // TODO(CORE-008 / beamr seam): once a router/supervisor owns spawn and can
-    // enqueue a command before the process's first slice (or beamr exposes a
-    // "spawn suspended" mode), add a test that deterministically exercises the
-    // `ShardError::Spawn` queued-at-boot drain path in `fail_startup`.
+    // The exact error KIND a caller observes here is genuinely timing-dependent,
+    // because beamr schedules a freshly spawned native process to run IMMEDIATELY
+    // (`spawn_native` pushes it onto the woken set and notifies the condvar): the
+    // sentinel's first slice usually runs and stops the process before this
+    // external command lands, so the caller sees `ReplyTimeout` or
+    // `ActorUnavailable`; if the command does land first it is drained with
+    // `Spawn`. That is real scheduler nondeterminism, not a test gap — so here we
+    // assert the contract that holds in EVERY interleaving: a boot failure always
+    // fails the command (never Ok, never a storage error, never the scheduler
+    // panicking). The `Spawn` queued-at-boot drain path itself is covered
+    // deterministically by `native::boot_failure_tests` (it pre-seeds the queue
+    // and drives the sentinel directly).
     let result = handle.get(b"any-key".to_vec(), TIMEOUT);
     assert!(
         result.is_err(),
