@@ -11,6 +11,15 @@
 //! Lock discipline (spec Landmine 4): the command-queue mutex is held ONLY for
 //! the `pop_front` in [`lock_queue`] / [`pop_command`]; it is released before
 //! any storage op and is never held across a [`NativeOutcome`] return.
+//!
+//! Wake-atom constraint: the handler never inspects the wake atom's VALUE — a
+//! received mailbox token (`ctx.recv().is_some()`) simply means "drain one
+//! command". That is WHY the host can intern the wake atom from a fresh local
+//! `AtomTable` (see `ShardHandle::spawn`) without sharing the scheduler's table.
+//! WARNING: if future code ever pattern-matches on the atom value in the mailbox
+//! (e.g. to distinguish a wake from an exit signal), it MUST intern that atom
+//! from the scheduler's own atom table, not a fresh local one — a fresh-table
+//! atom has a different id and the match would silently fail.
 
 use std::cmp::Ordering;
 use std::collections::VecDeque;

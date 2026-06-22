@@ -13,9 +13,10 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use beamr::module::ModuleRegistry;
+use beamr::process::ExitReason;
 use beamr::scheduler::{Scheduler, SchedulerConfig};
 
-use super::handle::{RangeItem, ShardHandle};
+use super::handle::{RangeItem, ShardError, ShardHandle};
 use crate::store::DiskStore;
 use crate::tree::{Hash, LeafNode, Node};
 use crate::wal::DurableWal;
@@ -241,8 +242,15 @@ fn respawn_replays_wal_and_leaves_sibling_running() -> Result<(), Box<dyn Error>
         Some(committed_root)
     );
 
-    // Model a crash + manual re-spawn against the same paths. The original
-    // handle's pid is now stale; the re-spawned process recovers from the WAL.
+    // Model a real crash: kill the "failed" process via the scheduler's
+    // embedding-side exit signal (`erlang:exit/2` with reason Kill) before
+    // re-spawning, so the test exercises crash recovery rather than two live
+    // processes sharing one WAL path. `caller_pid` is unused by the facility, so
+    // 0 is a fine sender.
+    scheduler.exit_signal(0, failed.handle.pid(), ExitReason::Kill)?;
+
+    // Re-spawn a fresh native process against the SAME paths. The original
+    // handle's pid is now dead; the re-spawned process recovers from the WAL.
     let recovered = failed.respawn(&scheduler)?;
     assert_ne!(recovered.pid(), failed.handle.pid());
 
@@ -256,6 +264,73 @@ fn respawn_replays_wal_and_leaves_sibling_running() -> Result<(), Box<dyn Error>
     // (post-commit) WAL entry.
     assert_eq!(get(&recovered, b"buffered")?, Some(b"wal-value".to_vec()));
     assert_eq!(get(&recovered, b"committed")?, Some(b"tree-value".to_vec()));
+    scheduler.shutdown();
+    Ok(())
+}
+
+#[test]
+fn boot_failure_keeps_scheduler_usable_and_fails_the_command() -> Result<(), Box<dyn Error>> {
+    let scheduler = test_scheduler()?;
+    let dir = tempfile::tempdir()?;
+
+    // Force a deterministic boot failure: `DiskStore::new` -> `ensure_directory`
+    // rejects a path that exists but is NOT a directory
+    // (StoreError::NotADirectory). Placing a regular file where the store dir
+    // should be makes `boot` fail, so the process comes up as the
+    // failed-startup sentinel (state = None, startup_error = Some).
+    let store_dir = dir.path().join("not-a-dir.store");
+    std::fs::write(&store_dir, b"i am a file, not a directory")?;
+    let wal_path = dir.path().join("boot-fail.wal");
+
+    // `spawn` itself SUCCEEDS: the scheduler accepts the process; only `boot`
+    // failed. A boot failure is never reported from `spawn`, only per-command.
+    let handle = ShardHandle::spawn(Arc::clone(&scheduler), store_dir, wal_path)?;
+
+    // A command issued against the booting-then-failing process must FAIL, never
+    // return a value, and the scheduler must not panic (it stays usable: a
+    // second spawn below still works).
+    //
+    // The exact error KIND is timing-dependent and NOT deterministically the
+    // `ShardError::Spawn` documented for a *queued-at-boot* command. The
+    // `Spawn`-draining path in `ShardNativeHandler::fail_startup` only fires for
+    // a command already on the queue when the sentinel runs its first slice. But
+    // beamr schedules a freshly spawned native process to run IMMEDIATELY
+    // (`spawn_native` pushes it onto the woken set and notifies the condvar), so
+    // the sentinel's first slice runs with an empty queue and stops the process
+    // BEFORE any externally-issued command can be enqueued. From the public
+    // `ShardHandle` API there is no seam to pre-load a command onto the queue
+    // ahead of that first slice, so the `Spawn` path is not deterministically
+    // reachable from outside. In practice this caller observes `ReplyTimeout`
+    // (the wake is accepted against the just-stopped pid but no further slice
+    // drains the command). We therefore assert the contract that IS
+    // deterministic: a boot failure never yields a successful command.
+    //
+    // TODO(CORE-008 / beamr seam): once a router/supervisor owns spawn and can
+    // enqueue a command before the process's first slice (or beamr exposes a
+    // "spawn suspended" mode), add a test that deterministically exercises the
+    // `ShardError::Spawn` queued-at-boot drain path in `fail_startup`.
+    let result = handle.get(b"any-key".to_vec(), TIMEOUT);
+    assert!(
+        result.is_err(),
+        "a command against a boot-failed shard must error, got Ok: {result:?}"
+    );
+    assert!(
+        matches!(
+            &result,
+            Err(ShardError::ReplyTimeout { .. }
+                | ShardError::ActorUnavailable { .. }
+                | ShardError::Spawn(_))
+        ),
+        "boot-failure command should fail as ReplyTimeout / ActorUnavailable / \
+         Spawn (never ReplyDisconnected or a storage error), got {result:?}"
+    );
+
+    // The scheduler survived the boot failure: a healthy shard still spawns and
+    // serves on it.
+    let healthy = TestShard::spawn(&scheduler, "healthy-after-boot-fail")?;
+    put(&healthy.handle, b"k", b"v")?;
+    assert_eq!(get(&healthy.handle, b"k")?, Some(b"v".to_vec()));
+
     scheduler.shutdown();
     Ok(())
 }

@@ -178,8 +178,29 @@ impl ShardHandle {
     /// The shard opens its [`crate::store::DiskStore`] at `store_dir` and its
     /// durable WAL at `wal_path`, recovering any committed root and replayed
     /// buffer before it accepts commands. A startup failure does not panic the
-    /// scheduler: the process boots into a sentinel that stops cleanly on its
-    /// first slice, and callers observe [`ShardError::ReplyDisconnected`].
+    /// scheduler: the process boots into a sentinel that, on its first slice,
+    /// drains every queued command with the boot error and then stops cleanly.
+    ///
+    /// Because `spawn` only fails if the *scheduler* refuses to spawn (see the
+    /// `# Errors` section), a boot failure (bad `store_dir`/`wal_path`, failed
+    /// WAL recovery) is reported per-command, not from `spawn` itself. The
+    /// per-command error kind depends on WHEN the command reaches the sentinel:
+    /// - A command already on the queue when the sentinel runs its first slice
+    ///   is drained by [`ShardNativeHandler::fail_startup`](super::native) with
+    ///   [`ShardError::Spawn`] carrying the boot-error message.
+    /// - A command enqueued *after* the sentinel has already stopped the process
+    ///   is not drained: depending on the scheduler's view of the dead pid it
+    ///   either fails the wake and is rolled back with
+    ///   [`ShardError::ActorUnavailable`] (see [`Self::enqueue`]), or the wake is
+    ///   accepted against the just-stopped pid but no slice ever drains it, so
+    ///   the caller observes [`ShardError::ReplyTimeout`].
+    ///
+    /// (Boot failure is therefore NOT surfaced as
+    /// [`ShardError::ReplyDisconnected`]; that kind is reserved for a reply
+    /// channel that disconnects mid-command, e.g. a live process exiting after
+    /// it accepted the command. In practice — because beamr gives a freshly
+    /// spawned native process its first slice immediately — an externally-issued
+    /// command typically lands in the second case above.)
     ///
     /// # Errors
     /// Returns [`ShardError::Spawn`] if the scheduler cannot spawn the process.
@@ -197,6 +218,11 @@ impl ShardHandle {
         let pid = scheduler
             .spawn_native(factory)
             .map_err(|error| ShardError::Spawn(format!("{error:?}")))?;
+        // Interning from a fresh local table is sound ONLY because the handler
+        // never inspects the wake atom's value (a mailbox token = "drain one
+        // command"; see native.rs). If a future change matches on the atom
+        // value in the mailbox, intern from the scheduler's table instead or the
+        // match will silently fail.
         let atoms = AtomTable::with_common_atoms();
         let wake_atom = atoms.intern(WAKE_ATOM_NAME);
         Ok(Self {
