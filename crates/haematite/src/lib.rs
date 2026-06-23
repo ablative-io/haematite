@@ -13,10 +13,10 @@ mod error;
 
 pub use branch::{
     BranchError, BranchHandle, BranchRegistry, BranchWalBuffer, CheckoutError, CommitLog,
-    CommitLogEntry, ConflictError, ConflictInput, ConflictPolicy, CustomMergeFn, MergeError,
-    PruneError, PruneReport, ReadOnlyView, ShardId, SnapshotEntry, SnapshotError, SnapshotRegistry,
-    Timestamp, checkout, current_timestamp, fork, fork_registered, fork_shards,
-    fork_shards_registered, merge, prune,
+    CommitLogEntry, ConflictError, ConflictInput, ConflictPolicy, CustomMergeFn, MergeConflict,
+    MergeError, MergeReport, PruneError, PruneReport, ReadOnlyView, ShardId, SnapshotEntry,
+    SnapshotError, SnapshotRegistry, Timestamp, checkout, current_timestamp, fork, fork_registered,
+    fork_shards, fork_shards_registered, merge, merge_with_report, prune,
 };
 
 pub use api::{
@@ -39,4 +39,10 @@ pub use tree::{DiffEntry, DiffError, diff};
 pub use wal::{
     DurableWal, FsyncPolicy, LookupResult, Mutation, OperationType, RecoveredWal, WalBuffer,
     WalEntry, WalError, WalFileContents, WalRecovery,
+};
+
+pub use sync::{
+    Ack, ConsistencyError, ConsistencyMode, EventualConsistency, QuorumOutcome, StrongConsistency,
+    SyncMergeError, SyncMergeResult, SyncMergeRoots, execute_with_consistency, merge_synced_roots,
+    quorum_size, wait_for_quorum, wait_for_quorum_from_receiver,
 };

@@ -18,6 +18,7 @@ use std::time::Duration;
 use crate::db::helpers::{map_shard_error, ordered_hashes, range_on_handle};
 use crate::db::{Database, DatabaseError, run_indexed_parallel};
 use crate::shard::actor::ShardHandle;
+use crate::sync::{Ack, ConsistencyError, ConsistencyMode, wait_for_quorum_from_receiver};
 use crate::tree::Hash;
 
 /// Key bytes used by the general KV API.
@@ -52,7 +53,20 @@ impl Database {
     ///
     /// This does not flush to the tree; [`Self::commit`] owns that boundary.
     pub fn put(&self, key: KvKey, value: KvValue) -> Result<(), DatabaseError> {
-        self.put_with_ttl(key, value, None)
+        self.put_with_consistency(key, value, ConsistencyMode::default())
+    }
+
+    /// Append a single-key put using the requested per-operation consistency
+    /// policy. Eventual mode preserves the existing local WAL acknowledgment
+    /// boundary. Strong mode performs the local write first, then waits for
+    /// quorum acknowledgments supplied by the distribution sync path.
+    pub fn put_with_consistency(
+        &self,
+        key: KvKey,
+        value: KvValue,
+        consistency: ConsistencyMode,
+    ) -> Result<(), DatabaseError> {
+        self.put_with_ttl_and_consistency(key, value, None, consistency)
     }
 
     /// Append a single-key put with optional TTL metadata.
@@ -65,10 +79,23 @@ impl Database {
         value: KvValue,
         ttl: Option<Duration>,
     ) -> Result<(), DatabaseError> {
+        self.put_with_ttl_and_consistency(key, value, ttl, ConsistencyMode::default())
+    }
+
+    /// Append a single-key put with optional TTL metadata and per-operation
+    /// consistency policy.
+    pub fn put_with_ttl_and_consistency(
+        &self,
+        key: KvKey,
+        value: KvValue,
+        ttl: Option<Duration>,
+        consistency: ConsistencyMode,
+    ) -> Result<(), DatabaseError> {
         self.validate_ttl_write(ttl)?;
         self.handle_for(&key)?
             .put_with_ttl(key, value, ttl, self.timeout())
-            .map_err(map_shard_error)
+            .map_err(map_shard_error)?;
+        wait_for_consistency(consistency)
     }
 
     /// Append a single-key tombstone to the owning shard's durable WAL and live
@@ -111,13 +138,37 @@ impl Database {
     }
 }
 
+fn wait_for_consistency(consistency: ConsistencyMode) -> Result<(), DatabaseError> {
+    let ConsistencyMode::Strong(strong) = consistency else {
+        return Ok(());
+    };
+
+    // DIST-002 defines the per-operation API and quorum wait semantics, but
+    // DIST-001/DIST-003 own node transfer and topology scheduling. Until that
+    // sync path feeds remote acknowledgments here, a single-node operation can
+    // complete with the local durable WAL ack; multi-node strong writes fail
+    // honestly rather than pretending replication happened.
+    let (sender, receiver) = std::sync::mpsc::channel::<Ack<usize>>();
+    let result = wait_for_quorum_from_receiver(strong, &receiver)
+        .map(drop)
+        .map_err(|error| map_consistency_error(&error));
+    drop(sender);
+    result
+}
+
+fn map_consistency_error(error: &ConsistencyError) -> DatabaseError {
+    DatabaseError::ConsistencyError(error.to_string())
+}
+
 #[cfg(test)]
 mod tests {
     use std::error::Error;
     use std::path::Path;
     use std::time::Duration;
 
+    use crate::DatabaseError;
     use crate::db::{Database, DatabaseConfig};
+    use crate::sync::{ConsistencyMode, EventualConsistency, StrongConsistency};
     use crate::wal::{DurableWal, OperationType};
 
     fn config_for(path: &Path, shard_count: usize) -> DatabaseConfig {
@@ -272,6 +323,58 @@ mod tests {
             Some(b"value".to_vec())
         );
         assert_eq!(reopened.commit()?, committed_roots);
+        Ok(())
+    }
+
+    #[test]
+    fn put_with_eventual_consistency_returns_after_local_write() -> Result<(), Box<dyn Error>> {
+        let dir = tempfile::tempdir()?;
+        let data_dir = dir.path().join("db");
+        let db = Database::create(config_for(&data_dir, 4))?;
+        let mode = ConsistencyMode::Eventual(EventualConsistency::new(Duration::from_secs(30)));
+
+        db.put_with_consistency(b"eventual".to_vec(), b"value".to_vec(), mode)?;
+
+        assert_eq!(db.get(b"eventual")?, Some(b"value".to_vec()));
+        Ok(())
+    }
+
+    #[test]
+    fn put_with_single_node_strong_consistency_counts_local_ack() -> Result<(), Box<dyn Error>> {
+        let dir = tempfile::tempdir()?;
+        let data_dir = dir.path().join("db");
+        let db = Database::create(config_for(&data_dir, 4))?;
+        let mode = ConsistencyMode::Strong(StrongConsistency::new(1, Duration::from_secs(1)));
+
+        db.put_with_consistency(b"strong-local".to_vec(), b"value".to_vec(), mode)?;
+
+        assert_eq!(db.get(b"strong-local")?, Some(b"value".to_vec()));
+        Ok(())
+    }
+
+    #[test]
+    fn different_operations_can_choose_different_consistency_modes() -> Result<(), Box<dyn Error>> {
+        let dir = tempfile::tempdir()?;
+        let data_dir = dir.path().join("db");
+        let db = Database::create(config_for(&data_dir, 4))?;
+
+        db.put_with_consistency(
+            b"eventual".to_vec(),
+            b"value".to_vec(),
+            ConsistencyMode::eventual(Duration::from_secs(30)),
+        )?;
+        let strong_result = db.put_with_consistency(
+            b"strong".to_vec(),
+            b"value".to_vec(),
+            ConsistencyMode::strong(3, Duration::from_millis(1)),
+        );
+
+        assert_eq!(db.get(b"eventual")?, Some(b"value".to_vec()));
+        assert!(matches!(
+            strong_result,
+            Err(DatabaseError::ConsistencyError(_))
+        ));
+        assert_eq!(db.get(b"strong")?, Some(b"value".to_vec()));
         Ok(())
     }
 

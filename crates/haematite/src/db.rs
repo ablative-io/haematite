@@ -60,6 +60,7 @@ pub enum DatabaseError {
         expected: Option<u64>,
         actual: Option<u64>,
     },
+    ConsistencyError(String),
 }
 
 impl fmt::Display for DatabaseError {
@@ -97,6 +98,9 @@ impl fmt::Display for DatabaseError {
                 formatter,
                 "cas mismatch: expected {expected:?}, actual {actual:?}"
             ),
+            Self::ConsistencyError(message) => {
+                write!(formatter, "consistency requirement failed: {message}")
+            }
         }
     }
 }
@@ -117,7 +121,8 @@ impl std::error::Error for DatabaseError {
             | Self::MissingSweepInterval
             | Self::InvalidSweepInterval
             | Self::SequenceConflict { .. }
-            | Self::CasMismatch { .. } => None,
+            | Self::CasMismatch { .. }
+            | Self::ConsistencyError(_) => None,
         }
     }
 }
