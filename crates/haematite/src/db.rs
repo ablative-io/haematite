@@ -11,6 +11,7 @@ use beamr::scheduler::{Scheduler, SchedulerConfig};
 use crate::shard::actor::{ShardError, ShardHandle};
 use crate::shard::router::ShardRouter;
 use crate::tree::Hash;
+use crate::ttl::sweep::{SweepError, SweepHandle};
 
 pub(crate) mod helpers;
 
@@ -32,6 +33,8 @@ pub(crate) type ShardCommitResult = (usize, Result<Hash, ShardError>);
 pub struct DatabaseConfig {
     pub data_dir: PathBuf,
     pub shard_count: usize,
+    /// Sweep interval in milliseconds. `None` disables TTL writes.
+    pub sweep_interval: Option<u64>,
 }
 
 /// Errors surfaced by the top-level database handle.
@@ -43,8 +46,12 @@ pub enum DatabaseError {
     ConfigParse(String),
     InvalidShardCount,
     ShardSpawn(String),
+    SweepSpawn(String),
     ShardError(String),
+    SweepError(String),
     IoError(io::Error),
+    MissingSweepInterval,
+    InvalidSweepInterval,
     SequenceConflict {
         expected: u64,
         actual: u64,
@@ -72,8 +79,16 @@ impl fmt::Display for DatabaseError {
             Self::ShardSpawn(message) => {
                 write!(formatter, "failed to spawn shard actor: {message}")
             }
+            Self::SweepSpawn(message) => {
+                write!(formatter, "failed to spawn sweep actor: {message}")
+            }
             Self::ShardError(message) => write!(formatter, "shard operation failed: {message}"),
+            Self::SweepError(message) => write!(formatter, "sweep operation failed: {message}"),
             Self::IoError(error) => write!(formatter, "database I/O error: {error}"),
+            Self::MissingSweepInterval => write!(formatter, "ttl writes require sweep_interval"),
+            Self::InvalidSweepInterval => {
+                write!(formatter, "sweep_interval must be greater than zero")
+            }
             Self::SequenceConflict { expected, actual } => write!(
                 formatter,
                 "sequence conflict on append: expected {expected}, actual {actual}"
@@ -96,7 +111,11 @@ impl std::error::Error for DatabaseError {
             Self::ConfigParse(_)
             | Self::InvalidShardCount
             | Self::ShardSpawn(_)
+            | Self::SweepSpawn(_)
             | Self::ShardError(_)
+            | Self::SweepError(_)
+            | Self::MissingSweepInterval
+            | Self::InvalidSweepInterval
             | Self::SequenceConflict { .. }
             | Self::CasMismatch { .. } => None,
         }
@@ -114,6 +133,7 @@ pub struct Database {
     config: DatabaseConfig,
     scheduler: Arc<Scheduler>,
     router: ShardRouter,
+    sweeps: Vec<SweepHandle>,
     timeout: Duration,
 }
 
@@ -162,8 +182,20 @@ impl Database {
         entries: Vec<Vec<u8>>,
         expected_seq: u64,
     ) -> Result<u64, DatabaseError> {
+        self.append_with_ttl(key, entries, expected_seq, None)
+    }
+
+    /// Atomically append event entries with optional TTL metadata.
+    pub fn append_with_ttl(
+        &self,
+        key: Vec<u8>,
+        entries: Vec<Vec<u8>>,
+        expected_seq: u64,
+        ttl: Option<Duration>,
+    ) -> Result<u64, DatabaseError> {
+        self.validate_ttl_write(ttl)?;
         self.handle_for(&key)?
-            .append(key, entries, expected_seq, self.timeout)
+            .append_with_ttl(key, entries, expected_seq, ttl, self.timeout)
             .map_err(map_shard_error)
     }
 
@@ -198,6 +230,17 @@ impl Database {
         let from = event_range_start(key, from_seq);
         let to = event_range_end(key);
         range_on_handle(self.handle_for(key)?, &from, &to, self.timeout)
+    }
+
+    /// Read the next sequence metadata for an event stream, if the stream exists.
+    pub fn read_stream_next_seq(&self, key: &[u8]) -> Result<Option<u64>, DatabaseError> {
+        self.read_value(&event_sequence_key(key))
+    }
+
+    /// Return true if a stream has at least one non-expired event visible now.
+    pub fn stream_has_live_events(&self, key: &[u8]) -> Result<bool, DatabaseError> {
+        self.read_event_entries_from(key, 1)
+            .map(|entries| !entries.is_empty())
     }
 
     /// Read the scalar `u64` value at `key`, or `None` if it is unset.
@@ -254,10 +297,28 @@ impl Database {
             .handle_for(key)
             .ok_or(DatabaseError::InvalidShardCount)
     }
+
+    pub(crate) const fn validate_ttl_write(
+        &self,
+        ttl: Option<Duration>,
+    ) -> Result<(), DatabaseError> {
+        if ttl.is_some() && self.config.sweep_interval.is_none() {
+            return Err(DatabaseError::MissingSweepInterval);
+        }
+        Ok(())
+    }
 }
 
 impl Drop for Database {
     fn drop(&mut self) {
+        for handle in &self.sweeps {
+            if let Err(error) = handle.shutdown(self.timeout) {
+                log::debug!(
+                    "database sweep shutdown skipped for supervisor pid {}: {error}",
+                    handle.supervisor_pid()
+                );
+            }
+        }
         for handle in self.router.handles_in_order() {
             if let Err(error) = handle.shutdown(self.timeout) {
                 log::debug!(
@@ -287,12 +348,15 @@ fn initialise_database(config: DatabaseConfig) -> Result<Database, DatabaseError
 
 fn start_database(config: DatabaseConfig, mode: StartupMode) -> Result<Database, DatabaseError> {
     validate_shard_count(config.shard_count)?;
+    validate_sweep_interval(config.sweep_interval)?;
     let scheduler = create_scheduler()?;
     let router = spawn_router(&scheduler, &config.data_dir, config.shard_count, mode)?;
+    let sweeps = spawn_sweeps(&scheduler, &config, &router)?;
     Ok(Database {
         config,
         scheduler,
         router,
+        sweeps,
         timeout: DEFAULT_TIMEOUT,
     })
 }
@@ -324,6 +388,36 @@ fn spawn_router(
         return Err(error);
     }
     ShardRouter::new(handles).ok_or(DatabaseError::InvalidShardCount)
+}
+
+fn spawn_sweeps(
+    scheduler: &Arc<Scheduler>,
+    config: &DatabaseConfig,
+    router: &ShardRouter,
+) -> Result<Vec<SweepHandle>, DatabaseError> {
+    let Some(interval_millis) = config.sweep_interval else {
+        return Ok(Vec::new());
+    };
+    let interval = Duration::from_millis(interval_millis);
+    let mut sweeps = Vec::with_capacity(config.shard_count);
+    for (index, shard) in router.handles_in_order().iter().cloned().enumerate() {
+        let shard_dir = shard_dir(&config.data_dir, index);
+        match SweepHandle::spawn(
+            Arc::clone(scheduler),
+            shard_dir.join(SHARD_STORE_DIR),
+            shard_dir.join(SHARD_WAL_FILE),
+            shard,
+            interval,
+            DEFAULT_TIMEOUT,
+        ) {
+            Ok(handle) => sweeps.push(handle),
+            Err(error) => {
+                shutdown_sweeps(&sweeps);
+                return Err(map_sweep_spawn_error(error));
+            }
+        }
+    }
+    Ok(sweeps)
 }
 
 fn spawn_one_shard(
@@ -379,6 +473,24 @@ fn shutdown_handles(handles: &[ShardHandle]) {
     }
 }
 
+fn shutdown_sweeps(handles: &[SweepHandle]) {
+    for handle in handles {
+        if let Err(error) = handle.shutdown(DEFAULT_TIMEOUT) {
+            log::debug!(
+                "sweep cleanup shutdown skipped for supervisor pid {}: {error}",
+                handle.supervisor_pid()
+            );
+        }
+    }
+}
+
+fn map_sweep_spawn_error(error: SweepError) -> DatabaseError {
+    match error {
+        SweepError::Spawn(message) => DatabaseError::SweepSpawn(message),
+        other => DatabaseError::SweepError(other.to_string()),
+    }
+}
+
 fn write_config(config: &DatabaseConfig) -> Result<(), DatabaseError> {
     let bytes = serde_json::to_vec_pretty(config).map_err(|error| {
         DatabaseError::ConfigWrite(io::Error::new(io::ErrorKind::InvalidData, error))
@@ -397,6 +509,20 @@ const fn validate_shard_count(shard_count: usize) -> Result<(), DatabaseError> {
     } else {
         Ok(())
     }
+}
+
+const fn validate_sweep_interval(interval: Option<u64>) -> Result<(), DatabaseError> {
+    match interval {
+        Some(0) => Err(DatabaseError::InvalidSweepInterval),
+        Some(_) | None => Ok(()),
+    }
+}
+
+fn event_sequence_key(key: &[u8]) -> Vec<u8> {
+    let mut encoded = Vec::with_capacity(key.len().saturating_add(4));
+    encoded.extend_from_slice(key);
+    encoded.extend_from_slice(&[0xff, b's', b'e', b'q']);
+    encoded
 }
 
 fn shard_dir(data_dir: &Path, index: usize) -> PathBuf {

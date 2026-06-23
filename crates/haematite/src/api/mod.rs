@@ -6,7 +6,7 @@ pub mod event_store;
 pub mod kv;
 pub mod types;
 
-pub use error::{ApiError, CasMismatch, SequenceConflict};
+pub use error::{ApiError, CasMismatch, HistoryCompacted, SequenceConflict};
 pub use event_store::{EventStore, decode_stream_key, encode_stream_key};
 pub use kv::{KvEntry, KvKey, KvRange, KvValue, ShardRoots};
 pub use types::{Event, ScanResult, StreamMeta};

@@ -32,6 +32,7 @@ use beamr::{NativeContext, NativeHandler, NativeOutcome};
 use crate::shard::actor::ShardActor;
 use crate::store::DiskStore;
 use crate::tree::Cursor;
+use crate::ttl::filter::{Visibility, visible_value};
 use crate::wal::{DurableWal, FsyncPolicy, Mutation, WalRecovery};
 
 use super::handle::{
@@ -112,8 +113,16 @@ impl ShardState {
                 drop(reply.send(result));
                 None
             }
-            ShardCommandKind::Put { key, value, reply } => {
-                let result = self.actor.put(key, value).map_err(ShardError::from);
+            ShardCommandKind::Put {
+                key,
+                value,
+                ttl,
+                reply,
+            } => {
+                let result = self
+                    .actor
+                    .put_with_ttl(key, value, ttl)
+                    .map_err(ShardError::from);
                 drop(reply.send(result));
                 None
             }
@@ -135,11 +144,12 @@ impl ShardState {
                 key,
                 entries,
                 expected_seq,
+                ttl,
                 reply,
             } => {
                 let result = self
                     .actor
-                    .append(&key, entries, expected_seq, &mut self.store)
+                    .append(&key, entries, expected_seq, ttl, &mut self.store)
                     .map_err(ShardError::from);
                 drop(reply.send(result));
                 None
@@ -201,7 +211,7 @@ impl ShardState {
             .iter()
             .filter(|mutation| in_range(mutation, from, to))
             .collect();
-        Ok(merge_range(&tree_entries, &buffer_entries))
+        merge_range(&tree_entries, &buffer_entries)
     }
 }
 
@@ -260,7 +270,7 @@ fn in_range(mutation: &Mutation, from: &[u8], to: &[u8]) -> bool {
 fn merge_range(
     tree_entries: &[(Vec<u8>, Vec<u8>)],
     buffer_entries: &[&Mutation],
-) -> Vec<RangeItem> {
+) -> Result<Vec<RangeItem>, ShardError> {
     let mut items = Vec::new();
     let mut tree_index = 0;
     let mut buffer_index = 0;
@@ -272,48 +282,55 @@ fn merge_range(
             (Some((tree_key, tree_value)), Some(buffer_mutation)) => {
                 match tree_key.as_slice().cmp(buffer_mutation.key()) {
                     Ordering::Less => {
-                        push_entry(&mut items, tree_key, tree_value);
+                        push_entry(&mut items, tree_key, tree_value)?;
                         tree_index = tree_index.saturating_add(1);
                     }
                     Ordering::Equal => {
-                        push_mutation(&mut items, buffer_mutation);
+                        push_mutation(&mut items, buffer_mutation)?;
                         tree_index = tree_index.saturating_add(1);
                         buffer_index = buffer_index.saturating_add(1);
                     }
                     Ordering::Greater => {
-                        push_mutation(&mut items, buffer_mutation);
+                        push_mutation(&mut items, buffer_mutation)?;
                         buffer_index = buffer_index.saturating_add(1);
                     }
                 }
             }
             (Some((tree_key, tree_value)), None) => {
-                push_entry(&mut items, tree_key, tree_value);
+                push_entry(&mut items, tree_key, tree_value)?;
                 tree_index = tree_index.saturating_add(1);
             }
             (None, Some(buffer_mutation)) => {
-                push_mutation(&mut items, buffer_mutation);
+                push_mutation(&mut items, buffer_mutation)?;
                 buffer_index = buffer_index.saturating_add(1);
             }
             (None, None) => break,
         }
     }
     items.push(RangeItem::Done);
-    items
+    Ok(items)
 }
 
-/// Append a tree entry (always a live value) to the range result.
-fn push_entry(items: &mut Vec<RangeItem>, key: &[u8], value: &[u8]) {
-    items.push(RangeItem::Entry {
-        key: key.to_vec(),
-        value: value.to_vec(),
-    });
+/// Append a visible tree entry to the range result.
+fn push_entry(items: &mut Vec<RangeItem>, key: &[u8], value: &[u8]) -> Result<(), ShardError> {
+    match visible_value(value)
+        .map_err(|error| ShardError::Wal(crate::wal::WalError::TreeError(error.to_string())))?
+    {
+        Visibility::Live(value) => items.push(RangeItem::Entry {
+            key: key.to_vec(),
+            value,
+        }),
+        Visibility::Expired => {}
+    }
+    Ok(())
 }
 
 /// Append a buffered mutation: a put becomes an entry, a delete is skipped.
-fn push_mutation(items: &mut Vec<RangeItem>, mutation: &Mutation) {
+fn push_mutation(items: &mut Vec<RangeItem>, mutation: &Mutation) -> Result<(), ShardError> {
     if let Mutation::Put { key, value } = mutation {
-        push_entry(items, key, value);
+        push_entry(items, key, value)?;
     }
+    Ok(())
 }
 
 /// Pre-flight (spec Phase 0): a [`DiskStore`] must be `Send` so it can live
@@ -390,6 +407,7 @@ mod boot_failure_tests {
                 kind: ShardCommandKind::Put {
                     key: b"k".to_vec(),
                     value: b"v".to_vec(),
+                    ttl: None,
                     reply: put_tx,
                 },
             });

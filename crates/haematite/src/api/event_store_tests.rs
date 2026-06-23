@@ -9,6 +9,7 @@ use std::error::Error;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Barrier};
 use std::thread;
+use std::time::Duration;
 
 use tempfile::TempDir;
 
@@ -23,6 +24,19 @@ fn new_store(dir: &TempDir, shard_count: usize) -> Result<EventStore, Box<dyn Er
     let config = DatabaseConfig {
         data_dir: dir.path().to_path_buf(),
         shard_count,
+        sweep_interval: None,
+    };
+    Ok(EventStore::new(Database::create(config)?))
+}
+
+fn new_ttl_store(dir: &TempDir, shard_count: usize) -> Result<EventStore, Box<dyn Error>> {
+    let config = DatabaseConfig {
+        data_dir: dir.path().to_path_buf(),
+        shard_count,
+        // Read-time-filtering tests: a long interval keeps the sweep from firing
+        // during the sub-second test (its first tick is `interval` away), avoiding
+        // scheduler load. Physical sweeping is covered by ttl::sweep's own test.
+        sweep_interval: Some(60_000),
     };
     Ok(EventStore::new(Database::create(config)?))
 }
@@ -338,5 +352,55 @@ fn event_value_envelope_preserves_empty_payload() -> TestResult {
     let events = store.read(b"empty")?;
     assert_eq!(events.len(), 1);
     assert!(events[0].payload.is_empty());
+    Ok(())
+}
+
+#[test]
+fn event_store_ttl_filters_expired_events_and_reports_compaction() -> TestResult {
+    let dir = TempDir::new()?;
+    let store = new_ttl_store(&dir, 1)?;
+
+    store.append_with_ttl(b"expired", b"gone", 0, Some(Duration::ZERO))?;
+    match store.read(b"expired") {
+        Err(ApiError::HistoryCompacted(compacted)) => {
+            assert_eq!(compacted.stream_key, b"expired".to_vec());
+        }
+        other => return Err(format!("expected HistoryCompacted, got {other:?}").into()),
+    }
+
+    assert!(store.read(b"missing")?.is_empty());
+    Ok(())
+}
+
+#[test]
+fn event_store_ttl_keeps_live_tail_without_compaction_error() -> TestResult {
+    let dir = TempDir::new()?;
+    let store = new_ttl_store(&dir, 1)?;
+
+    store.append_with_ttl(b"mixed", b"old", 0, Some(Duration::ZERO))?;
+    store.append_with_ttl(b"mixed", b"live", 1, Some(Duration::from_secs(60)))?;
+
+    let events = store.read(b"mixed")?;
+    assert_eq!(events.len(), 1);
+    assert_eq!(events[0].seq, 1);
+    assert_eq!(events[0].payload, b"live");
+    Ok(())
+}
+
+#[test]
+fn event_store_scan_excludes_streams_with_no_live_events() -> TestResult {
+    let dir = TempDir::new()?;
+    let store = new_ttl_store(&dir, 2)?;
+
+    store.append_with_ttl(b"gone", b"expired", 0, Some(Duration::ZERO))?;
+    store.append_with_ttl(b"live", b"visible", 0, Some(Duration::from_secs(60)))?;
+
+    let mut streams: Vec<Vec<u8>> = store
+        .scan(|_| true)?
+        .into_iter()
+        .map(|result| result.stream_key)
+        .collect();
+    streams.sort();
+    assert_eq!(streams, vec![b"live".to_vec()]);
     Ok(())
 }

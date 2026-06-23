@@ -1,5 +1,7 @@
 // CORE-007: Shard actor — owns tree + WAL buffer, handles get/put/delete/commit messages
 
+use std::time::Duration;
+
 mod errors;
 pub mod handle;
 pub mod native;
@@ -12,6 +14,8 @@ pub use handle::{RangeItem, ShardError, ShardHandle};
 
 use crate::store::NodeStore;
 use crate::tree::{Cursor, Hash, LeafNode, Node, batch_mutate};
+use crate::ttl::entry::encode_optional_ttl;
+use crate::ttl::filter::{Visibility, visible_value};
 use crate::wal::{DurableWal, LookupResult, Mutation, RecoveredWal, WalBuffer, WalError};
 
 /// Minimal shard write boundary used by the durable WAL layer.
@@ -59,6 +63,7 @@ impl ShardActor {
     }
 
     /// Append a put to the durable WAL, then buffer it for a future tree commit.
+    #[cfg(test)]
     pub fn put<K, V>(&mut self, key: K, value: V) -> Result<(), WalError>
     where
         K: Into<Vec<u8>>,
@@ -66,6 +71,26 @@ impl ShardActor {
     {
         let key = key.into();
         let value = value.into();
+        self.put_encoded(key, value)
+    }
+
+    /// Append a put with optional TTL metadata to the durable WAL and buffer.
+    pub fn put_with_ttl<K, V>(
+        &mut self,
+        key: K,
+        value: V,
+        ttl: Option<Duration>,
+    ) -> Result<(), WalError>
+    where
+        K: Into<Vec<u8>>,
+        V: Into<Vec<u8>>,
+    {
+        let key = key.into();
+        let value = encode_ttl_value(value.into(), ttl)?;
+        self.put_encoded(key, value)
+    }
+
+    fn put_encoded(&mut self, key: Vec<u8>, value: Vec<u8>) -> Result<(), WalError> {
         let mutation = Mutation::Put {
             key: key.clone(),
             value: value.clone(),
@@ -95,11 +120,15 @@ impl ShardActor {
     {
         let key = key.as_ref();
         match self.buffer.get(key) {
-            LookupResult::BufferedValue(value) => Ok(Some(value)),
+            LookupResult::BufferedValue(value) => visible_ttl_value(&value),
             LookupResult::BufferedDelete => Ok(None),
             LookupResult::NotBuffered => self.committed_root.map_or_else(
                 || Ok(None),
-                |root| Cursor::new(store, root).get(key).map_err(tree_error),
+                |root| {
+                    visible_optional_ttl_value(
+                        Cursor::new(store, root).get(key).map_err(tree_error)?,
+                    )
+                },
             ),
         }
     }
@@ -133,6 +162,7 @@ impl ShardActor {
         key: &[u8],
         entries: Vec<Vec<u8>>,
         expected_seq: u64,
+        ttl: Option<Duration>,
         store: &mut S,
     ) -> Result<u64, AppendError>
     where
@@ -161,9 +191,10 @@ impl ShardActor {
             let seq = actual
                 .checked_add(offset.saturating_add(1))
                 .ok_or_else(|| WalError::TreeError("append sequence overflow".to_owned()))?;
+            let value = encode_ttl_value(entry, ttl)?;
             mutations.push(Mutation::Put {
                 key: event_key(key, seq),
-                value: entry,
+                value,
             });
         }
         mutations.push(Mutation::Put {
@@ -310,6 +341,21 @@ where
 {
     let node = Node::Leaf(LeafNode::new(Vec::new()).map_err(tree_error)?);
     store.put(&node).map_err(tree_error)
+}
+
+fn encode_ttl_value(value: Vec<u8>, ttl: Option<Duration>) -> Result<Vec<u8>, WalError> {
+    encode_optional_ttl(value, ttl).map_err(tree_error)
+}
+
+fn visible_optional_ttl_value(value: Option<Vec<u8>>) -> Result<Option<Vec<u8>>, WalError> {
+    value.map_or(Ok(None), |value| visible_ttl_value(&value))
+}
+
+fn visible_ttl_value(value: &[u8]) -> Result<Option<Vec<u8>>, WalError> {
+    match visible_value(value).map_err(tree_error)? {
+        Visibility::Live(value) => Ok(Some(value)),
+        Visibility::Expired => Ok(None),
+    }
 }
 
 fn tree_error(error: impl std::fmt::Display) -> WalError {
