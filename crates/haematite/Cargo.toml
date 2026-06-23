@@ -16,6 +16,9 @@ beamr = "0.8.1"
 lru = "0.12"
 tempfile = "3"
 
+[dev-dependencies]
+proptest = "1"
+
 [lints.rust]
 unsafe_code = "forbid"
 

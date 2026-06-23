@@ -231,11 +231,38 @@ fn store_internal_replacements<S: NodeStore + ?Sized>(
     }
 }
 
+// Test-only seam: lets property tests drive the REAL mutate code path with a
+// small `target_size` so that realistic key counts produce genuinely
+// multi-leaf trees. Compiled out entirely in non-test builds, so production
+// behaviour is identical to `BoundaryDetector::default()`.
+#[cfg(test)]
+thread_local! {
+    static TEST_TARGET_SIZE: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
+}
+
+#[cfg(test)]
+pub(crate) fn set_test_target_size(target_size: Option<usize>) {
+    TEST_TARGET_SIZE.with(|cell| cell.set(target_size));
+}
+
+#[cfg(test)]
+fn active_detector() -> BoundaryDetector {
+    TEST_TARGET_SIZE.with(|cell| {
+        cell.get()
+            .map_or_else(BoundaryDetector::default, BoundaryDetector::new)
+    })
+}
+
+#[cfg(not(test))]
+fn active_detector() -> BoundaryDetector {
+    BoundaryDetector::default()
+}
+
 fn split_after_boundaries<T, F>(items: Vec<T>, key_of: F) -> Vec<Vec<T>>
 where
     F: Fn(&T) -> &[u8],
 {
-    let detector = BoundaryDetector::default();
+    let detector = active_detector();
     let mut chunks = Vec::new();
     let mut current = Vec::new();
 
