@@ -12,11 +12,10 @@ use crate::shard::actor::{ShardError, ShardHandle};
 use crate::shard::router::ShardRouter;
 use crate::tree::Hash;
 
-mod helpers;
+pub(crate) mod helpers;
 
 use helpers::{
-    event_range_end, event_range_start, map_shard_error, map_spawn_error, ordered_hashes,
-    range_on_handle,
+    event_range_end, event_range_start, map_shard_error, map_spawn_error, range_on_handle,
 };
 
 const CONFIG_FILE: &str = "config.json";
@@ -24,9 +23,9 @@ const SHARD_STORE_DIR: &str = "store";
 const SHARD_WAL_FILE: &str = "shard.wal";
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(5);
 
-type DbEntry = (Vec<u8>, Vec<u8>);
-type DbRange = Vec<DbEntry>;
-type ShardCommitResult = (usize, Result<Hash, ShardError>);
+pub(crate) type DbEntry = (Vec<u8>, Vec<u8>);
+pub(crate) type DbRange = Vec<DbEntry>;
+pub(crate) type ShardCommitResult = (usize, Result<Hash, ShardError>);
 
 /// Explicit database configuration; no field has a silent default.
 #[derive(Clone, Debug, serde::Deserialize, serde::Serialize)]
@@ -156,43 +155,6 @@ impl Database {
         self.router.shard_for(key)
     }
 
-    /// Read one key through the owning shard.
-    pub fn get(&self, key: &[u8]) -> Result<Option<Vec<u8>>, DatabaseError> {
-        self.handle_for(key)?
-            .get(key.to_vec(), self.timeout)
-            .map_err(map_shard_error)
-    }
-
-    /// Buffer a put through the owning shard.
-    pub fn put(&self, key: Vec<u8>, value: Vec<u8>) -> Result<(), DatabaseError> {
-        self.handle_for(&key)?
-            .put(key, value, self.timeout)
-            .map_err(map_shard_error)
-    }
-
-    /// Buffer a delete through the owning shard.
-    pub fn delete(&self, key: Vec<u8>) -> Result<(), DatabaseError> {
-        self.handle_for(&key)?
-            .delete(key, self.timeout)
-            .map_err(map_shard_error)
-    }
-
-    /// Commit every shard in parallel and return root hashes in shard order.
-    pub fn commit(&self) -> Result<Vec<Hash>, DatabaseError> {
-        let handles = self.router.handles_in_order().to_vec();
-        let timeout = self.timeout;
-        let results = run_indexed_parallel(handles, |handle: ShardHandle| handle.commit(timeout))?;
-        ordered_hashes(results, self.config.shard_count)
-    }
-
-    /// Read a single-shard key range in ascending key order.
-    pub fn range(&self, from: &[u8], to: &[u8]) -> Result<DbRange, DatabaseError> {
-        if from >= to {
-            return Ok(Vec::new());
-        }
-        range_on_handle(self.handle_for(from)?, from, to, self.timeout)
-    }
-
     /// Atomically append event entries under `key` using optimistic concurrency.
     pub fn append(
         &self,
@@ -275,7 +237,19 @@ impl Database {
         Ok(streams)
     }
 
-    fn handle_for(&self, key: &[u8]) -> Result<&ShardHandle, DatabaseError> {
+    pub(crate) const fn shard_count(&self) -> usize {
+        self.config.shard_count
+    }
+
+    pub(crate) const fn timeout(&self) -> Duration {
+        self.timeout
+    }
+
+    pub(crate) fn shard_handles_in_order(&self) -> &[ShardHandle] {
+        self.router.handles_in_order()
+    }
+
+    pub(crate) fn handle_for(&self, key: &[u8]) -> Result<&ShardHandle, DatabaseError> {
         self.router
             .handle_for(key)
             .ok_or(DatabaseError::InvalidShardCount)
@@ -429,7 +403,7 @@ fn shard_dir(data_dir: &Path, index: usize) -> PathBuf {
     data_dir.join(format!("shard-{index}"))
 }
 
-fn run_indexed_parallel<Item, Output, Work>(
+pub(crate) fn run_indexed_parallel<Item, Output, Work>(
     items: Vec<Item>,
     work: Work,
 ) -> Result<Vec<(usize, Output)>, DatabaseError>

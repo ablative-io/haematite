@@ -19,7 +19,7 @@ pub(super) fn map_spawn_error(error: ShardError) -> DatabaseError {
 
 /// Map a runtime shard error into the public [`DatabaseError`], preserving the
 /// optimistic-concurrency variants so callers can match them precisely.
-pub(super) fn map_shard_error(error: ShardError) -> DatabaseError {
+pub fn map_shard_error(error: ShardError) -> DatabaseError {
     match error {
         ShardError::SequenceConflict { expected, actual } => {
             DatabaseError::SequenceConflict { expected, actual }
@@ -33,7 +33,7 @@ pub(super) fn map_shard_error(error: ShardError) -> DatabaseError {
 }
 
 /// Reassemble per-shard commit results into a shard-ordered hash vector.
-pub(super) fn ordered_hashes(
+pub fn ordered_hashes(
     results: Vec<ShardCommitResult>,
     shard_count: usize,
 ) -> Result<Vec<Hash>, DatabaseError> {
@@ -61,7 +61,7 @@ pub(super) fn ordered_hashes(
 }
 
 /// Run a `[from, to)` range against one shard handle and collect its entries.
-pub(super) fn range_on_handle(
+pub fn range_on_handle(
     handle: &ShardHandle,
     from: &[u8],
     to: &[u8],
