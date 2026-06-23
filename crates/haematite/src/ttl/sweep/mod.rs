@@ -343,11 +343,18 @@ impl SweepNativeHandler {
             .collect::<Result<Vec<_>, SweepError>>()?;
         stats.expired = expired_keys.len();
         for key in expired_keys {
-            self.spec
+            // Re-check expiry atomically in the actor: a key refreshed by a
+            // concurrent write between the snapshot above and this delete must
+            // NOT be removed. `delete_if_expired` reports whether it deleted, so
+            // `deleted` counts physical removals, not just candidates.
+            let removed = self
+                .spec
                 .shard
-                .delete(key, self.spec.command_timeout)
+                .delete_if_expired(key, self.spec.command_timeout)
                 .map_err(|error| SweepError::Shard(error.to_string()))?;
-            stats.deleted = stats.deleted.saturating_add(1);
+            if removed {
+                stats.deleted = stats.deleted.saturating_add(1);
+            }
         }
         Ok(stats)
     }
@@ -359,7 +366,7 @@ impl SweepNativeHandler {
 
     /// Arm a single delayed self-tick at the configured interval.
     ///
-    /// `ctx.schedule` (beamr 0.9.0) hands the scheduler's timer wheel a
+    /// `ctx.schedule` (beamr 0.8.2) hands the scheduler's timer wheel a
     /// `Deliver` timer that pushes `tick` into THIS process's own mailbox after
     /// `interval`, then wakes it — so the tick arrives as an ordinary mailbox
     /// message on a later scheduler slice, with no host thread and no busy

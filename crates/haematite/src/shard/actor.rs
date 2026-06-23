@@ -12,10 +12,11 @@ use errors::{AppendError, CasError};
 
 pub use handle::{RangeItem, ShardError, ShardHandle};
 
+use crate::branch::current_timestamp;
 use crate::store::NodeStore;
 use crate::tree::{Cursor, Hash, LeafNode, Node, batch_mutate};
 use crate::ttl::entry::encode_optional_ttl;
-use crate::ttl::filter::{Visibility, visible_value};
+use crate::ttl::filter::{Visibility, is_expired_at, visible_value};
 use crate::wal::{DurableWal, LookupResult, Mutation, RecoveredWal, WalBuffer, WalError};
 
 /// Minimal shard write boundary used by the durable WAL layer.
@@ -110,6 +111,38 @@ impl ShardActor {
         self.wal.append_mutation(&mutation)?;
         self.buffer.delete(key);
         Ok(())
+    }
+
+    /// Delete `key` only if its current stored value is present and expired now,
+    /// re-checking the live buffer+tree inside the actor's single-threaded slice.
+    ///
+    /// The sweep computes its candidate set from an independent store+WAL
+    /// snapshot; re-checking here closes the window in which a concurrent refresh
+    /// (a fresh `put` landing between the snapshot and this delete) would be
+    /// clobbered by an unconditional delete. Expiry is evaluated against the raw
+    /// stored bytes (not the read-filtered view) at the current clock. Returns
+    /// whether a delete was issued.
+    pub fn delete_if_expired<S>(&mut self, key: &[u8], store: &S) -> Result<bool, WalError>
+    where
+        S: NodeStore + ?Sized,
+    {
+        let current = match self.buffer.get(key) {
+            LookupResult::BufferedValue(value) => Some(value),
+            LookupResult::BufferedDelete => None,
+            LookupResult::NotBuffered => match self.committed_root {
+                Some(root) => Cursor::new(store, root).get(key).map_err(tree_error)?,
+                None => None,
+            },
+        };
+        let Some(value) = current else {
+            return Ok(false);
+        };
+        if is_expired_at(&value, current_timestamp()).map_err(tree_error)? {
+            self.delete(key.to_vec())?;
+            Ok(true)
+        } else {
+            Ok(false)
+        }
     }
 
     /// Read through the recovered/live buffer first, then the committed tree.
@@ -433,6 +466,35 @@ mod storage_tests {
             DurableWal::read_file(path)?.entries(),
             &[WalEntry::delete(b"event".to_vec())]
         );
+        Ok(())
+    }
+
+    #[test]
+    fn delete_if_expired_removes_only_expired_values() -> Result<(), WalError> {
+        // The sweep's atomic re-check: delete_if_expired must remove an expired
+        // entry but leave a live (or refreshed) one untouched. Falsifiable — an
+        // unconditional delete would also drop the live "keep" value.
+        let temp = temp_path("actor-delete-if-expired.wal")?;
+        let wal = DurableWal::new(temp.path(), FsyncPolicy::CommitOnly)?;
+        let mut actor = ShardActor::new(wal);
+        let store = MemoryStore::new();
+
+        // A live (never-expiring) value is NOT removed.
+        actor.put(b"live".to_vec(), b"keep".to_vec())?;
+        assert!(!actor.delete_if_expired(b"live", &store)?);
+        assert_eq!(actor.get(b"live", &store)?, Some(b"keep".to_vec()));
+
+        // An expired value IS removed.
+        actor.put_with_ttl(
+            b"gone".to_vec(),
+            b"stale".to_vec(),
+            Some(std::time::Duration::ZERO),
+        )?;
+        assert!(actor.delete_if_expired(b"gone", &store)?);
+        assert_eq!(actor.get(b"gone", &store)?, None);
+
+        // An absent key is a no-op.
+        assert!(!actor.delete_if_expired(b"missing", &store)?);
         Ok(())
     }
 

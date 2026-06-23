@@ -16,6 +16,7 @@ pub(super) fn reply_startup_error(command: ShardCommand, message: &str) {
     let error = ShardError::Spawn(message.to_owned());
     match command.kind {
         ShardCommandKind::Get { reply, .. } => send_get(&reply, error),
+        ShardCommandKind::DeleteIfExpired { reply, .. } => send_bool(&reply, error),
         ShardCommandKind::Put { reply, .. }
         | ShardCommandKind::Delete { reply, .. }
         | ShardCommandKind::Cas { reply, .. }
@@ -33,6 +34,10 @@ fn send_get(reply: &SyncSender<Result<Option<Vec<u8>>, ShardError>>, error: Shar
 }
 
 fn send_unit(reply: &SyncSender<Result<(), ShardError>>, error: ShardError) {
+    drop(reply.send(Err(error)));
+}
+
+fn send_bool(reply: &SyncSender<Result<bool, ShardError>>, error: ShardError) {
     drop(reply.send(Err(error)));
 }
 

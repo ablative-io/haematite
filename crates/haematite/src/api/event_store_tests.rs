@@ -373,6 +373,35 @@ fn event_store_ttl_filters_expired_events_and_reports_compaction() -> TestResult
 }
 
 #[test]
+fn event_store_ttl_reports_compaction_across_shards() -> TestResult {
+    // Regression: a stream's next-seq metadata is written into the shard of the
+    // STREAM key (where `append` routes), so reading it must route on the stream
+    // key too — not on the differently-hashed sequence-metadata key. With more
+    // than one shard, routing the read on the seq key lands on the wrong shard,
+    // reads None, and a fully-expired stream silently returns empty instead of
+    // HistoryCompacted (violating R5). Sixteen keys over four shards make the
+    // divergent-shard case certain to be exercised.
+    let dir = TempDir::new()?;
+    let store = new_ttl_store(&dir, 4)?;
+
+    for index in 0..16u32 {
+        let key = format!("stream-{index}").into_bytes();
+        store.append_with_ttl(key.as_slice(), b"gone", 0, Some(Duration::ZERO))?;
+        match store.read(key.as_slice()) {
+            Err(ApiError::HistoryCompacted(compacted)) => {
+                assert_eq!(compacted.stream_key, key);
+            }
+            other => {
+                return Err(
+                    format!("stream {index}: expected HistoryCompacted, got {other:?}").into(),
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
+#[test]
 fn event_store_ttl_keeps_live_tail_without_compaction_error() -> TestResult {
     let dir = TempDir::new()?;
     let store = new_ttl_store(&dir, 1)?;

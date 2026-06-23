@@ -161,6 +161,10 @@ pub(super) enum ShardCommandKind {
         key: Vec<u8>,
         reply: SyncSender<Result<(), ShardError>>,
     },
+    DeleteIfExpired {
+        key: Vec<u8>,
+        reply: SyncSender<Result<bool, ShardError>>,
+    },
     Commit {
         reply: SyncSender<Result<Hash, ShardError>>,
     },
@@ -334,6 +338,18 @@ impl ShardHandle {
     pub fn delete(&self, key: Vec<u8>, timeout: Duration) -> Result<(), ShardError> {
         let (reply, response) = mpsc::sync_channel(1);
         self.enqueue(ShardCommandKind::Delete { key, reply })?;
+        recv(&response, self.pid, timeout)?
+    }
+
+    /// Delete `key` only if it is currently present and expired, re-checked
+    /// atomically inside the actor so a concurrent refresh is never clobbered.
+    /// Returns whether a delete was issued.
+    ///
+    /// # Errors
+    /// Returns a [`ShardError`] as for [`Self::delete`].
+    pub fn delete_if_expired(&self, key: Vec<u8>, timeout: Duration) -> Result<bool, ShardError> {
+        let (reply, response) = mpsc::sync_channel(1);
+        self.enqueue(ShardCommandKind::DeleteIfExpired { key, reply })?;
         recv(&response, self.pid, timeout)?
     }
 

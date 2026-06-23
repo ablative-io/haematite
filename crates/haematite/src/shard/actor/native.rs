@@ -131,6 +131,14 @@ impl ShardState {
                 drop(reply.send(result));
                 None
             }
+            ShardCommandKind::DeleteIfExpired { key, reply } => {
+                let result = self
+                    .actor
+                    .delete_if_expired(&key, &self.store)
+                    .map_err(ShardError::from);
+                drop(reply.send(result));
+                None
+            }
             ShardCommandKind::Commit { reply } => {
                 let result = self.actor.commit(&mut self.store).map_err(ShardError::from);
                 drop(reply.send(result));

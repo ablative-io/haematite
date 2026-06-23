@@ -234,7 +234,13 @@ impl Database {
 
     /// Read the next sequence metadata for an event stream, if the stream exists.
     pub fn read_stream_next_seq(&self, key: &[u8]) -> Result<Option<u64>, DatabaseError> {
-        self.read_value(&event_sequence_key(key))
+        // Route on the STREAM key — `append` writes the sequence metadata into the
+        // shard of the stream key, so the read must select the same shard. Routing
+        // on `event_sequence_key(key)` (a different hash) would read the wrong
+        // shard for `shard_count > 1` and miss the metadata entirely.
+        self.handle_for(key)?
+            .read_value(event_sequence_key(key), self.timeout)
+            .map_err(map_shard_error)
     }
 
     /// Return true if a stream has at least one non-expired event visible now.
