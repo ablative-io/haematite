@@ -154,11 +154,16 @@ pub(super) enum ShardCommandKind {
     Put {
         key: Vec<u8>,
         value: Vec<u8>,
+        ttl: Option<Duration>,
         reply: SyncSender<Result<(), ShardError>>,
     },
     Delete {
         key: Vec<u8>,
         reply: SyncSender<Result<(), ShardError>>,
+    },
+    DeleteIfExpired {
+        key: Vec<u8>,
+        reply: SyncSender<Result<bool, ShardError>>,
     },
     Commit {
         reply: SyncSender<Result<Hash, ShardError>>,
@@ -172,6 +177,7 @@ pub(super) enum ShardCommandKind {
         key: Vec<u8>,
         entries: Vec<Vec<u8>>,
         expected_seq: u64,
+        ttl: Option<Duration>,
         reply: SyncSender<Result<u64, ShardError>>,
     },
     ReadValue {
@@ -301,8 +307,27 @@ impl ShardHandle {
     /// # Errors
     /// Returns a [`ShardError`] as for [`Self::get`].
     pub fn put(&self, key: Vec<u8>, value: Vec<u8>, timeout: Duration) -> Result<(), ShardError> {
+        self.put_with_ttl(key, value, None, timeout)
+    }
+
+    /// Append a put with optional TTL metadata, blocking for the ack.
+    ///
+    /// # Errors
+    /// Returns a [`ShardError`] as for [`Self::get`].
+    pub fn put_with_ttl(
+        &self,
+        key: Vec<u8>,
+        value: Vec<u8>,
+        ttl: Option<Duration>,
+        timeout: Duration,
+    ) -> Result<(), ShardError> {
         let (reply, response) = mpsc::sync_channel(1);
-        self.enqueue(ShardCommandKind::Put { key, value, reply })?;
+        self.enqueue(ShardCommandKind::Put {
+            key,
+            value,
+            ttl,
+            reply,
+        })?;
         recv(&response, self.pid, timeout)?
     }
 
@@ -313,6 +338,18 @@ impl ShardHandle {
     pub fn delete(&self, key: Vec<u8>, timeout: Duration) -> Result<(), ShardError> {
         let (reply, response) = mpsc::sync_channel(1);
         self.enqueue(ShardCommandKind::Delete { key, reply })?;
+        recv(&response, self.pid, timeout)?
+    }
+
+    /// Delete `key` only if it is currently present and expired, re-checked
+    /// atomically inside the actor so a concurrent refresh is never clobbered.
+    /// Returns whether a delete was issued.
+    ///
+    /// # Errors
+    /// Returns a [`ShardError`] as for [`Self::delete`].
+    pub fn delete_if_expired(&self, key: Vec<u8>, timeout: Duration) -> Result<bool, ShardError> {
+        let (reply, response) = mpsc::sync_channel(1);
+        self.enqueue(ShardCommandKind::DeleteIfExpired { key, reply })?;
         recv(&response, self.pid, timeout)?
     }
 
@@ -355,11 +392,28 @@ impl ShardHandle {
         expected_seq: u64,
         timeout: Duration,
     ) -> Result<u64, ShardError> {
+        self.append_with_ttl(key, entries, expected_seq, None, timeout)
+    }
+
+    /// Atomically append event entries for one logical key with optional TTL.
+    ///
+    /// # Errors
+    /// Returns a [`ShardError`] as for [`Self::get`], or
+    /// [`ShardError::SequenceConflict`] when optimistic concurrency fails.
+    pub fn append_with_ttl(
+        &self,
+        key: Vec<u8>,
+        entries: Vec<Vec<u8>>,
+        expected_seq: u64,
+        ttl: Option<Duration>,
+        timeout: Duration,
+    ) -> Result<u64, ShardError> {
         let (reply, response) = mpsc::sync_channel(1);
         self.enqueue(ShardCommandKind::Append {
             key,
             entries,
             expected_seq,
+            ttl,
             reply,
         })?;
         recv(&response, self.pid, timeout)?

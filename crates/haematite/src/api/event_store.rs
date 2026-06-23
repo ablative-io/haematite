@@ -42,7 +42,9 @@
 //! could be read through the other's decoder. Aion's usage keeps event-stream
 //! keys and CAS keys in separate, non-overlapping namespaces.
 
-use crate::api::error::{ApiError, CasMismatch, SequenceConflict};
+use std::time::Duration;
+
+use crate::api::error::{ApiError, CasMismatch, HistoryCompacted, SequenceConflict};
 use crate::api::types::{Event, ScanResult, StreamMeta};
 use crate::branch::{Timestamp, current_timestamp};
 use crate::db::{Database, DatabaseError};
@@ -96,7 +98,18 @@ impl EventStore {
         payload: &[u8],
         expected_seq: u64,
     ) -> Result<u64, ApiError> {
-        self.append_batch(stream_key, &[payload], expected_seq)
+        self.append_batch_with_ttl(stream_key, &[payload], expected_seq, None)
+    }
+
+    /// Atomically append `payload` with optional TTL metadata.
+    pub fn append_with_ttl(
+        &self,
+        stream_key: &[u8],
+        payload: &[u8],
+        expected_seq: u64,
+        ttl: Option<Duration>,
+    ) -> Result<u64, ApiError> {
+        self.append_batch_with_ttl(stream_key, &[payload], expected_seq, ttl)
     }
 
     /// Atomically append many `payloads` to `stream_key` as one tree commit.
@@ -112,12 +125,26 @@ impl EventStore {
         payloads: &[&[u8]],
         expected_seq: u64,
     ) -> Result<u64, ApiError> {
+        self.append_batch_with_ttl(stream_key, payloads, expected_seq, None)
+    }
+
+    /// Atomically append many `payloads` with optional TTL metadata.
+    pub fn append_batch_with_ttl(
+        &self,
+        stream_key: &[u8],
+        payloads: &[&[u8]],
+        expected_seq: u64,
+        ttl: Option<Duration>,
+    ) -> Result<u64, ApiError> {
         let timestamp = current_timestamp();
         let entries: Vec<Vec<u8>> = payloads
             .iter()
             .map(|payload| encode_value(timestamp, payload))
             .collect();
-        match self.db.append(stream_key.to_vec(), entries, expected_seq) {
+        match self
+            .db
+            .append_with_ttl(stream_key.to_vec(), entries, expected_seq, ttl)
+        {
             Ok(next_seq) => Ok(next_seq),
             Err(DatabaseError::SequenceConflict { expected, actual }) => {
                 Err(ApiError::SequenceConflict(SequenceConflict {
@@ -155,11 +182,17 @@ impl EventStore {
         // `from_seq` at the tree level (R5: a range query, not read+filter).
         let engine_from = from_seq.saturating_add(1);
         let entries = self.db.read_event_entries_from(stream_key, engine_from)?;
+        let next_seq = self.db.read_stream_next_seq(stream_key)?;
         let mut events = Vec::with_capacity(entries.len());
         for (key, value) in entries {
             let seq = decode_event_seq(stream_key, &key)?;
             let (timestamp, payload) = decode_value(&value)?;
             events.push(Event::new(seq, payload, timestamp));
+        }
+        if events.is_empty() && from_seq == 0 && next_seq.is_some_and(|next_seq| next_seq > 0) {
+            return Err(ApiError::HistoryCompacted(HistoryCompacted::new(
+                stream_key.to_vec(),
+            )));
         }
         Ok(events)
     }
@@ -212,7 +245,7 @@ impl EventStore {
                 stream_key,
                 next_seq: *next_seq,
             };
-            if predicate(meta) {
+            if predicate(meta) && self.db.stream_has_live_events(stream_key)? {
                 matches.push(ScanResult::new(stream_key.clone(), *next_seq));
             }
         }

@@ -66,6 +66,33 @@ impl fmt::Display for CasMismatch {
 
 impl std::error::Error for CasMismatch {}
 
+/// A stream existed, but the readable event history requested by the caller was
+/// compacted away by TTL expiry.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct HistoryCompacted {
+    pub stream_key: Vec<u8>,
+}
+
+impl HistoryCompacted {
+    /// Construct a [`HistoryCompacted`] error for `stream_key`.
+    #[must_use]
+    pub const fn new(stream_key: Vec<u8>) -> Self {
+        Self { stream_key }
+    }
+}
+
+impl fmt::Display for HistoryCompacted {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "event history compacted for stream {:?}",
+            self.stream_key
+        )
+    }
+}
+
+impl std::error::Error for HistoryCompacted {}
+
 /// Umbrella error for every `EventStore` operation.
 ///
 /// Optimistic-concurrency failures are surfaced as their dedicated variants so
@@ -78,6 +105,8 @@ pub enum ApiError {
     SequenceConflict(SequenceConflict),
     /// `cas` saw a non-matching current value; the key was not modified.
     CasMismatch(CasMismatch),
+    /// A stream exists but its requested history has expired.
+    HistoryCompacted(HistoryCompacted),
     /// A stored event value or sequence header was malformed on read.
     CorruptEvent(String),
     /// An error from the underlying storage layer.
@@ -89,6 +118,7 @@ impl fmt::Display for ApiError {
         match self {
             Self::SequenceConflict(conflict) => write!(formatter, "{conflict}"),
             Self::CasMismatch(mismatch) => write!(formatter, "{mismatch}"),
+            Self::HistoryCompacted(compacted) => write!(formatter, "{compacted}"),
             Self::CorruptEvent(message) => {
                 write!(formatter, "corrupt event record: {message}")
             }
@@ -102,6 +132,7 @@ impl std::error::Error for ApiError {
         match self {
             Self::SequenceConflict(conflict) => Some(conflict),
             Self::CasMismatch(mismatch) => Some(mismatch),
+            Self::HistoryCompacted(compacted) => Some(compacted),
             Self::Storage(error) => Some(error),
             Self::CorruptEvent(_) => None,
         }
@@ -117,6 +148,12 @@ impl From<SequenceConflict> for ApiError {
 impl From<CasMismatch> for ApiError {
     fn from(mismatch: CasMismatch) -> Self {
         Self::CasMismatch(mismatch)
+    }
+}
+
+impl From<HistoryCompacted> for ApiError {
+    fn from(compacted: HistoryCompacted) -> Self {
+        Self::HistoryCompacted(compacted)
     }
 }
 

@@ -15,6 +15,7 @@ fn config_for(path: &Path, shard_count: usize) -> DatabaseConfig {
     DatabaseConfig {
         data_dir: path.to_path_buf(),
         shard_count,
+        sweep_interval: None,
     }
 }
 
@@ -34,6 +35,7 @@ fn assert_config_json(path: &Path, shard_count: usize) -> Result<(), Box<dyn Err
         parsed.get("shard_count"),
         Some(&Value::from(u64::try_from(shard_count)?))
     );
+    assert_eq!(parsed.get("sweep_interval"), Some(&Value::Null));
     Ok(())
 }
 
@@ -68,6 +70,8 @@ fn database_error_implements_error_debug_and_display() {
         expected: 1,
         actual: 2,
     });
+    check_database_error(&DatabaseError::MissingSweepInterval);
+    check_database_error(&DatabaseError::InvalidSweepInterval);
 }
 
 #[test]
@@ -135,6 +139,7 @@ fn open_rejects_zero_shards_from_config() -> Result<(), Box<dyn Error>> {
         serde_json::json!({
             "data_dir": dir.path(),
             "shard_count": 0,
+            "sweep_interval": null,
         })
         .to_string(),
     )?;
@@ -397,6 +402,7 @@ fn crate_root_reexports_database_types() {
         crate::DatabaseConfig {
             data_dir: PathBuf::from("root"),
             shard_count: 1,
+            sweep_interval: None,
         },
         None,
         None,

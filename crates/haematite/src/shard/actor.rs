@@ -1,5 +1,7 @@
 // CORE-007: Shard actor — owns tree + WAL buffer, handles get/put/delete/commit messages
 
+use std::time::Duration;
+
 mod errors;
 pub mod handle;
 pub mod native;
@@ -10,8 +12,11 @@ use errors::{AppendError, CasError};
 
 pub use handle::{RangeItem, ShardError, ShardHandle};
 
+use crate::branch::current_timestamp;
 use crate::store::NodeStore;
 use crate::tree::{Cursor, Hash, LeafNode, Node, batch_mutate};
+use crate::ttl::entry::encode_optional_ttl;
+use crate::ttl::filter::{Visibility, is_expired_at, visible_value};
 use crate::wal::{DurableWal, LookupResult, Mutation, RecoveredWal, WalBuffer, WalError};
 
 /// Minimal shard write boundary used by the durable WAL layer.
@@ -59,6 +64,7 @@ impl ShardActor {
     }
 
     /// Append a put to the durable WAL, then buffer it for a future tree commit.
+    #[cfg(test)]
     pub fn put<K, V>(&mut self, key: K, value: V) -> Result<(), WalError>
     where
         K: Into<Vec<u8>>,
@@ -66,6 +72,26 @@ impl ShardActor {
     {
         let key = key.into();
         let value = value.into();
+        self.put_encoded(key, value)
+    }
+
+    /// Append a put with optional TTL metadata to the durable WAL and buffer.
+    pub fn put_with_ttl<K, V>(
+        &mut self,
+        key: K,
+        value: V,
+        ttl: Option<Duration>,
+    ) -> Result<(), WalError>
+    where
+        K: Into<Vec<u8>>,
+        V: Into<Vec<u8>>,
+    {
+        let key = key.into();
+        let value = encode_ttl_value(value.into(), ttl)?;
+        self.put_encoded(key, value)
+    }
+
+    fn put_encoded(&mut self, key: Vec<u8>, value: Vec<u8>) -> Result<(), WalError> {
         let mutation = Mutation::Put {
             key: key.clone(),
             value: value.clone(),
@@ -87,6 +113,38 @@ impl ShardActor {
         Ok(())
     }
 
+    /// Delete `key` only if its current stored value is present and expired now,
+    /// re-checking the live buffer+tree inside the actor's single-threaded slice.
+    ///
+    /// The sweep computes its candidate set from an independent store+WAL
+    /// snapshot; re-checking here closes the window in which a concurrent refresh
+    /// (a fresh `put` landing between the snapshot and this delete) would be
+    /// clobbered by an unconditional delete. Expiry is evaluated against the raw
+    /// stored bytes (not the read-filtered view) at the current clock. Returns
+    /// whether a delete was issued.
+    pub fn delete_if_expired<S>(&mut self, key: &[u8], store: &S) -> Result<bool, WalError>
+    where
+        S: NodeStore + ?Sized,
+    {
+        let current = match self.buffer.get(key) {
+            LookupResult::BufferedValue(value) => Some(value),
+            LookupResult::BufferedDelete => None,
+            LookupResult::NotBuffered => match self.committed_root {
+                Some(root) => Cursor::new(store, root).get(key).map_err(tree_error)?,
+                None => None,
+            },
+        };
+        let Some(value) = current else {
+            return Ok(false);
+        };
+        if is_expired_at(&value, current_timestamp()).map_err(tree_error)? {
+            self.delete(key.to_vec())?;
+            Ok(true)
+        } else {
+            Ok(false)
+        }
+    }
+
     /// Read through the recovered/live buffer first, then the committed tree.
     pub fn get<K, S>(&self, key: K, store: &S) -> Result<Option<Vec<u8>>, WalError>
     where
@@ -95,11 +153,15 @@ impl ShardActor {
     {
         let key = key.as_ref();
         match self.buffer.get(key) {
-            LookupResult::BufferedValue(value) => Ok(Some(value)),
+            LookupResult::BufferedValue(value) => visible_ttl_value(&value),
             LookupResult::BufferedDelete => Ok(None),
             LookupResult::NotBuffered => self.committed_root.map_or_else(
                 || Ok(None),
-                |root| Cursor::new(store, root).get(key).map_err(tree_error),
+                |root| {
+                    visible_optional_ttl_value(
+                        Cursor::new(store, root).get(key).map_err(tree_error)?,
+                    )
+                },
             ),
         }
     }
@@ -133,6 +195,7 @@ impl ShardActor {
         key: &[u8],
         entries: Vec<Vec<u8>>,
         expected_seq: u64,
+        ttl: Option<Duration>,
         store: &mut S,
     ) -> Result<u64, AppendError>
     where
@@ -161,9 +224,10 @@ impl ShardActor {
             let seq = actual
                 .checked_add(offset.saturating_add(1))
                 .ok_or_else(|| WalError::TreeError("append sequence overflow".to_owned()))?;
+            let value = encode_ttl_value(entry, ttl)?;
             mutations.push(Mutation::Put {
                 key: event_key(key, seq),
-                value: entry,
+                value,
             });
         }
         mutations.push(Mutation::Put {
@@ -312,6 +376,21 @@ where
     store.put(&node).map_err(tree_error)
 }
 
+fn encode_ttl_value(value: Vec<u8>, ttl: Option<Duration>) -> Result<Vec<u8>, WalError> {
+    encode_optional_ttl(value, ttl).map_err(tree_error)
+}
+
+fn visible_optional_ttl_value(value: Option<Vec<u8>>) -> Result<Option<Vec<u8>>, WalError> {
+    value.map_or(Ok(None), |value| visible_ttl_value(&value))
+}
+
+fn visible_ttl_value(value: &[u8]) -> Result<Option<Vec<u8>>, WalError> {
+    match visible_value(value).map_err(tree_error)? {
+        Visibility::Live(value) => Ok(Some(value)),
+        Visibility::Expired => Ok(None),
+    }
+}
+
 fn tree_error(error: impl std::fmt::Display) -> WalError {
     WalError::TreeError(error.to_string())
 }
@@ -387,6 +466,35 @@ mod storage_tests {
             DurableWal::read_file(path)?.entries(),
             &[WalEntry::delete(b"event".to_vec())]
         );
+        Ok(())
+    }
+
+    #[test]
+    fn delete_if_expired_removes_only_expired_values() -> Result<(), WalError> {
+        // The sweep's atomic re-check: delete_if_expired must remove an expired
+        // entry but leave a live (or refreshed) one untouched. Falsifiable — an
+        // unconditional delete would also drop the live "keep" value.
+        let temp = temp_path("actor-delete-if-expired.wal")?;
+        let wal = DurableWal::new(temp.path(), FsyncPolicy::CommitOnly)?;
+        let mut actor = ShardActor::new(wal);
+        let store = MemoryStore::new();
+
+        // A live (never-expiring) value is NOT removed.
+        actor.put(b"live".to_vec(), b"keep".to_vec())?;
+        assert!(!actor.delete_if_expired(b"live", &store)?);
+        assert_eq!(actor.get(b"live", &store)?, Some(b"keep".to_vec()));
+
+        // An expired value IS removed.
+        actor.put_with_ttl(
+            b"gone".to_vec(),
+            b"stale".to_vec(),
+            Some(std::time::Duration::ZERO),
+        )?;
+        assert!(actor.delete_if_expired(b"gone", &store)?);
+        assert_eq!(actor.get(b"gone", &store)?, None);
+
+        // An absent key is a no-op.
+        assert!(!actor.delete_if_expired(b"missing", &store)?);
         Ok(())
     }
 

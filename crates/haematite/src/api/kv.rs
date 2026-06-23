@@ -13,6 +13,7 @@
 //! sorted result.
 
 use std::collections::BTreeMap;
+use std::time::Duration;
 
 use crate::db::helpers::{map_shard_error, ordered_hashes, range_on_handle};
 use crate::db::{Database, DatabaseError, run_indexed_parallel};
@@ -51,8 +52,22 @@ impl Database {
     ///
     /// This does not flush to the tree; [`Self::commit`] owns that boundary.
     pub fn put(&self, key: KvKey, value: KvValue) -> Result<(), DatabaseError> {
+        self.put_with_ttl(key, value, None)
+    }
+
+    /// Append a single-key put with optional TTL metadata.
+    ///
+    /// This does not flush to the tree; [`Self::commit`] owns that boundary.
+    /// A `Some(ttl)` write requires `DatabaseConfig::sweep_interval` to be set.
+    pub fn put_with_ttl(
+        &self,
+        key: KvKey,
+        value: KvValue,
+        ttl: Option<Duration>,
+    ) -> Result<(), DatabaseError> {
+        self.validate_ttl_write(ttl)?;
         self.handle_for(&key)?
-            .put(key, value, self.timeout())
+            .put_with_ttl(key, value, ttl, self.timeout())
             .map_err(map_shard_error)
     }
 
@@ -100,6 +115,7 @@ impl Database {
 mod tests {
     use std::error::Error;
     use std::path::Path;
+    use std::time::Duration;
 
     use crate::db::{Database, DatabaseConfig};
     use crate::wal::{DurableWal, OperationType};
@@ -108,6 +124,7 @@ mod tests {
         DatabaseConfig {
             data_dir: path.to_path_buf(),
             shard_count,
+            sweep_interval: None,
         }
     }
 
@@ -255,6 +272,63 @@ mod tests {
             Some(b"value".to_vec())
         );
         assert_eq!(reopened.commit()?, committed_roots);
+        Ok(())
+    }
+
+    #[test]
+    fn put_with_ttl_requires_configured_sweep_interval() -> Result<(), Box<dyn Error>> {
+        let dir = tempfile::tempdir()?;
+        let data_dir = dir.path().join("db");
+        let db = Database::create(config_for(&data_dir, 4))?;
+
+        assert!(matches!(
+            db.put_with_ttl(
+                b"temporary".to_vec(),
+                b"value".to_vec(),
+                Some(Duration::from_secs(1)),
+            ),
+            Err(crate::DatabaseError::MissingSweepInterval)
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn get_and_range_filter_expired_ttl_entries() -> Result<(), Box<dyn Error>> {
+        let dir = tempfile::tempdir()?;
+        let data_dir = dir.path().join("db");
+        let mut config = config_for(&data_dir, 4);
+        // This test exercises read-time TTL filtering, not the physical sweep, so
+        // use a long interval: the sweep's first tick fires after `interval`, well
+        // past this sub-second test, keeping the scheduler free of sweep load.
+        // (Physical sweeping is covered by ttl::sweep's dedicated test.)
+        config.sweep_interval = Some(60_000);
+        let db = Database::create(config)?;
+        let range_from = b"ttl:";
+        let range_to = b"ttl;";
+        let mut keys = Vec::new();
+        let mut candidate = 0_u64;
+        while keys.len() < 2 {
+            let key = format!("ttl:{candidate:04}").into_bytes();
+            if db.shard_for(&key) == db.shard_for(range_from) {
+                keys.push(key);
+            }
+            candidate = candidate.saturating_add(1);
+        }
+        keys.sort();
+
+        db.put_with_ttl(keys[0].clone(), b"expired".to_vec(), Some(Duration::ZERO))?;
+        db.put_with_ttl(
+            keys[1].clone(),
+            b"live".to_vec(),
+            Some(Duration::from_secs(60)),
+        )?;
+
+        assert_eq!(db.get(&keys[0])?, None);
+        assert_eq!(db.get(&keys[1])?, Some(b"live".to_vec()));
+        assert_eq!(
+            db.range(range_from, range_to)?,
+            vec![(keys[1].clone(), b"live".to_vec())]
+        );
         Ok(())
     }
 }
