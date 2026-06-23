@@ -18,6 +18,11 @@ pub use branch::{
     current_timestamp, fork, fork_registered, fork_shards, fork_shards_registered, merge,
 };
 
+pub use api::{
+    ApiError, CasMismatch, Event, EventStore, ScanResult, SequenceConflict, StreamMeta,
+    decode_stream_key, encode_stream_key,
+};
+
 pub use db::{Database, DatabaseConfig, DatabaseError};
 
 pub use error::Error;

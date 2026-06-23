@@ -1,11 +1,14 @@
 // CORE-007: Shard actor — owns tree + WAL buffer, handles get/put/delete/commit messages
 
+mod errors;
 pub mod handle;
 pub mod native;
+mod scan;
+mod startup;
+
+use errors::{AppendError, CasError};
 
 pub use handle::{RangeItem, ShardError, ShardHandle};
-
-use std::fmt;
 
 use crate::store::NodeStore;
 use crate::tree::{Cursor, Hash, LeafNode, Node, batch_mutate};
@@ -24,51 +27,6 @@ pub struct ShardActor {
     wal: DurableWal,
     buffer: WalBuffer,
     committed_root: Option<Hash>,
-}
-
-/// Errors returned by shard-local event append operations.
-#[derive(Debug)]
-enum AppendError {
-    SequenceConflict { expected: u64, actual: u64 },
-    Wal(WalError),
-}
-
-impl fmt::Display for AppendError {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::SequenceConflict { expected, actual } => write!(
-                formatter,
-                "sequence conflict on append: expected {expected}, actual {actual}"
-            ),
-            Self::Wal(error) => write!(formatter, "append WAL error: {error}"),
-        }
-    }
-}
-
-impl std::error::Error for AppendError {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        match self {
-            Self::Wal(error) => Some(error),
-            Self::SequenceConflict { .. } => None,
-        }
-    }
-}
-
-impl From<WalError> for AppendError {
-    fn from(error: WalError) -> Self {
-        Self::Wal(error)
-    }
-}
-
-impl From<AppendError> for ShardError {
-    fn from(error: AppendError) -> Self {
-        match error {
-            AppendError::SequenceConflict { expected, actual } => {
-                Self::SequenceConflict { expected, actual }
-            }
-            AppendError::Wal(error) => Self::from(error),
-        }
-    }
 }
 
 impl ShardActor {
@@ -225,6 +183,60 @@ impl ShardActor {
         }
     }
 
+    /// Read a scalar `u64` value for `key`, or `None` if the key is unset.
+    ///
+    /// A stored value must be exactly eight big-endian bytes; anything else is a
+    /// corrupt scalar and surfaces as a tree error.
+    fn read_value<S>(&self, key: &[u8], store: &S) -> Result<Option<u64>, WalError>
+    where
+        S: NodeStore + ?Sized,
+    {
+        self.get(key, store)?.map_or(Ok(None), |bytes| {
+            bytes
+                .as_slice()
+                .try_into()
+                .map(|raw| Some(u64::from_be_bytes(raw)))
+                .map_err(|_| WalError::TreeError("invalid scalar value".to_owned()))
+        })
+    }
+
+    /// Atomically compare-and-swap the scalar `u64` value at `key`.
+    ///
+    /// The read of the current value, the comparison against `expected`, and
+    /// the write of `new` all run inside this one call. Because every shard
+    /// command is executed by the shard's single-threaded native process — one
+    /// command per slice, popped under the queue lock — no other command can
+    /// observe or mutate `key` between the read and the write. That is what
+    /// makes the operation atomic: there is no interleaving point.
+    ///
+    /// On a value mismatch the actual current value is returned in
+    /// [`CasError::Mismatch`] and nothing is written. On a match the new value
+    /// is buffered and committed as a single tree commit.
+    fn cas<S>(
+        &mut self,
+        key: &[u8],
+        expected: Option<u64>,
+        new: u64,
+        store: &mut S,
+    ) -> Result<(), CasError>
+    where
+        S: NodeStore + ?Sized,
+    {
+        let actual = self.read_value(key, store)?;
+        if actual != expected {
+            return Err(CasError::Mismatch { expected, actual });
+        }
+        let previous_buffer = self.buffer.clone();
+        self.buffer.put(key, new.to_be_bytes());
+        match self.commit(store) {
+            Ok(_root) => Ok(()),
+            Err(error) => {
+                self.buffer = previous_buffer;
+                Err(CasError::from(error))
+            }
+        }
+    }
+
     /// Inspect buffered mutations; exposed for tests and future shard wiring.
     #[must_use]
     pub const fn buffer(&self) -> &WalBuffer {
@@ -260,12 +272,26 @@ fn event_key(key: &[u8], seq: u64) -> Vec<u8> {
     encoded
 }
 
+/// Suffix appended to a stream key to form its sequence-metadata key.
+pub(super) const SEQ_SUFFIX: &[u8] = &[0xff, b's', b'e', b'q'];
+
 fn sequence_key(key: &[u8]) -> Vec<u8> {
-    let mut encoded = Vec::with_capacity(key.len().saturating_add(4));
+    let mut encoded = Vec::with_capacity(key.len().saturating_add(SEQ_SUFFIX.len()));
     encoded.extend_from_slice(key);
-    encoded.push(0xff);
-    encoded.extend_from_slice(b"seq");
+    encoded.extend_from_slice(SEQ_SUFFIX);
     encoded
+}
+
+/// Recover a stream key from an encoded sequence-metadata key, if the encoded
+/// key carries the [`SEQ_SUFFIX`].
+pub(super) fn decode_sequence_key(encoded: &[u8]) -> Option<&[u8]> {
+    encoded
+        .len()
+        .checked_sub(SEQ_SUFFIX.len())
+        .and_then(|split| {
+            let (stream_key, suffix) = encoded.split_at(split);
+            (suffix == SEQ_SUFFIX).then_some(stream_key)
+        })
 }
 
 fn buffered_batch(buffer: &WalBuffer) -> Vec<(Vec<u8>, Option<Vec<u8>>)> {

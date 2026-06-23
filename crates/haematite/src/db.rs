@@ -8,9 +8,16 @@ use std::time::Duration;
 use beamr::module::ModuleRegistry;
 use beamr::scheduler::{Scheduler, SchedulerConfig};
 
-use crate::shard::actor::{RangeItem, ShardError, ShardHandle};
+use crate::shard::actor::{ShardError, ShardHandle};
 use crate::shard::router::ShardRouter;
 use crate::tree::Hash;
+
+mod helpers;
+
+use helpers::{
+    event_range_end, event_range_start, map_shard_error, map_spawn_error, ordered_hashes,
+    range_on_handle,
+};
 
 const CONFIG_FILE: &str = "config.json";
 const SHARD_STORE_DIR: &str = "store";
@@ -39,7 +46,14 @@ pub enum DatabaseError {
     ShardSpawn(String),
     ShardError(String),
     IoError(io::Error),
-    SequenceConflict { expected: u64, actual: u64 },
+    SequenceConflict {
+        expected: u64,
+        actual: u64,
+    },
+    CasMismatch {
+        expected: Option<u64>,
+        actual: Option<u64>,
+    },
 }
 
 impl fmt::Display for DatabaseError {
@@ -65,6 +79,10 @@ impl fmt::Display for DatabaseError {
                 formatter,
                 "sequence conflict on append: expected {expected}, actual {actual}"
             ),
+            Self::CasMismatch { expected, actual } => write!(
+                formatter,
+                "cas mismatch: expected {expected:?}, actual {actual:?}"
+            ),
         }
     }
 }
@@ -80,7 +98,8 @@ impl std::error::Error for DatabaseError {
             | Self::InvalidShardCount
             | Self::ShardSpawn(_)
             | Self::ShardError(_)
-            | Self::SequenceConflict { .. } => None,
+            | Self::SequenceConflict { .. }
+            | Self::CasMismatch { .. } => None,
         }
     }
 }
@@ -201,6 +220,59 @@ impl Database {
         let to = event_range_end(key);
         let entries = range_on_handle(self.handle_for(key)?, &from, &to, self.timeout)?;
         Ok(entries.into_iter().map(|(_, value)| value).collect())
+    }
+
+    /// Read appended event entries for `key` from `from_seq` onward as raw
+    /// `(encoded_key, value)` pairs, in sequence order.
+    ///
+    /// Unlike [`Self::read_events_from`], this preserves the encoded tree key so
+    /// the caller (the `EventStore`) can decode each event's sequence number from
+    /// its key rather than trusting a value-side copy.
+    pub fn read_event_entries_from(
+        &self,
+        key: &[u8],
+        from_seq: u64,
+    ) -> Result<DbRange, DatabaseError> {
+        let from = event_range_start(key, from_seq);
+        let to = event_range_end(key);
+        range_on_handle(self.handle_for(key)?, &from, &to, self.timeout)
+    }
+
+    /// Read the scalar `u64` value at `key`, or `None` if it is unset.
+    pub fn read_value(&self, key: &[u8]) -> Result<Option<u64>, DatabaseError> {
+        self.handle_for(key)?
+            .read_value(key.to_vec(), self.timeout)
+            .map_err(map_shard_error)
+    }
+
+    /// Atomically compare-and-swap the scalar `u64` value at `key`.
+    ///
+    /// The read-compare-write executes inside the owning shard's single-threaded
+    /// actor, so concurrent CAS calls against the same key are serialised and
+    /// cannot race. Returns [`DatabaseError::CasMismatch`] if the current value
+    /// is not `expected`.
+    pub fn cas(&self, key: Vec<u8>, expected: Option<u64>, new: u64) -> Result<(), DatabaseError> {
+        self.handle_for(&key)?
+            .cas(key, expected, new, self.timeout)
+            .map_err(map_shard_error)
+    }
+
+    /// Collect every stream's `(stream_key, next_seq)` pair across all shards.
+    ///
+    /// This walks each shard in parallel, scanning its full key range for the
+    /// per-stream sequence-metadata keys and decoding each one. It is the
+    /// O(total entries) traversal that backs the `EventStore` `scan` predicate.
+    pub fn scan_sequence_keys(&self) -> Result<Vec<(Vec<u8>, u64)>, DatabaseError> {
+        let handles = self.router.handles_in_order().to_vec();
+        let timeout = self.timeout;
+        let results = run_indexed_parallel(handles, |handle: ShardHandle| {
+            handle.scan_sequences(timeout)
+        })?;
+        let mut streams = Vec::new();
+        for (_, result) in results {
+            streams.extend(result.map_err(map_shard_error)?);
+        }
+        Ok(streams)
     }
 
     fn handle_for(&self, key: &[u8]) -> Result<&ShardHandle, DatabaseError> {
@@ -385,90 +457,6 @@ where
         }
         Ok(results)
     })
-}
-
-fn map_spawn_error(error: ShardError) -> DatabaseError {
-    match error {
-        ShardError::Spawn(message) => DatabaseError::ShardSpawn(message),
-        other => map_shard_error(other),
-    }
-}
-
-fn map_shard_error(error: ShardError) -> DatabaseError {
-    match error {
-        ShardError::SequenceConflict { expected, actual } => {
-            DatabaseError::SequenceConflict { expected, actual }
-        }
-        ShardError::Spawn(message) => DatabaseError::ShardSpawn(message),
-        other => DatabaseError::ShardError(other.to_string()),
-    }
-}
-
-fn ordered_hashes(
-    results: Vec<ShardCommitResult>,
-    shard_count: usize,
-) -> Result<Vec<Hash>, DatabaseError> {
-    let mut ordered = vec![None; shard_count];
-    for (index, result) in results {
-        match result {
-            Ok(hash) => {
-                if let Some(slot) = ordered.get_mut(index) {
-                    *slot = Some(hash);
-                }
-            }
-            Err(error) => return Err(map_shard_error(error)),
-        }
-    }
-    let mut hashes = Vec::with_capacity(shard_count);
-    for hash in ordered {
-        let Some(hash) = hash else {
-            return Err(DatabaseError::ShardError(
-                "missing shard commit result".to_owned(),
-            ));
-        };
-        hashes.push(hash);
-    }
-    Ok(hashes)
-}
-
-fn range_on_handle(
-    handle: &ShardHandle,
-    from: &[u8],
-    to: &[u8],
-    timeout: Duration,
-) -> Result<DbRange, DatabaseError> {
-    let items = handle
-        .range(from.to_vec(), to.to_vec(), timeout)
-        .map_err(map_shard_error)?;
-    collect_range_items(items)
-}
-
-fn collect_range_items(items: Vec<RangeItem>) -> Result<DbRange, DatabaseError> {
-    let mut entries = Vec::new();
-    for item in items {
-        match item {
-            RangeItem::Entry { key, value } => entries.push((key, value)),
-            RangeItem::Done => return Ok(entries),
-        }
-    }
-    Err(DatabaseError::ShardError(
-        "range result missing Done".to_owned(),
-    ))
-}
-
-fn event_range_start(key: &[u8], seq: u64) -> Vec<u8> {
-    let mut encoded = Vec::with_capacity(key.len().saturating_add(9));
-    encoded.extend_from_slice(key);
-    encoded.push(0);
-    encoded.extend_from_slice(&seq.to_be_bytes());
-    encoded
-}
-
-fn event_range_end(key: &[u8]) -> Vec<u8> {
-    let mut encoded = Vec::with_capacity(key.len().saturating_add(1));
-    encoded.extend_from_slice(key);
-    encoded.push(1);
-    encoded
 }
 
 #[cfg(test)]

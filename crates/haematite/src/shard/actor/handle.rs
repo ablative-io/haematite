@@ -62,6 +62,11 @@ pub enum ShardError {
     Spawn(String),
     /// An append expected one sequence number but found another.
     SequenceConflict { expected: u64, actual: u64 },
+    /// A compare-and-swap saw a scalar value other than the one expected.
+    CasMismatch {
+        expected: Option<u64>,
+        actual: Option<u64>,
+    },
 }
 
 impl fmt::Display for ShardError {
@@ -84,6 +89,10 @@ impl fmt::Display for ShardError {
                 formatter,
                 "sequence conflict on append: expected {expected}, actual {actual}"
             ),
+            Self::CasMismatch { expected, actual } => write!(
+                formatter,
+                "cas mismatch: expected {expected:?}, actual {actual:?}"
+            ),
         }
     }
 }
@@ -98,7 +107,8 @@ impl std::error::Error for ShardError {
             | Self::ReplyDisconnected { .. }
             | Self::ReplyTimeout { .. }
             | Self::Spawn(_)
-            | Self::SequenceConflict { .. } => None,
+            | Self::SequenceConflict { .. }
+            | Self::CasMismatch { .. } => None,
         }
     }
 }
@@ -120,6 +130,12 @@ impl From<StoreError> for ShardError {
         Self::Store(error)
     }
 }
+
+/// One stream's decoded sequence metadata: `(stream_key, next_seq)`.
+pub(super) type StreamSeq = (Vec<u8>, u64);
+
+/// Reply channel payload for a `scan_sequences` request.
+pub(super) type ScanReply = SyncSender<Result<Vec<StreamSeq>, ShardError>>;
 
 /// A queued command: a monotonic id (so a failed enqueue can be rolled back)
 /// plus the typed request and its reply channel.
@@ -157,6 +173,19 @@ pub(super) enum ShardCommandKind {
         entries: Vec<Vec<u8>>,
         expected_seq: u64,
         reply: SyncSender<Result<u64, ShardError>>,
+    },
+    ReadValue {
+        key: Vec<u8>,
+        reply: SyncSender<Result<Option<u64>, ShardError>>,
+    },
+    Cas {
+        key: Vec<u8>,
+        expected: Option<u64>,
+        new: u64,
+        reply: SyncSender<Result<(), ShardError>>,
+    },
+    ScanSequences {
+        reply: ScanReply,
     },
     Shutdown {
         reply: SyncSender<Result<(), ShardError>>,
@@ -333,6 +362,52 @@ impl ShardHandle {
             expected_seq,
             reply,
         })?;
+        recv(&response, self.pid, timeout)?
+    }
+
+    /// Read the scalar `u64` value for `key`, blocking up to `timeout`.
+    ///
+    /// # Errors
+    /// Returns a [`ShardError`] as for [`Self::get`].
+    pub fn read_value(&self, key: Vec<u8>, timeout: Duration) -> Result<Option<u64>, ShardError> {
+        let (reply, response) = mpsc::sync_channel(1);
+        self.enqueue(ShardCommandKind::ReadValue { key, reply })?;
+        recv(&response, self.pid, timeout)?
+    }
+
+    /// Atomically compare-and-swap the scalar `u64` value at `key`.
+    ///
+    /// The read-compare-write executes inside the shard's single-threaded
+    /// process handler, so concurrent CAS calls on the same key cannot race.
+    ///
+    /// # Errors
+    /// Returns a [`ShardError`] as for [`Self::get`], or
+    /// [`ShardError::CasMismatch`] when the current value is not `expected`.
+    pub fn cas(
+        &self,
+        key: Vec<u8>,
+        expected: Option<u64>,
+        new: u64,
+        timeout: Duration,
+    ) -> Result<(), ShardError> {
+        let (reply, response) = mpsc::sync_channel(1);
+        self.enqueue(ShardCommandKind::Cas {
+            key,
+            expected,
+            new,
+            reply,
+        })?;
+        recv(&response, self.pid, timeout)?
+    }
+
+    /// Walk this shard's entire keyspace and return every stream's decoded
+    /// `(stream_key, next_seq)` sequence-metadata pair.
+    ///
+    /// # Errors
+    /// Returns a [`ShardError`] as for [`Self::get`].
+    pub fn scan_sequences(&self, timeout: Duration) -> Result<Vec<StreamSeq>, ShardError> {
+        let (reply, response) = mpsc::sync_channel(1);
+        self.enqueue(ShardCommandKind::ScanSequences { reply })?;
         recv(&response, self.pid, timeout)?
     }
 
