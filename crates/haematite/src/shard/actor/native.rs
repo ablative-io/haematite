@@ -24,7 +24,6 @@
 use std::cmp::Ordering;
 use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
-use std::sync::mpsc::SyncSender;
 use std::sync::{Arc, MutexGuard};
 
 use beamr::process::ExitReason;
@@ -35,7 +34,9 @@ use crate::store::DiskStore;
 use crate::tree::Cursor;
 use crate::wal::{DurableWal, FsyncPolicy, Mutation, WalRecovery};
 
-use super::handle::{CommandQueue, RangeItem, ShardCommand, ShardCommandKind, ShardError};
+use super::handle::{
+    CommandQueue, RangeItem, ShardCommand, ShardCommandKind, ShardError, StreamSeq,
+};
 
 /// The wrapped-storage state plus the bridge queue, run as a beamr process.
 ///
@@ -143,11 +144,46 @@ impl ShardState {
                 drop(reply.send(result));
                 None
             }
+            ShardCommandKind::ReadValue { key, reply } => {
+                let result = self
+                    .actor
+                    .read_value(&key, &self.store)
+                    .map_err(ShardError::from);
+                drop(reply.send(result));
+                None
+            }
+            ShardCommandKind::Cas {
+                key,
+                expected,
+                new,
+                reply,
+            } => {
+                let result = self
+                    .actor
+                    .cas(&key, expected, new, &mut self.store)
+                    .map_err(ShardError::from);
+                drop(reply.send(result));
+                None
+            }
+            ShardCommandKind::ScanSequences { reply } => {
+                drop(reply.send(self.scan_sequences()));
+                None
+            }
             ShardCommandKind::Shutdown { reply } => {
                 drop(reply.send(Ok(())));
                 Some(NativeOutcome::Stop(ExitReason::Normal))
             }
         }
+    }
+
+    /// Walk the whole shard and decode every stream's sequence metadata; see
+    /// [`super::scan::scan_sequences`].
+    fn scan_sequences(&self) -> Result<Vec<StreamSeq>, ShardError> {
+        super::scan::scan_sequences(
+            &self.store,
+            self.actor.committed_root(),
+            self.actor.buffer(),
+        )
     }
 
     /// Merge committed-tree entries with the live buffer for `[from, to)`.
@@ -193,7 +229,7 @@ impl ShardNativeHandler {
             .as_ref()
             .map_or_else(|| "shard startup failed".to_owned(), ToString::to_string);
         while let Some(command) = pop_command(&self.commands) {
-            reply_startup_error(command, &message);
+            super::startup::reply_startup_error(command, &message);
         }
         NativeOutcome::Stop(ExitReason::Error)
     }
@@ -210,50 +246,6 @@ pub(super) fn lock_queue(commands: &CommandQueue) -> MutexGuard<'_, VecDeque<Sha
 /// Pop one command under a tight lock, releasing it before returning.
 fn pop_command(commands: &CommandQueue) -> Option<ShardCommand> {
     lock_queue(commands).pop_front()
-}
-
-/// Reply to a queued command with a startup error so its caller fails fast.
-fn reply_startup_error(command: ShardCommand, message: &str) {
-    let error = ShardError::Spawn(message.to_owned());
-    match command.kind {
-        ShardCommandKind::Get { reply, .. } => send_get_startup_error(&reply, error),
-        ShardCommandKind::Put { reply, .. } | ShardCommandKind::Delete { reply, .. } => {
-            send_unit_startup_error(&reply, error);
-        }
-        ShardCommandKind::Commit { reply } => send_commit_startup_error(&reply, error),
-        ShardCommandKind::Range { reply, .. } => send_range_startup_error(&reply, error),
-        ShardCommandKind::Append { reply, .. } => send_append_startup_error(&reply, error),
-        ShardCommandKind::Shutdown { reply } => send_unit_startup_error(&reply, error),
-    }
-}
-
-fn send_get_startup_error(
-    reply: &SyncSender<Result<Option<Vec<u8>>, ShardError>>,
-    error: ShardError,
-) {
-    drop(reply.send(Err(error)));
-}
-
-fn send_unit_startup_error(reply: &SyncSender<Result<(), ShardError>>, error: ShardError) {
-    drop(reply.send(Err(error)));
-}
-
-fn send_commit_startup_error(
-    reply: &SyncSender<Result<crate::tree::Hash, ShardError>>,
-    error: ShardError,
-) {
-    drop(reply.send(Err(error)));
-}
-
-fn send_range_startup_error(
-    reply: &SyncSender<Result<Vec<RangeItem>, ShardError>>,
-    error: ShardError,
-) {
-    drop(reply.send(Err(error)));
-}
-
-fn send_append_startup_error(reply: &SyncSender<Result<u64, ShardError>>, error: ShardError) {
-    drop(reply.send(Err(error)));
 }
 
 /// True when `mutation`'s key lies in `[from, to)`.
