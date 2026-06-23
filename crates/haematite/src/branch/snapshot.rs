@@ -173,6 +173,28 @@ impl SnapshotRegistry {
         self.index.get(name).copied()
     }
 
+    /// Removes the snapshot bound to `name`, returning the removed entry.
+    ///
+    /// Unknown names return `Ok(None)`. Persisted registries flush the removal
+    /// atomically; if persistence fails, the in-memory entry and index are
+    /// restored so memory remains consistent with disk.
+    pub fn remove(&mut self, name: &str) -> Result<Option<SnapshotEntry>, SnapshotError> {
+        let Some(position) = self.entries.iter().position(|entry| entry.name == name) else {
+            return Ok(None);
+        };
+
+        let removed = self.entries.remove(position);
+        self.index.remove(name);
+
+        if let Err(error) = self.persist() {
+            self.entries.insert(position, removed.clone());
+            self.index.insert(removed.name.clone(), removed.root_hash);
+            return Err(error);
+        }
+
+        Ok(Some(removed))
+    }
+
     /// Lists every named snapshot as `(name, root_hash, timestamp)` tuples in
     /// chronological (naming) order; `timestamp` is naming time (see module doc).
     pub fn list_snapshots(&self) -> Vec<(String, Hash, Timestamp)> {

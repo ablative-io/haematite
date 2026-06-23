@@ -14,8 +14,9 @@ mod error;
 pub use branch::{
     BranchError, BranchHandle, BranchRegistry, BranchWalBuffer, CheckoutError, CommitLog,
     CommitLogEntry, ConflictError, ConflictInput, ConflictPolicy, CustomMergeFn, MergeError,
-    ReadOnlyView, ShardId, SnapshotEntry, SnapshotError, SnapshotRegistry, Timestamp, checkout,
-    current_timestamp, fork, fork_registered, fork_shards, fork_shards_registered, merge,
+    PruneError, PruneReport, ReadOnlyView, ShardId, SnapshotEntry, SnapshotError, SnapshotRegistry,
+    Timestamp, checkout, current_timestamp, fork, fork_registered, fork_shards,
+    fork_shards_registered, merge, prune,
 };
 
 pub use api::{
