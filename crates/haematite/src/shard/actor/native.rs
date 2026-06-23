@@ -24,6 +24,7 @@
 use std::cmp::Ordering;
 use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
+use std::sync::mpsc::SyncSender;
 use std::sync::{Arc, MutexGuard};
 
 use beamr::process::ExitReason;
@@ -94,38 +95,57 @@ impl ShardNativeHandler {
     }
 
     /// Pop and run exactly one queued command, replying over its channel.
-    /// Returns `false` when the queue was empty (a spurious wake).
-    fn pop_and_execute(state: &mut ShardState, commands: &CommandQueue) -> bool {
-        let Some(command) = pop_command(commands) else {
-            return false;
-        };
-        state.execute(command);
-        true
+    /// Returns a stop outcome when the command requested process shutdown.
+    fn pop_and_execute(state: &mut ShardState, commands: &CommandQueue) -> Option<NativeOutcome> {
+        let command = pop_command(commands)?;
+        state.execute(command)
     }
 }
 
 impl ShardState {
     /// Run one command against the wrapped storage and send the reply.
-    fn execute(&mut self, command: ShardCommand) {
+    fn execute(&mut self, command: ShardCommand) -> Option<NativeOutcome> {
         match command.kind {
             ShardCommandKind::Get { key, reply } => {
                 let result = self.actor.get(&key, &self.store).map_err(ShardError::from);
-                let _sent = reply.send(result);
+                drop(reply.send(result));
+                None
             }
             ShardCommandKind::Put { key, value, reply } => {
                 let result = self.actor.put(key, value).map_err(ShardError::from);
-                let _sent = reply.send(result);
+                drop(reply.send(result));
+                None
             }
             ShardCommandKind::Delete { key, reply } => {
                 let result = self.actor.delete(key).map_err(ShardError::from);
-                let _sent = reply.send(result);
+                drop(reply.send(result));
+                None
             }
             ShardCommandKind::Commit { reply } => {
                 let result = self.actor.commit(&mut self.store).map_err(ShardError::from);
-                let _sent = reply.send(result);
+                drop(reply.send(result));
+                None
             }
             ShardCommandKind::Range { from, to, reply } => {
-                let _sent = reply.send(self.collect_range(&from, &to));
+                drop(reply.send(self.collect_range(&from, &to)));
+                None
+            }
+            ShardCommandKind::Append {
+                key,
+                entries,
+                expected_seq,
+                reply,
+            } => {
+                let result = self
+                    .actor
+                    .append(&key, entries, expected_seq, &mut self.store)
+                    .map_err(ShardError::from);
+                drop(reply.send(result));
+                None
+            }
+            ShardCommandKind::Shutdown { reply } => {
+                drop(reply.send(Ok(())));
+                Some(NativeOutcome::Stop(ExitReason::Normal))
             }
         }
     }
@@ -156,7 +176,9 @@ impl NativeHandler for ShardNativeHandler {
         };
         // Drain one queued command per mailbox token; QueueEmpty = spurious.
         while ctx.recv().is_some() {
-            let _executed = Self::pop_and_execute(state, &self.commands);
+            if let Some(outcome) = Self::pop_and_execute(state, &self.commands) {
+                return outcome;
+            }
         }
         NativeOutcome::Wait
     }
@@ -192,21 +214,46 @@ fn pop_command(commands: &CommandQueue) -> Option<ShardCommand> {
 
 /// Reply to a queued command with a startup error so its caller fails fast.
 fn reply_startup_error(command: ShardCommand, message: &str) {
-    let error = || ShardError::Spawn(message.to_owned());
+    let error = ShardError::Spawn(message.to_owned());
     match command.kind {
-        ShardCommandKind::Get { reply, .. } => {
-            let _sent = reply.send(Err(error()));
-        }
+        ShardCommandKind::Get { reply, .. } => send_get_startup_error(&reply, error),
         ShardCommandKind::Put { reply, .. } | ShardCommandKind::Delete { reply, .. } => {
-            let _sent = reply.send(Err(error()));
+            send_unit_startup_error(&reply, error);
         }
-        ShardCommandKind::Commit { reply } => {
-            let _sent = reply.send(Err(error()));
-        }
-        ShardCommandKind::Range { reply, .. } => {
-            let _sent = reply.send(Err(error()));
-        }
+        ShardCommandKind::Commit { reply } => send_commit_startup_error(&reply, error),
+        ShardCommandKind::Range { reply, .. } => send_range_startup_error(&reply, error),
+        ShardCommandKind::Append { reply, .. } => send_append_startup_error(&reply, error),
+        ShardCommandKind::Shutdown { reply } => send_unit_startup_error(&reply, error),
     }
+}
+
+fn send_get_startup_error(
+    reply: &SyncSender<Result<Option<Vec<u8>>, ShardError>>,
+    error: ShardError,
+) {
+    drop(reply.send(Err(error)));
+}
+
+fn send_unit_startup_error(reply: &SyncSender<Result<(), ShardError>>, error: ShardError) {
+    drop(reply.send(Err(error)));
+}
+
+fn send_commit_startup_error(
+    reply: &SyncSender<Result<crate::tree::Hash, ShardError>>,
+    error: ShardError,
+) {
+    drop(reply.send(Err(error)));
+}
+
+fn send_range_startup_error(
+    reply: &SyncSender<Result<Vec<RangeItem>, ShardError>>,
+    error: ShardError,
+) {
+    drop(reply.send(Err(error)));
+}
+
+fn send_append_startup_error(reply: &SyncSender<Result<u64, ShardError>>, error: ShardError) {
+    drop(reply.send(Err(error)));
 }
 
 /// True when `mutation`'s key lies in `[from, to)`.

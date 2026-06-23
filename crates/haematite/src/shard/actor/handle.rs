@@ -60,6 +60,8 @@ pub enum ShardError {
     Store(StoreError),
     /// The shard process failed to spawn.
     Spawn(String),
+    /// An append expected one sequence number but found another.
+    SequenceConflict { expected: u64, actual: u64 },
 }
 
 impl fmt::Display for ShardError {
@@ -78,6 +80,10 @@ impl fmt::Display for ShardError {
             Self::Tree(error) => write!(formatter, "shard tree error: {error}"),
             Self::Store(error) => write!(formatter, "shard store error: {error}"),
             Self::Spawn(message) => write!(formatter, "shard spawn failed: {message}"),
+            Self::SequenceConflict { expected, actual } => write!(
+                formatter,
+                "sequence conflict on append: expected {expected}, actual {actual}"
+            ),
         }
     }
 }
@@ -91,7 +97,8 @@ impl std::error::Error for ShardError {
             Self::ActorUnavailable { .. }
             | Self::ReplyDisconnected { .. }
             | Self::ReplyTimeout { .. }
-            | Self::Spawn(_) => None,
+            | Self::Spawn(_)
+            | Self::SequenceConflict { .. } => None,
         }
     }
 }
@@ -144,6 +151,15 @@ pub(super) enum ShardCommandKind {
         from: Vec<u8>,
         to: Vec<u8>,
         reply: SyncSender<Result<Vec<RangeItem>, ShardError>>,
+    },
+    Append {
+        key: Vec<u8>,
+        entries: Vec<Vec<u8>>,
+        expected_seq: u64,
+        reply: SyncSender<Result<u64, ShardError>>,
+    },
+    Shutdown {
+        reply: SyncSender<Result<(), ShardError>>,
     },
 }
 
@@ -295,6 +311,39 @@ impl ShardHandle {
     ) -> Result<Vec<RangeItem>, ShardError> {
         let (reply, response) = mpsc::sync_channel(1);
         self.enqueue(ShardCommandKind::Range { from, to, reply })?;
+        recv(&response, self.pid, timeout)?
+    }
+
+    /// Atomically append event entries for one logical key.
+    ///
+    /// # Errors
+    /// Returns a [`ShardError`] as for [`Self::get`], or
+    /// [`ShardError::SequenceConflict`] when optimistic concurrency fails.
+    pub fn append(
+        &self,
+        key: Vec<u8>,
+        entries: Vec<Vec<u8>>,
+        expected_seq: u64,
+        timeout: Duration,
+    ) -> Result<u64, ShardError> {
+        let (reply, response) = mpsc::sync_channel(1);
+        self.enqueue(ShardCommandKind::Append {
+            key,
+            entries,
+            expected_seq,
+            reply,
+        })?;
+        recv(&response, self.pid, timeout)?
+    }
+
+    /// Ask the shard process to stop after it drains prior queued commands.
+    ///
+    /// # Errors
+    /// Returns a [`ShardError`] when the process cannot be reached or does not
+    /// acknowledge shutdown within `timeout`.
+    pub(crate) fn shutdown(&self, timeout: Duration) -> Result<(), ShardError> {
+        let (reply, response) = mpsc::sync_channel(1);
+        self.enqueue(ShardCommandKind::Shutdown { reply })?;
         recv(&response, self.pid, timeout)?
     }
 

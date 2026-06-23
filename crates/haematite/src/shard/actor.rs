@@ -5,6 +5,8 @@ pub mod native;
 
 pub use handle::{RangeItem, ShardError, ShardHandle};
 
+use std::fmt;
+
 use crate::store::NodeStore;
 use crate::tree::{Cursor, Hash, LeafNode, Node, batch_mutate};
 use crate::wal::{DurableWal, LookupResult, Mutation, RecoveredWal, WalBuffer, WalError};
@@ -24,8 +26,54 @@ pub struct ShardActor {
     committed_root: Option<Hash>,
 }
 
+/// Errors returned by shard-local event append operations.
+#[derive(Debug)]
+enum AppendError {
+    SequenceConflict { expected: u64, actual: u64 },
+    Wal(WalError),
+}
+
+impl fmt::Display for AppendError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::SequenceConflict { expected, actual } => write!(
+                formatter,
+                "sequence conflict on append: expected {expected}, actual {actual}"
+            ),
+            Self::Wal(error) => write!(formatter, "append WAL error: {error}"),
+        }
+    }
+}
+
+impl std::error::Error for AppendError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Wal(error) => Some(error),
+            Self::SequenceConflict { .. } => None,
+        }
+    }
+}
+
+impl From<WalError> for AppendError {
+    fn from(error: WalError) -> Self {
+        Self::Wal(error)
+    }
+}
+
+impl From<AppendError> for ShardError {
+    fn from(error: AppendError) -> Self {
+        match error {
+            AppendError::SequenceConflict { expected, actual } => {
+                Self::SequenceConflict { expected, actual }
+            }
+            AppendError::Wal(error) => Self::from(error),
+        }
+    }
+}
+
 impl ShardActor {
     /// Build a shard write boundary around an already-open durable WAL.
+    #[cfg(test)]
     #[must_use]
     pub fn new(wal: DurableWal) -> Self {
         Self {
@@ -121,11 +169,103 @@ impl ShardActor {
         Ok(new_root)
     }
 
+    /// Atomically append event entries for one logical key and commit once.
+    fn append<S>(
+        &mut self,
+        key: &[u8],
+        entries: Vec<Vec<u8>>,
+        expected_seq: u64,
+        store: &mut S,
+    ) -> Result<u64, AppendError>
+    where
+        S: NodeStore + ?Sized,
+    {
+        if entries.is_empty() {
+            return Ok(expected_seq);
+        }
+        let seq_key = sequence_key(key);
+        let actual = self.read_sequence(&seq_key, store)?;
+        if actual != expected_seq {
+            return Err(AppendError::SequenceConflict {
+                expected: expected_seq,
+                actual,
+            });
+        }
+        let entry_count = u64::try_from(entries.len())
+            .map_err(|_| WalError::TreeError("too many append entries".to_owned()))?;
+        let new_seq = actual
+            .checked_add(entry_count)
+            .ok_or_else(|| WalError::TreeError("append sequence overflow".to_owned()))?;
+        let mut mutations = Vec::with_capacity(entries.len().saturating_add(1));
+        for (offset, entry) in entries.into_iter().enumerate() {
+            let offset = u64::try_from(offset)
+                .map_err(|_| WalError::TreeError("too many append entries".to_owned()))?;
+            let seq = actual
+                .checked_add(offset.saturating_add(1))
+                .ok_or_else(|| WalError::TreeError("append sequence overflow".to_owned()))?;
+            mutations.push(Mutation::Put {
+                key: event_key(key, seq),
+                value: entry,
+            });
+        }
+        mutations.push(Mutation::Put {
+            key: seq_key,
+            value: new_seq.to_be_bytes().to_vec(),
+        });
+        let previous_buffer = self.buffer.clone();
+        for mutation in mutations {
+            buffer_mutation(&mut self.buffer, mutation);
+        }
+        match self.commit(store) {
+            Ok(_root) => Ok(new_seq),
+            Err(error) => {
+                self.buffer = previous_buffer;
+                Err(AppendError::from(error))
+            }
+        }
+    }
+
     /// Inspect buffered mutations; exposed for tests and future shard wiring.
     #[must_use]
     pub const fn buffer(&self) -> &WalBuffer {
         &self.buffer
     }
+
+    fn read_sequence<S>(&self, seq_key: &[u8], store: &S) -> Result<u64, WalError>
+    where
+        S: NodeStore + ?Sized,
+    {
+        self.get(seq_key, store)?.map_or(Ok(0), |bytes| {
+            bytes
+                .as_slice()
+                .try_into()
+                .map(u64::from_be_bytes)
+                .map_err(|_| WalError::TreeError("invalid sequence metadata".to_owned()))
+        })
+    }
+}
+
+fn buffer_mutation(buffer: &mut WalBuffer, mutation: Mutation) {
+    match mutation {
+        Mutation::Put { key, value } => buffer.put(key, value),
+        Mutation::Delete { key } => buffer.delete(key),
+    }
+}
+
+fn event_key(key: &[u8], seq: u64) -> Vec<u8> {
+    let mut encoded = Vec::with_capacity(key.len().saturating_add(9));
+    encoded.extend_from_slice(key);
+    encoded.push(0);
+    encoded.extend_from_slice(&seq.to_be_bytes());
+    encoded
+}
+
+fn sequence_key(key: &[u8]) -> Vec<u8> {
+    let mut encoded = Vec::with_capacity(key.len().saturating_add(4));
+    encoded.extend_from_slice(key);
+    encoded.push(0xff);
+    encoded.extend_from_slice(b"seq");
+    encoded
 }
 
 fn buffered_batch(buffer: &WalBuffer) -> Vec<(Vec<u8>, Option<Vec<u8>>)> {

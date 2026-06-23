@@ -131,7 +131,7 @@ impl From<io::Error> for WalError {
 /// key always wins and iteration is in ascending key order. A `commit` flushes
 /// the whole buffer to the prolly tree as a single batch — exactly one
 /// path-to-root rewrite per flush (CN8), not one per buffered write.
-#[derive(Debug, Default)]
+#[derive(Clone, Debug, Default)]
 pub struct WalBuffer {
     mutations: BTreeMap<Vec<u8>, Mutation>,
 }

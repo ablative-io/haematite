@@ -1,6 +1,6 @@
 pub mod api;
 pub mod branch;
-pub mod shard;
+pub(crate) mod shard;
 pub mod store;
 pub mod sync;
 pub mod tree;
@@ -8,7 +8,7 @@ pub mod ttl;
 pub mod wal;
 pub mod wasm;
 
-mod db;
+pub mod db;
 mod error;
 
 pub use branch::{
@@ -18,7 +18,7 @@ pub use branch::{
     current_timestamp, fork, fork_registered, fork_shards, fork_shards_registered, merge,
 };
 
-pub use db::Database;
+pub use db::{Database, DatabaseConfig, DatabaseError};
 
 pub use error::Error;
 
