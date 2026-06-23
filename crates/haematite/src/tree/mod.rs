@@ -2,6 +2,8 @@ pub mod boundary;
 pub mod cursor;
 pub mod diff;
 pub mod mutate;
+#[cfg(test)]
+mod mutate_history_independence_tests;
 pub mod node;
 
 pub use boundary::BoundaryDetector;

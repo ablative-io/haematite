@@ -1,0 +1,8 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc 7cdfcb969a7db873c44b762d0d8f0910869ff6bdb4d145d269ab72d75399d221 # shrinks to target_size = 4, pairs = [([8], []), ([9], []), ([10], []), ([11], []), ([50, 166, 129], []), ([52], []), ([53], []), ([61], []), ([62], []), ([63], []), ([88], []), ([99], [])], perm1 = Index(7753990557660521308), perm2 = Index(1346890339855955437)
+cc c58978af022792b00d67858189bcdda08616e46ce349ee10b2c9ae198aeb1bb8 # shrinks to target_size = 4, final_pairs = [([0], []), ([5], []), ([5, 23], []), ([35], []), ([184], [])], noise = [], seed1 = 2305389377256595294, seed2 = 377322337436811464
