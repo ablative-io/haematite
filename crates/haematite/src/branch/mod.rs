@@ -12,7 +12,7 @@ pub use checkout::{CheckoutError, ReadOnlyView, checkout};
 pub use conflict::{ConflictError, ConflictInput, ConflictPolicy, CustomMergeFn};
 pub use fork::{fork, fork_registered, fork_shards, fork_shards_registered};
 pub use handle::{BranchError, BranchHandle, BranchWalBuffer, ShardId};
-pub use merge::{MergeError, merge};
+pub use merge::{MergeConflict, MergeError, MergeReport, merge, merge_with_report};
 pub use prune::{PruneError, PruneReport, prune};
 pub use registry::BranchRegistry;
 pub use snapshot::{

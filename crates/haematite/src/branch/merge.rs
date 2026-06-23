@@ -54,6 +54,21 @@ impl From<ConflictError> for MergeError {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MergeConflict {
+    pub key: Vec<u8>,
+    pub ancestor_value: Option<Vec<u8>>,
+    pub parent_value: Option<Vec<u8>>,
+    pub branch_value: Option<Vec<u8>>,
+    pub resolved_value: Option<Vec<u8>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MergeReport {
+    pub merged_root: Hash,
+    pub conflicts: Vec<MergeConflict>,
+}
+
 pub fn merge<S: NodeStore + ?Sized>(
     store: &mut S,
     parent_root: Hash,
@@ -61,8 +76,22 @@ pub fn merge<S: NodeStore + ?Sized>(
     ancestor_root: Hash,
     policy: &ConflictPolicy,
 ) -> Result<Hash, MergeError> {
+    merge_with_report(store, parent_root, branch_root, ancestor_root, policy)
+        .map(|report| report.merged_root)
+}
+
+pub fn merge_with_report<S: NodeStore + ?Sized>(
+    store: &mut S,
+    parent_root: Hash,
+    branch_root: Hash,
+    ancestor_root: Hash,
+    policy: &ConflictPolicy,
+) -> Result<MergeReport, MergeError> {
     if parent_root == branch_root || branch_root == ancestor_root {
-        return Ok(parent_root);
+        return Ok(MergeReport {
+            merged_root: parent_root,
+            conflicts: Vec::new(),
+        });
     }
 
     let hashes = NodeHashes {
@@ -72,13 +101,17 @@ pub fn merge<S: NodeStore + ?Sized>(
     };
     let mut walk = MergeWalk::new(store, policy);
     walk.merge_node_range(hashes, KeyRange::unbounded())?;
-    let mutations = walk.into_mutations();
+    let (mutations, conflicts) = walk.into_parts();
 
-    if mutations.is_empty() {
-        Ok(parent_root)
+    let merged_root = if mutations.is_empty() {
+        parent_root
     } else {
-        batch_mutate(store, parent_root, mutations.as_slice()).map_err(MergeError::from)
-    }
+        batch_mutate(store, parent_root, mutations.as_slice()).map_err(MergeError::from)?
+    };
+    Ok(MergeReport {
+        merged_root,
+        conflicts,
+    })
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -122,6 +155,7 @@ struct MergeWalk<'a, S: NodeStore + ?Sized> {
     store: &'a mut S,
     policy: &'a ConflictPolicy,
     mutations: Vec<MergeMutation>,
+    conflicts: Vec<MergeConflict>,
 }
 
 impl<'a, S: NodeStore + ?Sized> MergeWalk<'a, S> {
@@ -130,11 +164,12 @@ impl<'a, S: NodeStore + ?Sized> MergeWalk<'a, S> {
             store,
             policy,
             mutations: Vec::new(),
+            conflicts: Vec::new(),
         }
     }
 
-    fn into_mutations(self) -> Vec<MergeMutation> {
-        self.mutations
+    fn into_parts(self) -> (Vec<MergeMutation>, Vec<MergeConflict>) {
+        (self.mutations, self.conflicts)
     }
 
     fn merge_node_range(
@@ -277,13 +312,23 @@ impl<'a, S: NodeStore + ?Sized> MergeWalk<'a, S> {
             }
             (true, true) if values.parent == values.branch => Ok(()),
             (true, true) => {
+                let ancestor_value = optional_value_to_vec(values.ancestor);
+                let parent_value = optional_value_to_vec(values.parent);
+                let branch_value = optional_value_to_vec(values.branch);
                 let conflict = ConflictInput::new(
                     key.to_vec(),
-                    optional_value_to_vec(values.ancestor),
-                    optional_value_to_vec(values.parent),
-                    optional_value_to_vec(values.branch),
+                    ancestor_value.clone(),
+                    parent_value.clone(),
+                    branch_value.clone(),
                 );
                 let resolved = self.policy.resolve(&conflict)?;
+                self.conflicts.push(MergeConflict {
+                    key: key.to_vec(),
+                    ancestor_value,
+                    parent_value,
+                    branch_value,
+                    resolved_value: resolved.clone(),
+                });
                 self.push_mutation_if_changed(key, values.parent, resolved);
                 Ok(())
             }
