@@ -30,6 +30,17 @@
 //! ```
 //!
 //! so `read`/`read_from` recover payload + sequence + timestamp after a reopen.
+//!
+//! # Keyspace separation (caller invariant)
+//!
+//! The `EventStore` and the scalar [`EventStore::cas`]/[`EventStore::read_value`]
+//! API share one flat tree keyspace with three disjoint regions per logical key:
+//! a CAS scalar at the raw `key`, events at `key || 0x00 || seq`, and the
+//! per-stream sequence counter at `key || 0xff`. Callers MUST NOT use a stream
+//! name and a CAS key that collide across these encodings (e.g. a CAS key whose
+//! bytes equal another stream's `key || 0x00 || seq`), or one region's value
+//! could be read through the other's decoder. Aion's usage keeps event-stream
+//! keys and CAS keys in separate, non-overlapping namespaces.
 
 use crate::api::error::{ApiError, CasMismatch, SequenceConflict};
 use crate::api::types::{Event, ScanResult, StreamMeta};
