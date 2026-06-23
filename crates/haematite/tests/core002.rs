@@ -259,10 +259,22 @@ fn insert_rewrites_immutably_splits_roots_and_is_history_independent() -> Result
     let Some(Node::Internal(internal)) = store.get(&split) else {
         return Err("split root was not an internal node".into());
     };
+    // A boundary key followed by its successor splits into two leaves, so the root
+    // is internal with two children. NOTE: internal children are now rederived by
+    // the SAME content-defined boundary grouping used at the leaf level (the old
+    // positional `root_children` bisect was the history-independence bug this
+    // change fixes). For a separator key that is itself a boundary, each child is a
+    // single-leaf internal node rather than a bare leaf; both leaves stay reachable
+    // and the layout is a pure function of the key set.
     assert_eq!(internal.children().len(), 2);
-    for (_separator, child_hash) in internal.children() {
-        assert!(matches!(store.get(child_hash), Some(Node::Leaf(_))));
-    }
+    assert_eq!(
+        Cursor::new(&store, split).get(boundary.as_slice())?,
+        Some(b"boundary".to_vec())
+    );
+    assert_eq!(
+        Cursor::new(&store, split).get(successor.as_slice())?,
+        Some(b"successor".to_vec())
+    );
 
     let mut reverse_split_store = MemoryStore::new();
     let reverse_split_root = empty_root(&mut reverse_split_store)?;
@@ -280,21 +292,39 @@ fn insert_rewrites_immutably_splits_roots_and_is_history_independent() -> Result
     )?;
     assert_eq!(split, reverse_split);
 
+    // Rewriting a tree now produces the canonical layout for the resulting key
+    // set, independent of the (possibly non-canonical) structure it started from.
+    // Here "a", "b" and "m" are all non-boundary keys, so the canonical layout for
+    // {a, b, m} is a SINGLE leaf — inserting "b" into a hand-built two-leaf tree
+    // collapses it accordingly. (Previously the insert patched the touched leaf in
+    // place and left the non-canonical sibling untouched, which is exactly the
+    // history-dependence this change removes.)
     let mut sibling_store = MemoryStore::new();
     let left = store_leaf(&mut sibling_store, &[(b"a", b"one")])?;
     let right = store_leaf(&mut sibling_store, &[(b"m", b"two")])?;
     let manual_root = store_internal(&mut sibling_store, vec![(b"a", left), (b"m", right)])?;
     let rewritten = insert(&mut sibling_store, manual_root, b"b", b"inserted")?;
-    let Some(Node::Internal(internal)) = sibling_store.get(&rewritten) else {
-        return Err("rewritten root was not an internal node".into());
+    let Some(Node::Leaf(leaf)) = sibling_store.get(&rewritten) else {
+        return Err("rewritten root was not the canonical single leaf".into());
     };
-    assert!(
-        internal
-            .children()
-            .iter()
-            .any(|(_key, hash)| *hash == right)
+    assert_eq!(
+        leaf.entries(),
+        &[
+            (b"a".to_vec(), b"one".to_vec()),
+            (b"b".to_vec(), b"inserted".to_vec()),
+            (b"m".to_vec(), b"two".to_vec()),
+        ]
     );
 
+    assert_multi_boundary_split_is_history_independent()?;
+    assert_non_boundary_keys_are_order_independent()?;
+    Ok(())
+}
+
+/// Twelve keys that are each their own boundary build a multi-leaf tree whose
+/// internal layout is rederived by content-defined grouping (one node per leaf).
+/// The layout must be identical for forward, reverse and batched construction.
+fn assert_multi_boundary_split_is_history_independent() -> Result<(), Box<dyn Error>> {
     let split_keys = boundary_keys(12);
     let mut split_store = MemoryStore::new();
     let mut split_root = empty_root(&mut split_store)?;
@@ -304,7 +334,15 @@ fn insert_rewrites_immutably_splits_roots_and_is_history_independent() -> Result
     let Some(Node::Internal(internal)) = split_store.get(&split_root) else {
         return Err("multi-boundary split root was not an internal node".into());
     };
-    assert_eq!(internal.children().len(), 2);
+    // Each key is its own boundary, so every separator is a boundary one level up
+    // and the internal level groups into one node per leaf — a pure function of the
+    // key set. (The old positional `root_children` bisect produced an order-
+    // dependent 2-way split; that was the history-independence bug.)
+    assert_eq!(internal.children().len(), split_keys.len());
+    let split_cursor = Cursor::new(&split_store, split_root);
+    for key in &split_keys {
+        assert_eq!(split_cursor.get(key.as_slice())?, Some(b"value".to_vec()));
+    }
 
     let mut split_reverse_store = MemoryStore::new();
     let mut split_reverse = empty_root(&mut split_reverse_store)?;
@@ -330,7 +368,11 @@ fn insert_rewrites_immutably_splits_roots_and_is_history_independent() -> Result
         split_mutations.as_slice(),
     )?;
     assert_eq!(split_batch, split_root);
+    Ok(())
+}
 
+/// Inserting 100 non-boundary keys forward and in reverse must yield the same root.
+fn assert_non_boundary_keys_are_order_independent() -> Result<(), Box<dyn Error>> {
     let keys = non_boundary_keys(100);
     let mut forward_store = MemoryStore::new();
     let mut forward = empty_root(&mut forward_store)?;
