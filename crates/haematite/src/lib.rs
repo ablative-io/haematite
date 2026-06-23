@@ -19,8 +19,8 @@ pub use branch::{
 };
 
 pub use api::{
-    ApiError, CasMismatch, Event, EventStore, ScanResult, SequenceConflict, StreamMeta,
-    decode_stream_key, encode_stream_key,
+    ApiError, CasMismatch, Event, EventStore, KvEntry, KvKey, KvRange, KvValue, ScanResult,
+    SequenceConflict, ShardRoots, StreamMeta, decode_stream_key, encode_stream_key,
 };
 
 pub use db::{Database, DatabaseConfig, DatabaseError};
