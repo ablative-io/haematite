@@ -8,10 +8,10 @@
 //! hashes, then merge/sync/equality are all broken.
 //!
 //! The suspected danger zone is MULTI-LEAF trees. The production `batch_mutate`
-//! path hard-codes `BoundaryDetector::default()` (target_size 4096), so small
+//! path hard-codes `BoundaryDetector::default()` (`target_size` 4096), so small
 //! test trees stay single-leaf and never exercise node splitting/rewriting.
 //! These tests use the test-only `set_test_target_size` seam (see `mutate.rs`)
-//! to drive the REAL mutate code path with a small target_size, so that a few
+//! to drive the REAL mutate code path with a small `target_size`, so that a few
 //! dozen keys produce genuinely multi-leaf trees.
 
 #![allow(clippy::unwrap_used)]
@@ -26,7 +26,7 @@ use super::node::{Hash, Node};
 use crate::store::MemoryStore;
 use crate::tree::cursor::load_node;
 
-/// Build an empty tree (an empty leaf) and return (store, root_hash).
+/// Build an empty tree (an empty leaf) and return (store, `root_hash`).
 fn empty_tree() -> (MemoryStore, Hash) {
     let mut store = MemoryStore::new();
     // An empty leaf is the canonical empty root.
@@ -63,7 +63,11 @@ fn collect_map(target_size: usize, root: Hash, ops: &[(Vec<u8>, Option<Vec<u8>>)
     let mut leaf_count = 0usize;
     walk(&store, root, &mut map, &mut leaf_count);
     set_test_target_size(None);
-    ReadBack { map, leaf_count, root }
+    ReadBack {
+        map,
+        leaf_count,
+        root,
+    }
 }
 
 struct ReadBack {
@@ -102,7 +106,8 @@ fn root_is_multi_leaf(target_size: usize, ops: &[(Vec<u8>, Option<Vec<u8>>)]) ->
         let mutation = [(key.clone(), value.clone())];
         root = batch_mutate(&mut store, root, &mutation).unwrap();
     }
-    let result = matches!(load_node(&store, root).unwrap(), Node::Internal(i) if i.children().len() > 1);
+    let result =
+        matches!(load_node(&store, root).unwrap(), Node::Internal(i) if i.children().len() > 1);
     set_test_target_size(None);
     result
 }
@@ -174,8 +179,8 @@ proptest! {
 
         // Sanity: both sequences must actually reach the target map.
         let target: BTreeMap<Vec<u8>, Vec<u8>> = final_pairs.iter().cloned().collect();
-        prop_assert_eq!(replay(&ops1), target.clone(), "seq1 did not reach target map");
-        prop_assert_eq!(replay(&ops2), target.clone(), "seq2 did not reach target map");
+        prop_assert_eq!(&replay(&ops1), &target, "seq1 did not reach target map");
+        prop_assert_eq!(&replay(&ops2), &target, "seq2 did not reach target map");
 
         let h1 = apply_ops(target_size, &ops1);
         let h2 = apply_ops(target_size, &ops2);
@@ -207,9 +212,9 @@ proptest! {
         let mut ops_diff = ops_base.clone();
         let differs = if let Some(existing) = map.get(&extra_key) {
             if existing == &extra_val { false }
-            else { ops_diff.push((extra_key.clone(), Some(extra_val.clone()))); true }
+            else { ops_diff.push((extra_key, Some(extra_val))); true }
         } else {
-            ops_diff.push((extra_key.clone(), Some(extra_val.clone()))); true
+            ops_diff.push((extra_key, Some(extra_val))); true
         };
         prop_assume!(differs);
 
@@ -222,10 +227,14 @@ proptest! {
 /// Deterministically shuffle a slice using a simple LCG seeded by `seed`.
 fn shuffle_with(pairs: &[(Vec<u8>, Vec<u8>)], seed: usize) -> Vec<(Vec<u8>, Vec<u8>)> {
     let mut v = pairs.to_vec();
-    let mut state = (seed as u64).wrapping_mul(0x9e37_79b9_7f4a_7c15).wrapping_add(1);
+    let mut state = (seed as u64)
+        .wrapping_mul(0x9e37_79b9_7f4a_7c15)
+        .wrapping_add(1);
     // Fisher-Yates.
     for i in (1..v.len()).rev() {
-        state = state.wrapping_mul(0x5851_f42d_4c95_7f2d).wrapping_add(0x1405_7b7e_f767_814f);
+        state = state
+            .wrapping_mul(0x5851_f42d_4c95_7f2d)
+            .wrapping_add(0x1405_7b7e_f767_814f);
         let j = (state >> 33) as usize % (i + 1);
         v.swap(i, j);
     }
@@ -289,7 +298,7 @@ fn build_sequence_to_map(
     ops
 }
 
-/// Replay a put/delete sequence into a plain BTreeMap to compute the expected
+/// Replay a put/delete sequence into a plain `BTreeMap` to compute the expected
 /// final logical state independently of the tree.
 fn replay(ops: &[(Vec<u8>, Option<Vec<u8>>)]) -> BTreeMap<Vec<u8>, Vec<u8>> {
     let mut map = BTreeMap::new();
@@ -309,24 +318,24 @@ fn replay(ops: &[(Vec<u8>, Option<Vec<u8>>)]) -> BTreeMap<Vec<u8>, Vec<u8>> {
 /// Deterministic regression for the minimal shrunk counterexample found by
 /// `prop_a_insertion_order_independence`.
 ///
-/// Over the key SET {0, 1, 8, 19} (target_size = 4), inserting in order
-/// [19, 1, 0, 8] yields a DIFFERENT root hash than inserting [8, 19, 0, 1]
-/// (the latter matches the canonical single-batch build). The first ordering
-/// transiently produces a 3-child root, which `root_children` bisects
+/// Over the key SET {0, 1, 8, 19} (`target_size` = 4), inserting in order
+/// [19, 1, 0, 8] once produced a DIFFERENT root hash than inserting
+/// [8, 19, 0, 1] (the canonical single-batch build). The first ordering
+/// transiently produces a 3-child root, which the old `root_children` bisected
 /// positionally (at len/2) rather than at content-defined boundaries, wrapping
-/// {8},{19} in a spurious internal node. THIS BREAKS HISTORY-INDEPENDENCE.
-///
-/// This test is `#[ignore]` because it is EXPECTED TO FAIL against current
-/// production code; it exists to pin the exact counterexample for the human
-/// reviewing the proposed fix. Remove `#[ignore]` once the root_children /
-/// internal re-chunking path is made content-defined.
+/// {8},{19} in a spurious internal node — which broke history-independence.
+/// The content-defined re-chunking fix makes both orders hash identically;
+/// this test pins that counterexample so the bug can never silently regress.
 #[test]
-#[ignore = "documents a known history-independence bug; expected to fail until root_children is fixed"]
 fn regression_minimal_insertion_order_counterexample() {
-    let order1: Vec<(Vec<u8>, Option<Vec<u8>>)> =
-        [19u8, 1, 0, 8].iter().map(|&k| (vec![k], Some(vec![]))).collect();
-    let order2: Vec<(Vec<u8>, Option<Vec<u8>>)> =
-        [8u8, 19, 0, 1].iter().map(|&k| (vec![k], Some(vec![]))).collect();
+    let order1: Vec<(Vec<u8>, Option<Vec<u8>>)> = [19u8, 1, 0, 8]
+        .iter()
+        .map(|&k| (vec![k], Some(vec![])))
+        .collect();
+    let order2: Vec<(Vec<u8>, Option<Vec<u8>>)> = [8u8, 19, 0, 1]
+        .iter()
+        .map(|&k| (vec![k], Some(vec![])))
+        .collect();
 
     let h1 = apply_ops(4, &order1);
     let h2 = apply_ops(4, &order2);
@@ -353,7 +362,11 @@ fn confirms_small_target_size_produces_multi_leaf_trees() {
     // Also report the leaf count for the record.
     let root = apply_ops(4, &ops);
     let read = collect_map(4, root, &ops);
-    assert!(read.leaf_count > 1, "expected >1 leaf, got {}", read.leaf_count);
+    assert!(
+        read.leaf_count > 1,
+        "expected >1 leaf, got {}",
+        read.leaf_count
+    );
     assert_eq!(read.map.len(), 120);
     assert_eq!(read.root, root);
     println!(
