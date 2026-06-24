@@ -114,6 +114,7 @@ impl Database {
                 value.clone(),
                 ttl,
                 stamp.clone(),
+                false,
                 membership,
                 timeout,
             )
@@ -134,6 +135,69 @@ impl Database {
             // raced this key locally — impossible under single-owner-per-key — so a
             // mismatch signals a violated invariant just as an IO fault signals a
             // storage failure; both are a failed durable local commit.
+            Err(error) => Err(DatabaseError::LocalCommitFailed(error.to_string())),
+        }
+    }
+
+    /// Coordinate one Strong CAS DELETE to quorum across the cluster AND, on
+    /// commit, durably persist the proposer's own stamped tombstone LOCALLY
+    /// (AA-3-4b, §2.4).
+    ///
+    /// A delete is the SAME fenced + stamped + quorum-replicated write a put is —
+    /// there is no second delete path. It mirrors [`Self::replicate_write`] exactly
+    /// (stamp from `owner_stamps.next_stamp`, quorum via the SAME proposal flow,
+    /// then the proposer's own durable apply with the IDENTICAL stamp) but the
+    /// receiver and the proposer store a stamped TOMBSTONE instead of a value:
+    ///
+    /// * `expected` is the hash of the value being deleted (`None` to delete an
+    ///   absent / already-tombstoned key; create-if-absent semantics apply because
+    ///   a tombstone reads as `None`).
+    /// * A delete from a stale/deposed owner is `Fenced` (rejected) by the receiver
+    ///   exactly like a put, surfaced as a quorum failure to the caller.
+    ///
+    /// # Errors
+    /// As [`Self::replicate_write`]: [`DatabaseError::ConsistencyError`] when the
+    /// delete does not reach quorum (fenced/timed-out/transport), or
+    /// [`DatabaseError::LocalCommitFailed`] when quorum was reached but the local
+    /// durable tombstone commit failed.
+    pub fn replicate_delete(
+        &self,
+        key: KvKey,
+        expected: Option<Hash>,
+        membership: &WriteMembership,
+        timeout: Duration,
+    ) -> Result<QuorumOutcome<SyncNodeId>, DatabaseError> {
+        let endpoint = self.distribution().ok_or_else(|| {
+            DatabaseError::Distribution("no distribution endpoint for replicate_delete".to_owned())
+        })?;
+
+        // R-LE + R-SEQ: a delete draws the SAME `(live_epoch, seq)` stamp a put
+        // does (§2.4) — it is a comparable, mergeable, stamped entry.
+        let shard = self.shard_for(&key);
+        let stamp = self.owner_stamps.next_stamp(shard);
+
+        // Step 1: drive the tombstone to peer-quorum (empty value/ttl; the
+        // `tombstone` flag tells each receiver to store a stamped tombstone).
+        let outcome = endpoint
+            .propose_write_stamped(
+                key.clone(),
+                expected,
+                Vec::new(),
+                None,
+                stamp.clone(),
+                true,
+                membership,
+                timeout,
+            )
+            .map_err(|error| DatabaseError::ConsistencyError(error.to_string()))?;
+
+        // Step 2: quorum reached — durably persist the proposer's own tombstone
+        // with the IDENTICAL stamp the cluster accepted.
+        let handle = self
+            .handle_for(&key)
+            .map_err(|error| DatabaseError::LocalCommitFailed(error.to_string()))?;
+        match handle.apply_durable_tombstone(key, expected, stamp, self.timeout()) {
+            Ok(()) => Ok(outcome),
             Err(error) => Err(DatabaseError::LocalCommitFailed(error.to_string())),
         }
     }
@@ -199,17 +263,29 @@ impl Database {
             Ok(handle) => handle,
             Err(_error) => return AckOutcome::Rejected(RejectReason::ApplyError),
         };
-        match handle.apply_durable(
-            proposal.key.clone(),
-            proposal.expected,
-            proposal.value.clone(),
-            proposal.ttl,
-            // R-SEQ: store the OWNER-ASSIGNED stamp `(epoch, seq)` verbatim — this
-            // replica never invents its own seq, so every replica's stored stamp
-            // for this write is byte-identical (§2.4 merge precondition).
-            proposal.stamp(),
-            self.timeout(),
-        ) {
+        // R-SEQ: store the OWNER-ASSIGNED stamp `(epoch, seq)` verbatim — this
+        // replica never invents its own seq, so every replica's stored stamp for
+        // this write is byte-identical (§2.4 merge precondition). AA-3-4b: a
+        // `tombstone` proposal applies a stamped tombstone through the SAME fence +
+        // CAS path; otherwise a stamped value.
+        let result = if proposal.tombstone {
+            handle.apply_durable_tombstone(
+                proposal.key.clone(),
+                proposal.expected,
+                proposal.stamp(),
+                self.timeout(),
+            )
+        } else {
+            handle.apply_durable(
+                proposal.key.clone(),
+                proposal.expected,
+                proposal.value.clone(),
+                proposal.ttl,
+                proposal.stamp(),
+                self.timeout(),
+            )
+        };
+        match result {
             Ok(()) => AckOutcome::Applied,
             // A CAS hash mismatch is a vote-against, not a fault: the replica is
             // ahead and applied nothing.

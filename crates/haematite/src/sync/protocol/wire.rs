@@ -93,6 +93,7 @@ pub fn encode_sync_message(message: &SyncMessage) -> Result<Vec<u8>, SyncError> 
             append_optional_duration(&mut bytes, proposal.ttl);
             append_ballot(&mut bytes, &proposal.epoch);
             bytes.extend_from_slice(&proposal.seq.to_be_bytes());
+            bytes.push(u8::from(proposal.tombstone));
         }
         SyncMessage::WriteAck(ack) => {
             bytes.push(MESSAGE_WRITE_ACK);
@@ -164,6 +165,7 @@ pub fn decode_sync_message(bytes: &[u8]) -> Result<SyncMessage, SyncError> {
             ttl: cursor.read_optional_duration()?,
             epoch: cursor.read_ballot()?,
             seq: cursor.read_u64()?,
+            tombstone: cursor.read_bool()?,
         }),
         MESSAGE_WRITE_ACK => SyncMessage::WriteAck(WriteAck {
             write_id: cursor.read_write_id()?,
@@ -580,6 +582,16 @@ impl<'a> MessageCursor<'a> {
     fn read_u8(&mut self) -> Result<u8, SyncError> {
         let bytes = self.read_exact(1)?;
         bytes.first().copied().ok_or(SyncError::InvalidMessage)
+    }
+
+    /// Read a single boolean byte (`0` or `1`); any other value is rejected so a
+    /// malformed frame fails closed (AA-3-4b tombstone flag).
+    fn read_bool(&mut self) -> Result<bool, SyncError> {
+        match self.read_u8()? {
+            0 => Ok(false),
+            1 => Ok(true),
+            _ => Err(SyncError::InvalidMessage),
+        }
     }
 
     fn read_u32_as_usize(&mut self) -> Result<usize, SyncError> {

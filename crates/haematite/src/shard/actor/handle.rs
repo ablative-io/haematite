@@ -195,6 +195,7 @@ pub(super) enum ShardCommandKind {
     },
     Delete {
         key: Vec<u8>,
+        stamp: Stamp,
         reply: SyncSender<Result<(), ShardError>>,
     },
     DeleteIfExpired {
@@ -231,6 +232,12 @@ pub(super) enum ShardCommandKind {
         expected: Option<Hash>,
         value: Vec<u8>,
         ttl: Option<Duration>,
+        stamp: Stamp,
+        reply: SyncSender<Result<(), ShardError>>,
+    },
+    ApplyDurableTombstone {
+        key: Vec<u8>,
+        expected: Option<Hash>,
         stamp: Stamp,
         reply: SyncSender<Result<(), ShardError>>,
     },
@@ -402,13 +409,42 @@ impl ShardHandle {
         recv(&response, self.pid, timeout)?
     }
 
-    /// Append a delete (durable-WAL first, then buffered), blocking for the ack.
+    /// Append a STAMPED-TOMBSTONE delete (durable-WAL first, then buffered),
+    /// blocking for the ack (AA-3-4b). The delete is stored as a stamped tombstone
+    /// (reads as absent), not a bare key-removal, so it is a mergeable committed
+    /// delete that persists in the tree.
     ///
     /// # Errors
     /// Returns a [`ShardError`] as for [`Self::get`].
-    pub fn delete(&self, key: Vec<u8>, timeout: Duration) -> Result<(), ShardError> {
+    pub fn delete(&self, key: Vec<u8>, stamp: Stamp, timeout: Duration) -> Result<(), ShardError> {
         let (reply, response) = mpsc::sync_channel(1);
-        self.enqueue(ShardCommandKind::Delete { key, reply })?;
+        self.enqueue(ShardCommandKind::Delete { key, stamp, reply })?;
+        recv(&response, self.pid, timeout)?
+    }
+
+    /// Conditionally + durably apply a replicated TOMBSTONE delete (AA-3-4b).
+    ///
+    /// The receiver-side counterpart of [`Self::apply_durable`] for a delete: it
+    /// runs the SAME epoch fence + CAS (over the logical value hash) + stamped
+    /// commit, but stores a stamped tombstone instead of a value. `expected` is the
+    /// hash of the value being deleted (`None` to match an absent/tombstoned key).
+    ///
+    /// # Errors
+    /// Returns a [`ShardError`] as for [`Self::apply_durable`].
+    pub fn apply_durable_tombstone(
+        &self,
+        key: Vec<u8>,
+        expected: Option<Hash>,
+        stamp: Stamp,
+        timeout: Duration,
+    ) -> Result<(), ShardError> {
+        let (reply, response) = mpsc::sync_channel(1);
+        self.enqueue(ShardCommandKind::ApplyDurableTombstone {
+            key,
+            expected,
+            stamp,
+            reply,
+        })?;
         recv(&response, self.pid, timeout)?
     }
 

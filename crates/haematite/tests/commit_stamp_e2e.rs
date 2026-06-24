@@ -339,3 +339,150 @@ fn recovered_owner_epoch_cannot_restamp_without_reacquire() -> TestResult {
     assert!(after > pre1 && after > pre2, "(e'',0) dominates all (e',_)");
     Ok(())
 }
+
+// ===========================================================================
+// AA-3-4b — deletes as stamped tombstones through the one fenced/quorum path.
+// ===========================================================================
+
+/// Adversarial test 1: a distributed delete is FENCED + STAMPED + quorum-
+/// replicated, exactly like a put.
+///
+/// * The owner A commits `k=v`, then DELETEs `k` via `replicate_delete`. The
+///   tombstone lands on the PEER B as a stamped tombstone (reads as None there),
+///   carrying the SAME owner-assigned `(epoch, seq)` on A and B (R-SEQ).
+/// * A delete from a STALE epoch is FENCED (rejected) — driven by a crashed,
+///   non-re-acquired owner whose stamp is `bottom < B.promised`.
+#[test]
+fn distributed_delete_is_fenced_stamped_and_quorum_replicated() -> TestResult {
+    let dir_a = tempfile::tempdir()?;
+    let dir_b = tempfile::tempdir()?;
+    let node_a = Node::create(NODE_A, dir_a.path().join("db"))?;
+    let node_b = Node::create(NODE_B, dir_b.path().join("db"))?;
+    link_both(&node_a, &node_b)?;
+
+    let owner = node_a
+        .db
+        .acquire_shard(SHARD, &membership(2, &[NODE_B]), WRITE_TIMEOUT)?;
+    let e_prime = owner.ballot;
+
+    // Commit k=v to majority {A,B}.
+    node_a.db.replicate_write(
+        b"k".to_vec(),
+        None,
+        b"v".to_vec(),
+        None,
+        &membership(2, &[NODE_B]),
+        WRITE_TIMEOUT,
+    )?;
+    let value_hash = haematite::tree::Hash::of(b"v");
+    assert_eq!(node_b.db.get(b"k")?, Some(b"v".to_vec()), "B holds the value");
+
+    // DELETE k: a stamped tombstone replicated to quorum, CAS expecting the value
+    // hash. The delete draws the NEXT seq under e' (seq 1; the put was seq 0).
+    node_a.db.replicate_delete(
+        b"k".to_vec(),
+        Some(value_hash),
+        &membership(2, &[NODE_B]),
+        WRITE_TIMEOUT,
+    )?;
+
+    // Reads as None on BOTH nodes (tombstone reads as absent).
+    assert_eq!(node_a.db.get(b"k")?, None, "A reads deleted key as None");
+    assert_eq!(node_b.db.get(b"k")?, None, "B reads deleted key as None");
+
+    // The PEER B physically holds a STAMPED TOMBSTONE (not a removal), with the
+    // IDENTICAL stamp the owner assigned (R-SEQ), under the live epoch e'.
+    assert_eq!(
+        node_b.db.stored_is_tombstone_for_test(b"k"),
+        Some(true),
+        "the committed delete landed a stamped tombstone on the peer, not a removal"
+    );
+    let a_stamp = node_a.db.stored_stamp_for_test(b"k").ok_or("A missing tombstone stamp")?;
+    let b_stamp = node_b.db.stored_stamp_for_test(b"k").ok_or("B missing tombstone stamp")?;
+    assert_eq!(a_stamp, b_stamp, "tombstone stamp IDENTICAL on proposer and peer");
+    assert_eq!(a_stamp.epoch, e_prime, "tombstone stamped with the live epoch e'");
+    assert_eq!(a_stamp.seq, 1, "delete drew the next seq (put was 0) under e'");
+
+    // --- A stale-epoch delete is FENCED. Crash A so live_epoch -> bottom; B keeps
+    // promised = e'. A bottom-stamped delete is below B.promised -> Fenced. ---
+    let node_a = node_a.crash_and_reopen()?;
+    link_both(&node_a, &node_b)?;
+    assert_eq!(node_a.db.live_epoch_for_test(SHARD), Ballot::bottom());
+    let fenced = node_a.db.replicate_delete(
+        b"k".to_vec(),
+        None,
+        &membership(2, &[NODE_B]),
+        WRITE_TIMEOUT,
+    );
+    assert!(
+        fenced.is_err(),
+        "a delete from a stale (bottom) epoch must be FENCED, like a put: {fenced:?}"
+    );
+    Ok(())
+}
+
+/// Adversarial test 2 + 3: CAS semantics on a tombstone, and delete -> recreate
+/// -> delete with three strictly-increasing stamps.
+///
+/// (a) create-if-absent (`expected = None`) on a tombstoned key MATCHES (tombstone
+///     reads as None) and succeeds.
+/// (b) a CAS expecting the deleted value MISSES on a tombstone.
+/// (c) delete -> recreate -> delete leaves the key deleted, each step a higher
+///     stamp.
+#[test]
+fn tombstone_cas_semantics_and_delete_recreate_delete() -> TestResult {
+    let dir_a = tempfile::tempdir()?;
+    let dir_b = tempfile::tempdir()?;
+    let node_a = Node::create(NODE_A, dir_a.path().join("db"))?;
+    let node_b = Node::create(NODE_B, dir_b.path().join("db"))?;
+    link_both(&node_a, &node_b)?;
+    let member = membership(2, &[NODE_B]);
+
+    node_a.db.acquire_shard(SHARD, &member, WRITE_TIMEOUT)?;
+
+    // put k=v1 (seq 0), then DELETE expecting v1 (seq 1).
+    node_a.db.replicate_write(b"k".to_vec(), None, b"v1".to_vec(), None, &member, WRITE_TIMEOUT)?;
+    let v1_hash = haematite::tree::Hash::of(b"v1");
+    node_a.db.replicate_delete(b"k".to_vec(), Some(v1_hash), &member, WRITE_TIMEOUT)?;
+    let s_del1 = node_a.db.stored_stamp_for_test(b"k").ok_or("missing del1 stamp")?;
+    assert_eq!(node_a.db.get(b"k")?, None);
+
+    // (b) A CAS expecting the OLD value v1 MISSES on the tombstone (its logical
+    // hash is None, not v1) — the recreate must use expected = None.
+    let cas_expecting_old = node_a.db.replicate_write(
+        b"k".to_vec(),
+        Some(v1_hash),
+        b"v2".to_vec(),
+        None,
+        &member,
+        WRITE_TIMEOUT,
+    );
+    assert!(
+        cas_expecting_old.is_err(),
+        "a CAS expecting the deleted value must MISS on a tombstone: {cas_expecting_old:?}"
+    );
+    assert_eq!(node_a.db.get(b"k")?, None, "the missed CAS applied nothing");
+
+    // (a) create-if-absent (expected = None) MATCHES the tombstone and recreates.
+    node_a.db.replicate_write(b"k".to_vec(), None, b"v2".to_vec(), None, &member, WRITE_TIMEOUT)?;
+    let s_recreate = node_a.db.stored_stamp_for_test(b"k").ok_or("missing recreate stamp")?;
+    assert_eq!(node_a.db.get(b"k")?, Some(b"v2".to_vec()), "create-if-absent recreated the key");
+    assert_eq!(
+        node_a.db.stored_is_tombstone_for_test(b"k"),
+        Some(false),
+        "the recreated key is a value, not a tombstone"
+    );
+
+    // (c) DELETE again (expecting v2). Final read None; three strictly-increasing
+    // stamps: del1 < recreate < del2.
+    let v2_hash = haematite::tree::Hash::of(b"v2");
+    node_a.db.replicate_delete(b"k".to_vec(), Some(v2_hash), &member, WRITE_TIMEOUT)?;
+    let s_del2 = node_a.db.stored_stamp_for_test(b"k").ok_or("missing del2 stamp")?;
+    assert_eq!(node_a.db.get(b"k")?, None, "key is deleted again");
+    assert_eq!(node_a.db.stored_is_tombstone_for_test(b"k"), Some(true));
+    assert_eq!(node_b.db.get(b"k")?, None, "peer also reads None after final delete");
+
+    assert!(s_del1 < s_recreate, "recreate stamp exceeds first delete: {s_recreate:?} > {s_del1:?}");
+    assert!(s_recreate < s_del2, "second delete stamp exceeds recreate: {s_del2:?} > {s_recreate:?}");
+    Ok(())
+}

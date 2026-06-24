@@ -19,6 +19,8 @@ const STAMP_MAGIC: &[u8; 8] = b"HMSTMP01";
 const COUNTER_WIDTH: usize = 8;
 const SEQ_WIDTH: usize = 8;
 const NODE_LEN_WIDTH: usize = 4;
+/// Width of the AA-3-4b kind discriminator byte (value vs tombstone).
+const KIND_WIDTH: usize = 1;
 
 /// Absolute expiry timestamp in nanoseconds since the Unix epoch.
 pub type ExpiryTimestamp = Timestamp;
@@ -107,31 +109,69 @@ impl TtlEntry {
     }
 }
 
-/// Stored value envelope carrying the causal commit stamp ALONGSIDE the existing
-/// TTL metadata and user bytes (AA-3-4a, §2.4). The envelope now holds
-/// `{ stamp, ttl, value }`.
+/// Envelope kind byte (AA-3-4b): the first byte after [`STAMP_MAGIC`]
+/// discriminates a stamped VALUE from a stamped TOMBSTONE. Both kinds carry the
+/// `(epoch, seq)` stamp; a tombstone additionally reads as ABSENT (it has no
+/// logical value and no TTL). The byte sits inside the stamped magic boundary, so
+/// raw / TTL-only / stamped-value / stamped-tombstone still decode unambiguously
+/// (only a stamped envelope ever reaches this byte).
+const KIND_VALUE: u8 = 0x00;
+const KIND_TOMBSTONE: u8 = 0x01;
+
+/// The kind of a stamped entry (AA-3-4b): a live value or a tombstone.
+///
+/// A tombstone is a first-class STAMPED entry persisted in the tree (R-TOMB) that
+/// reads as ABSENT — so `get` returns `None`, `current_value_hash` returns `None`,
+/// and create-if-absent (CAS `expected = None`) MATCHES on a tombstoned key. It
+/// is a comparable, mergeable, stamped delete, not a bare key-removal.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum EntryKind {
+    /// A live logical value with optional TTL.
+    Value {
+        expires_at: Option<ExpiryTimestamp>,
+        value: Vec<u8>,
+    },
+    /// A committed delete: stamped, persisted, reads as absent (R-TOMB).
+    Tombstone,
+}
+
+/// Stored value envelope carrying the causal commit stamp (AA-3-4a, §2.4).
+///
+/// The envelope holds `{ stamp, kind }`, where `kind` is either a
+/// `Value { ttl, bytes }` or a `Tombstone` (AA-3-4b), alongside the existing TTL
+/// metadata and user bytes.
 ///
 /// CRITICAL — the stamp is NOT part of the CAS identity. The CAS hash
 /// (`ShardActor::current_value_hash`) is taken over the LOGICAL value bytes that
-/// the read path returns, which strip BOTH the stamp and the TTL. So two writes
-/// with identical `value` bytes but different stamps decode to the same logical
-/// value and therefore hash identically — the 3-3 fence/CAS semantics are
-/// unchanged and the stamp is pure merge metadata (3-4c).
+/// the read path returns, which strip BOTH the stamp and the TTL (and which is
+/// `None` for a tombstone). So two writes with identical `value` bytes but
+/// different stamps decode to the same logical value and therefore hash
+/// identically — the 3-3 fence/CAS semantics are unchanged and the stamp is pure
+/// merge metadata (3-4c). A tombstone's logical value is absent, so the CAS sees
+/// it exactly as it sees a never-written key.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct StampedEntry {
     stamp: Stamp,
-    expires_at: Option<ExpiryTimestamp>,
-    value: Vec<u8>,
+    kind: EntryKind,
 }
 
 impl StampedEntry {
-    /// Build a stamped entry over an optional absolute expiry and user bytes.
+    /// Build a stamped VALUE entry over an optional absolute expiry and user bytes.
     #[must_use]
     pub const fn new(stamp: Stamp, expires_at: Option<ExpiryTimestamp>, value: Vec<u8>) -> Self {
         Self {
             stamp,
-            expires_at,
-            value,
+            kind: EntryKind::Value { expires_at, value },
+        }
+    }
+
+    /// Build a stamped TOMBSTONE entry (AA-3-4b): a committed delete that carries
+    /// a `(epoch, seq)` stamp, persists in the tree, and reads as absent.
+    #[must_use]
+    pub const fn tombstone(stamp: Stamp) -> Self {
+        Self {
+            stamp,
+            kind: EntryKind::Tombstone,
         }
     }
 
@@ -141,46 +181,74 @@ impl StampedEntry {
         &self.stamp
     }
 
+    /// The entry kind (value or tombstone).
+    #[must_use]
+    pub const fn kind(&self) -> &EntryKind {
+        &self.kind
+    }
+
+    /// True when this entry is a tombstone (a committed delete, R-TOMB).
+    #[must_use]
+    pub const fn is_tombstone(&self) -> bool {
+        matches!(self.kind, EntryKind::Tombstone)
+    }
+
     /// Optional absolute expiry timestamp (TTL semantics identical to
-    /// [`TtlEntry`]).
+    /// [`TtlEntry`]). A tombstone never expires (it is `None`).
     #[must_use]
     pub const fn expires_at(&self) -> Option<ExpiryTimestamp> {
-        self.expires_at
+        match self.kind {
+            EntryKind::Value { expires_at, .. } => expires_at,
+            EntryKind::Tombstone => None,
+        }
     }
 
-    /// The LOGICAL user value bytes (stamp- AND TTL-stripped). This is what the
-    /// read path returns and what the CAS hash is taken over.
+    /// The LOGICAL user value bytes (stamp- AND TTL-stripped), or `None` for a
+    /// tombstone. This is what the read path returns and what the CAS hash is
+    /// taken over.
     #[must_use]
-    pub fn value(&self) -> &[u8] {
-        &self.value
+    pub fn value(&self) -> Option<&[u8]> {
+        match &self.kind {
+            EntryKind::Value { value, .. } => Some(value),
+            EntryKind::Tombstone => None,
+        }
     }
 
-    /// Consume the envelope and return the logical user value bytes.
+    /// Consume the envelope and return the logical user value bytes, or `None`
+    /// for a tombstone.
     #[must_use]
-    pub fn into_value(self) -> Vec<u8> {
-        self.value
+    pub fn into_value(self) -> Option<Vec<u8>> {
+        match self.kind {
+            EntryKind::Value { value, .. } => Some(value),
+            EntryKind::Tombstone => None,
+        }
     }
 
-    /// True when the entry has an expiry at or before `now`.
+    /// True when the entry has an expiry at or before `now`. A tombstone is never
+    /// "expired" in this sense — it has no TTL (R-TOMB: it is immortal); it simply
+    /// reads as absent at every clock.
     #[must_use]
     pub fn is_expired_at(&self, now: ExpiryTimestamp) -> bool {
-        self.expires_at.is_some_and(|expires_at| expires_at <= now)
+        self.expires_at().is_some_and(|expires_at| expires_at <= now)
     }
 
     /// Deterministically encode this stamped envelope.
     ///
     /// Layout: `STAMP_MAGIC || epoch.counter.be || node_len.be || node_bytes ||
-    /// seq.be || expiry_or_u64_max.be || value`.
+    /// seq.be || kind`, then for a VALUE `|| expiry_or_u64_max.be || value`. A
+    /// TOMBSTONE has no trailing expiry/value bytes (it carries no value).
     #[must_use]
     pub fn encode(&self) -> Vec<u8> {
         let node = self.stamp.epoch.node.as_str().as_bytes();
+        let value_len = self.value().map_or(0, <[u8]>::len);
         let header = STAMP_MAGIC.len()
             + COUNTER_WIDTH
             + NODE_LEN_WIDTH
             + node.len()
             + SEQ_WIDTH
+            + KIND_WIDTH
             + EXPIRY_WIDTH;
-        let mut encoded = Vec::with_capacity(header.saturating_add(self.value.len()));
+        let mut encoded = Vec::with_capacity(header.saturating_add(value_len));
         encoded.extend_from_slice(STAMP_MAGIC);
         encoded.extend_from_slice(&self.stamp.epoch.counter.to_be_bytes());
         // node id length is bounded; a name longer than u32::MAX is not
@@ -189,15 +257,26 @@ impl StampedEntry {
         encoded.extend_from_slice(&node_len.to_be_bytes());
         encoded.extend_from_slice(node);
         encoded.extend_from_slice(&self.stamp.seq.to_be_bytes());
-        encoded.extend_from_slice(&self.expires_at.unwrap_or(NEVER_EXPIRES).to_be_bytes());
-        encoded.extend_from_slice(&self.value);
+        match &self.kind {
+            EntryKind::Value { expires_at, value } => {
+                encoded.push(KIND_VALUE);
+                encoded.extend_from_slice(&expires_at.unwrap_or(NEVER_EXPIRES).to_be_bytes());
+                encoded.extend_from_slice(value);
+            }
+            EntryKind::Tombstone => {
+                encoded.push(KIND_TOMBSTONE);
+            }
+        }
         encoded
     }
 
     /// Decode a stamped envelope.
     ///
     /// Returns `Ok(None)` when `bytes` does not carry [`STAMP_MAGIC`], so callers
-    /// can fall back to the plain-TTL / raw decode paths.
+    /// can fall back to the plain-TTL / raw decode paths. A trailing `kind` byte
+    /// (AA-3-4b) selects value vs tombstone; an unknown kind is a truncation-class
+    /// error (fail closed rather than silently treating an unknown kind as a
+    /// value).
     pub fn decode(bytes: &[u8]) -> Result<Option<Self>, TtlDecodeError> {
         if !bytes.starts_with(STAMP_MAGIC) {
             return Ok(None);
@@ -209,16 +288,24 @@ impl StampedEntry {
         let node = String::from_utf8(node_bytes.to_vec())
             .map_err(|_error| TtlDecodeError::TruncatedEnvelope { len: bytes.len() })?;
         let seq = read_u64(bytes, &mut cursor)?;
-        let expiry_raw = read_u64(bytes, &mut cursor)?;
-        let value = bytes
-            .get(cursor..)
-            .ok_or(TtlDecodeError::TruncatedEnvelope { len: bytes.len() })?
-            .to_vec();
-        Ok(Some(Self {
-            stamp: Stamp::new(Ballot::new(counter, SyncNodeId::new(node)), seq),
-            expires_at: (expiry_raw != NEVER_EXPIRES).then_some(expiry_raw),
-            value,
-        }))
+        let kind_byte = read_slice(bytes, &mut cursor, KIND_WIDTH)?[0];
+        let stamp = Stamp::new(Ballot::new(counter, SyncNodeId::new(node)), seq);
+        let kind = match kind_byte {
+            KIND_TOMBSTONE => EntryKind::Tombstone,
+            KIND_VALUE => {
+                let expiry_raw = read_u64(bytes, &mut cursor)?;
+                let value = bytes
+                    .get(cursor..)
+                    .ok_or(TtlDecodeError::TruncatedEnvelope { len: bytes.len() })?
+                    .to_vec();
+                EntryKind::Value {
+                    expires_at: (expiry_raw != NEVER_EXPIRES).then_some(expiry_raw),
+                    value,
+                }
+            }
+            _ => return Err(TtlDecodeError::TruncatedEnvelope { len: bytes.len() }),
+        };
+        Ok(Some(Self { stamp, kind }))
     }
 }
 
@@ -231,6 +318,16 @@ impl StampedEntry {
 #[must_use]
 pub fn encode_stamped(value: Vec<u8>, stamp: Stamp, expires_at: Option<ExpiryTimestamp>) -> Vec<u8> {
     StampedEntry::new(stamp, expires_at, value).encode()
+}
+
+/// Encode a stamped TOMBSTONE (AA-3-4b): a committed delete carrying `stamp`.
+///
+/// EVERY committed delete goes through this — a delete is a stamped, mergeable
+/// entry, never a bare key-removal. The tombstone persists in the tree and reads
+/// as absent (`get` → `None`, CAS hash → `None`).
+#[must_use]
+pub fn encode_stamped_tombstone(stamp: Stamp) -> Vec<u8> {
+    StampedEntry::tombstone(stamp).encode()
 }
 
 fn read_u64(bytes: &[u8], cursor: &mut usize) -> Result<u64, TtlDecodeError> {
@@ -366,6 +463,7 @@ impl std::error::Error for TtlDecodeError {}
 mod tests {
     use super::{
         MAGIC, STAMP_MAGIC, StampedEntry, TtlEntry, encode_optional_ttl, encode_stamped,
+        encode_stamped_tombstone,
     };
     use crate::sync::ballot::{Ballot, Stamp};
     use crate::sync::topology::SyncNodeId;
@@ -395,7 +493,8 @@ mod tests {
         let decoded = StampedEntry::decode(&entry.encode())?.ok_or("missing stamped envelope")?;
         assert_eq!(decoded.stamp(), &stamp(7, "owner-node-\u{00e9}", 0xdead_beef));
         assert_eq!(decoded.expires_at(), Some(42));
-        assert_eq!(decoded.value(), b"payload");
+        assert_eq!(decoded.value(), Some(b"payload".as_slice()));
+        assert!(!decoded.is_tombstone());
 
         // A never-expiring stamped value also round-trips (expiry None).
         let never = StampedEntry::new(stamp(1, "n", 5), None, b"v".to_vec());
@@ -410,6 +509,49 @@ mod tests {
         // A plain TTL envelope and a raw value are NOT stamped envelopes.
         assert_eq!(StampedEntry::decode(b"plain")?, None);
         assert_eq!(StampedEntry::decode(&TtlEntry::expiring(b"v".to_vec(), 9).encode())?, None);
+        Ok(())
+    }
+
+    /// AA-3-4b: a stamped TOMBSTONE round-trips its stamp, decodes as a tombstone,
+    /// reads as ABSENT (`visible_value_at` is Expired at every clock), and its
+    /// CAS hash is `None` (it has no logical value, so create-if-absent matches).
+    #[test]
+    fn stamped_tombstone_round_trips_and_reads_as_absent()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let encoded = encode_stamped_tombstone(stamp(11, "owner", 4));
+        let decoded = StampedEntry::decode(&encoded)?.ok_or("missing tombstone")?;
+        assert!(decoded.is_tombstone());
+        assert_eq!(decoded.stamp(), &stamp(11, "owner", 4));
+        assert_eq!(decoded.value(), None);
+        assert_eq!(decoded.expires_at(), None);
+        assert_eq!(decoded.into_value(), None);
+        // A tombstone reads as absent at every clock (it is not TTL-expiry, but it
+        // surfaces identically — Expired → None to the read path).
+        assert_eq!(visible_value_at(&encoded, 0)?, Visibility::Expired);
+        assert_eq!(visible_value_at(&encoded, u64::MAX)?, Visibility::Expired);
+        // CAS hash crux: a tombstone's visible value is None, so it hashes exactly
+        // like a never-written key — create-if-absent (expected = None) matches.
+        assert_eq!(visible_value_at(&encoded, 0)?.into_option(), None);
+        Ok(())
+    }
+
+    /// A stamped value and a stamped tombstone are DISTINGUISHABLE on the wire
+    /// (the kind byte), and a tombstone is never misparsed as a value even if a
+    /// value happens to be empty.
+    #[test]
+    fn empty_value_is_not_a_tombstone() -> Result<(), Box<dyn std::error::Error>> {
+        let empty_value = encode_stamped(Vec::new(), stamp(3, "n", 0), None);
+        let tombstone = encode_stamped_tombstone(stamp(3, "n", 0));
+        assert_ne!(empty_value, tombstone, "empty value must differ from tombstone");
+
+        let value = StampedEntry::decode(&empty_value)?.ok_or("missing value")?;
+        assert!(!value.is_tombstone());
+        assert_eq!(value.value(), Some(b"".as_slice()));
+        // An empty value is Live(empty) — present-but-empty, NOT absent.
+        assert_eq!(visible_value_at(&empty_value, 0)?, Visibility::Live(Vec::new()));
+
+        let tomb = StampedEntry::decode(&tombstone)?.ok_or("missing tombstone")?;
+        assert!(tomb.is_tombstone());
         Ok(())
     }
 
@@ -450,7 +592,7 @@ mod tests {
         value.extend_from_slice(b"inner");
         let encoded = encode_stamped(value.clone(), stamp(2, "z", 1), None);
         let decoded = StampedEntry::decode(&encoded)?.ok_or("missing")?;
-        assert_eq!(decoded.value(), value.as_slice());
+        assert_eq!(decoded.value(), Some(value.as_slice()));
         assert_eq!(visible_value_at(&encoded, 0)?, Visibility::Live(value));
         Ok(())
     }

@@ -24,6 +24,7 @@ pub(super) fn reply_startup_error(command: ShardCommand, message: &str) {
         | ShardCommandKind::Delete { reply, .. }
         | ShardCommandKind::Cas { reply, .. }
         | ShardCommandKind::ApplyDurable { reply, .. }
+        | ShardCommandKind::ApplyDurableTombstone { reply, .. }
         | ShardCommandKind::RecordOwnerEpoch { reply, .. }
         | ShardCommandKind::Shutdown { reply } => send_unit(&reply, error),
         ShardCommandKind::Commit { reply } => send_commit(&reply, error),
