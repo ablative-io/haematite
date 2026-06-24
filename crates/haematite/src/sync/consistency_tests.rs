@@ -386,15 +386,51 @@ fn cas_mixed_accepts_and_rejects_fences_as_soon_as_provably_lost() {
 }
 
 #[test]
-fn cas_fault_is_ack_failed_distinct_from_reject() {
-    // A transport fault poisons the tally as AckFailed — distinct from a reject
-    // (which is a clean Fenced). This is the fault/reject distinction.
-    let result = wait_for_cas_quorum(
+fn cas_single_fault_does_not_abort_a_reachable_quorum() -> Result<(), ConsistencyError> {
+    // 3-node cluster, quorum 2 (local + 1). One remote faults, but the OTHER
+    // remote accepts → local + accept = 2 → committed. A single fault must NOT
+    // abort a write the rest of the cluster can still carry (the availability fix:
+    // a fault erodes the accept ceiling, it does not poison the whole tally).
+    let outcome = wait_for_cas_quorum(
         StrongConsistency::new(3, Duration::from_secs(1)),
-        vec![CasVote::fault("node-b")],
+        vec![CasVote::fault("node-b"), CasVote::accept("node-c")],
+    )?;
+
+    assert_eq!(outcome.acknowledged, 2);
+    Ok(())
+}
+
+#[test]
+fn cas_loss_to_faults_alone_is_ack_failed_not_fenced() {
+    // 3-node cluster, quorum 2, possible 3. Two DISTINCT faults erode
+    // possible_accepts to 1 < 2 with NO reject in play → AckFailed (a retryable
+    // infrastructure failure), distinct from the Fenced a CAS reject produces.
+    let result = wait_for_cas_quorum::<&str, _>(
+        StrongConsistency::new(3, Duration::from_secs(1)),
+        vec![CasVote::fault("node-b"), CasVote::fault("node-c")],
     );
 
     assert_eq!(result, Err(ConsistencyError::AckFailed));
+}
+
+#[test]
+fn cas_loss_with_any_reject_is_fenced_even_alongside_faults() {
+    // 5-node cluster, quorum 3, possible 5. A reject plus faults erode
+    // possible_accepts below 3; because a real CAS reject occurred (a conflicting
+    // owner out-voted us), the verdict is Fenced, not AckFailed.
+    let result = wait_for_cas_quorum::<&str, _>(
+        StrongConsistency::new(5, Duration::from_secs(1)),
+        vec![
+            CasVote::reject("node-b"),
+            CasVote::fault("node-c"),
+            CasVote::fault("node-d"),
+        ],
+    );
+
+    assert!(
+        matches!(result, Err(ConsistencyError::Fenced { required: 3, .. })),
+        "a reject in the loss set fences (conflicting owner), got {result:?}"
+    );
 }
 
 #[test]

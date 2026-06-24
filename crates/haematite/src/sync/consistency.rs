@@ -389,6 +389,25 @@ impl<NodeId> CasVote<NodeId> {
     }
 }
 
+/// Classify a CAS write that can no longer reach a quorum of accepts. A prior
+/// CAS reject means a conflicting owner deterministically out-voted us
+/// ([`ConsistencyError::Fenced`]); a loss to faults alone is an infrastructure
+/// failure ([`ConsistencyError::AckFailed`], retryable) — not a fence.
+const fn decline_outcome(
+    had_reject: bool,
+    required: usize,
+    possible_accepts: usize,
+) -> ConsistencyError {
+    if had_reject {
+        ConsistencyError::Fenced {
+            required,
+            possible_accepts,
+        }
+    } else {
+        ConsistencyError::AckFailed
+    }
+}
+
 /// CAS-aware quorum tally over a stream of [`CasVote`]s.
 ///
 /// This is a SEPARATE primitive from [`wait_for_quorum`]: non-CAS callers keep
@@ -400,12 +419,16 @@ impl<NodeId> CasVote<NodeId> {
 ///   blip must never abort a write the majority should win.
 /// * Distinct **accepts** (deduped by node id, plus the local ack) count toward
 ///   `acknowledged`; reaching `required` yields a committed [`QuorumOutcome`].
-/// * Distinct **rejects** (deduped by node id) shrink the reachable accept ceiling
-///   `possible_accepts = possible - distinct_rejects`. The instant
-///   `possible_accepts < required`, the writer has provably lost: return
-///   [`ConsistencyError::Fenced`] (deterministic, not a timeout, not a fault).
-/// * A **fault** is a transport failure and returns [`ConsistencyError::AckFailed`]
-///   — distinct from a reject.
+/// * Both **rejects** and **faults** (deduped together by node id — a node that
+///   will not accept, whether by CAS-reject or by failure) shrink the reachable
+///   accept ceiling `possible_accepts = possible - declined`. A single fault does
+///   NOT abort a write the rest of the cluster can still carry; the tally only
+///   gives up when `possible_accepts < required`.
+/// * When `possible_accepts < required`, the verdict depends on WHY: if any CAS
+///   **reject** occurred, a conflicting owner deterministically out-voted us →
+///   [`ConsistencyError::Fenced`]; if the loss is to **faults alone**, it is an
+///   infrastructure failure → [`ConsistencyError::AckFailed`] (retryable), not a
+///   fence.
 /// * If neither a quorum of accepts nor a fenced verdict is reached before the
 ///   deadline, return [`ConsistencyError::QuorumTimeout`].
 pub fn wait_for_cas_quorum<NodeId, Votes>(
@@ -427,7 +450,10 @@ where
     let deadline = Instant::now() + strong.timeout();
     let mut acknowledged_nodes = Vec::new();
     let mut accepted = HashSet::new();
-    let mut rejected = HashSet::new();
+    // Nodes that will not contribute an accept — CAS rejects AND faults unioned,
+    // so a node that both rejects and faults erodes the accept ceiling once.
+    let mut declined = HashSet::new();
+    let mut had_reject = false;
     let mut acknowledged = local_ack_count;
 
     if acknowledged >= required {
@@ -462,8 +488,9 @@ where
                 }
             }
             CasVote::Reject(node_id) => {
-                if rejected.insert(node_id) {
-                    let possible_accepts = possible.saturating_sub(rejected.len());
+                had_reject = true;
+                if declined.insert(node_id) {
+                    let possible_accepts = possible.saturating_sub(declined.len());
                     if possible_accepts < required {
                         return Err(ConsistencyError::Fenced {
                             required,
@@ -472,7 +499,14 @@ where
                     }
                 }
             }
-            CasVote::Fault(_node_id) => return Err(ConsistencyError::AckFailed),
+            CasVote::Fault(node_id) => {
+                if declined.insert(node_id) {
+                    let possible_accepts = possible.saturating_sub(declined.len());
+                    if possible_accepts < required {
+                        return Err(decline_outcome(had_reject, required, possible_accepts));
+                    }
+                }
+            }
         }
     }
 
@@ -507,7 +541,10 @@ where
     let deadline = Instant::now() + strong.timeout();
     let mut acknowledged_nodes = Vec::new();
     let mut accepted = HashSet::new();
-    let mut rejected = HashSet::new();
+    // Nodes that will not contribute an accept — CAS rejects AND faults unioned,
+    // so a node that both rejects and faults erodes the accept ceiling once.
+    let mut declined = HashSet::new();
+    let mut had_reject = false;
     let mut acknowledged = local_ack_count;
 
     if acknowledged >= required {
@@ -542,8 +579,9 @@ where
                 }
             }
             Ok(CasVote::Reject(node_id)) => {
-                if rejected.insert(node_id) {
-                    let possible_accepts = possible.saturating_sub(rejected.len());
+                had_reject = true;
+                if declined.insert(node_id) {
+                    let possible_accepts = possible.saturating_sub(declined.len());
                     if possible_accepts < required {
                         return Err(ConsistencyError::Fenced {
                             required,
@@ -552,7 +590,14 @@ where
                     }
                 }
             }
-            Ok(CasVote::Fault(_node_id)) => return Err(ConsistencyError::AckFailed),
+            Ok(CasVote::Fault(node_id)) => {
+                if declined.insert(node_id) {
+                    let possible_accepts = possible.saturating_sub(declined.len());
+                    if possible_accepts < required {
+                        return Err(decline_outcome(had_reject, required, possible_accepts));
+                    }
+                }
+            }
             Err(
                 std::sync::mpsc::RecvTimeoutError::Timeout
                 | std::sync::mpsc::RecvTimeoutError::Disconnected,
