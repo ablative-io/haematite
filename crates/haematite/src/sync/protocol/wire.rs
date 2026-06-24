@@ -7,12 +7,13 @@ use beamr::distribution::connection::DistConnection;
 
 use crate::branch::ShardId;
 use crate::sync::SyncNodeId;
+use crate::sync::ballot::Ballot;
 use crate::tree::{Hash, Node};
 
 use super::{
-    AckOutcome, NodeTransfer, PullRequest, PushResponse, RejectReason, RootExchangeRequest,
-    RootExchangeResponse, SyncDecision, SyncError, SyncStats, TargetNodeRequest, TargetNodeResponse,
-    TargetNodeSummary, WriteAck, WriteId, WriteProposal,
+    AckOutcome, Nack, NodeTransfer, Prepare, Promise, PullRequest, PushResponse, RejectReason,
+    RootExchangeRequest, RootExchangeResponse, SyncDecision, SyncError, SyncStats,
+    TargetNodeRequest, TargetNodeResponse, TargetNodeSummary, WriteAck, WriteId, WriteProposal,
 };
 
 const SYNC_CONTROL_FRAME: &[u8] = b"haematite.sync.v1";
@@ -26,6 +27,9 @@ const MESSAGE_TARGET_NODE_REQUEST: u8 = 5;
 const MESSAGE_TARGET_NODE_RESPONSE: u8 = 6;
 const MESSAGE_WRITE_PROPOSAL: u8 = 7;
 const MESSAGE_WRITE_ACK: u8 = 8;
+const MESSAGE_PREPARE: u8 = 9;
+const MESSAGE_PROMISE: u8 = 10;
+const MESSAGE_NACK: u8 = 11;
 
 const ACK_OUTCOME_APPLIED: u8 = 0;
 const ACK_OUTCOME_REJECTED: u8 = 1;
@@ -41,6 +45,9 @@ pub enum SyncMessage {
     TargetNodeResponse(TargetNodeResponse),
     WriteProposal(WriteProposal),
     WriteAck(WriteAck),
+    Prepare(Prepare),
+    Promise(Promise),
+    Nack(Nack),
 }
 
 /// Encode a sync message payload.
@@ -92,6 +99,23 @@ pub fn encode_sync_message(message: &SyncMessage) -> Result<Vec<u8>, SyncError> 
             bytes.extend_from_slice(&ack.acker_creation.to_be_bytes());
             append_ack_outcome(&mut bytes, ack.outcome);
         }
+        SyncMessage::Prepare(prepare) => {
+            bytes.push(MESSAGE_PREPARE);
+            append_shard_id(&mut bytes, prepare.shard_id);
+            append_ballot(&mut bytes, &prepare.ballot);
+        }
+        SyncMessage::Promise(promise) => {
+            bytes.push(MESSAGE_PROMISE);
+            append_shard_id(&mut bytes, promise.shard_id);
+            append_ballot(&mut bytes, &promise.ballot);
+            append_optional_ballot(&mut bytes, promise.accepted_epoch.as_ref());
+            append_optional_hash(&mut bytes, promise.committed_root);
+        }
+        SyncMessage::Nack(nack) => {
+            bytes.push(MESSAGE_NACK);
+            append_shard_id(&mut bytes, nack.shard_id);
+            append_ballot(&mut bytes, &nack.promised);
+        }
     }
     Ok(bytes)
 }
@@ -141,6 +165,20 @@ pub fn decode_sync_message(bytes: &[u8]) -> Result<SyncMessage, SyncError> {
             acker: cursor.read_sync_node_id()?,
             acker_creation: cursor.read_u32()?,
             outcome: cursor.read_ack_outcome()?,
+        }),
+        MESSAGE_PREPARE => SyncMessage::Prepare(Prepare {
+            shard_id: cursor.read_shard_id()?,
+            ballot: cursor.read_ballot()?,
+        }),
+        MESSAGE_PROMISE => SyncMessage::Promise(Promise {
+            shard_id: cursor.read_shard_id()?,
+            ballot: cursor.read_ballot()?,
+            accepted_epoch: cursor.read_optional_ballot()?,
+            committed_root: cursor.read_optional_hash()?,
+        }),
+        MESSAGE_NACK => SyncMessage::Nack(Nack {
+            shard_id: cursor.read_shard_id()?,
+            promised: cursor.read_ballot()?,
         }),
         _ => return Err(SyncError::InvalidMessage),
     };
@@ -341,6 +379,52 @@ where
     )
 }
 
+pub fn send_prepare_via_beamr<F>(
+    manager: &ConnectionManager,
+    remote: Atom,
+    prepare: &Prepare,
+    write_frame: F,
+) -> Result<(), SyncError>
+where
+    F: FnOnce(Arc<DistConnection>, Vec<u8>) -> Result<(), SyncError>,
+{
+    send_sync_message_via_beamr(
+        manager,
+        remote,
+        &SyncMessage::Prepare(prepare.clone()),
+        write_frame,
+    )
+}
+
+pub fn send_promise_via_beamr<F>(
+    manager: &ConnectionManager,
+    remote: Atom,
+    promise: &Promise,
+    write_frame: F,
+) -> Result<(), SyncError>
+where
+    F: FnOnce(Arc<DistConnection>, Vec<u8>) -> Result<(), SyncError>,
+{
+    send_sync_message_via_beamr(
+        manager,
+        remote,
+        &SyncMessage::Promise(promise.clone()),
+        write_frame,
+    )
+}
+
+pub fn send_nack_via_beamr<F>(
+    manager: &ConnectionManager,
+    remote: Atom,
+    nack: &Nack,
+    write_frame: F,
+) -> Result<(), SyncError>
+where
+    F: FnOnce(Arc<DistConnection>, Vec<u8>) -> Result<(), SyncError>,
+{
+    send_sync_message_via_beamr(manager, remote, &SyncMessage::Nack(nack.clone()), write_frame)
+}
+
 /// Register a beamr control-frame handler for haematite sync messages.
 pub fn register_beamr_sync_handler<F>(manager: &ConnectionManager, handler: F)
 where
@@ -436,6 +520,24 @@ fn append_write_id(bytes: &mut Vec<u8>, write_id: &WriteId) {
     append_len_prefixed_bytes(bytes, write_id.origin.as_str().as_bytes());
     bytes.extend_from_slice(&write_id.origin_creation.to_be_bytes());
     bytes.extend_from_slice(&write_id.counter.to_be_bytes());
+}
+
+/// Wire-encode a [`Ballot`]: `u64` counter (big-endian) followed by the minting
+/// node id as length-prefixed bytes (§5). This is the WIRE codec; the WAL ballot
+/// codec (`wal/promise.rs`) is a separate, little-endian framing.
+fn append_ballot(bytes: &mut Vec<u8>, ballot: &Ballot) {
+    bytes.extend_from_slice(&ballot.counter.to_be_bytes());
+    append_len_prefixed_bytes(bytes, ballot.node.as_str().as_bytes());
+}
+
+fn append_optional_ballot(bytes: &mut Vec<u8>, ballot: Option<&Ballot>) {
+    match ballot {
+        Some(ballot) => {
+            bytes.push(1);
+            append_ballot(bytes, ballot);
+        }
+        None => bytes.push(0),
+    }
 }
 
 fn append_optional_duration(bytes: &mut Vec<u8>, ttl: Option<Duration>) {
@@ -541,6 +643,20 @@ impl<'a> MessageCursor<'a> {
         let bytes = self.read_len_prefixed_bytes()?;
         let name = String::from_utf8(bytes).map_err(|_error| SyncError::InvalidMessage)?;
         Ok(SyncNodeId::new(name))
+    }
+
+    fn read_ballot(&mut self) -> Result<Ballot, SyncError> {
+        let counter = self.read_u64()?;
+        let node = self.read_sync_node_id()?;
+        Ok(Ballot::new(counter, node))
+    }
+
+    fn read_optional_ballot(&mut self) -> Result<Option<Ballot>, SyncError> {
+        match self.read_u8()? {
+            0 => Ok(None),
+            1 => self.read_ballot().map(Some),
+            _ => Err(SyncError::InvalidMessage),
+        }
     }
 
     fn read_write_id(&mut self) -> Result<WriteId, SyncError> {

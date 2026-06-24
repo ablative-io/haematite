@@ -5,6 +5,7 @@ use crate::api::kv::{KvKey, KvValue};
 use crate::branch::ShardId;
 use crate::store::NodeStore;
 use crate::sync::SyncNodeId;
+use crate::sync::ballot::Ballot;
 use crate::tree::{Hash, Node};
 
 #[path = "protocol/wire.rs"]
@@ -24,11 +25,11 @@ pub use error::SyncError;
 pub use target::{TargetNodeReader, TargetNodeRequest, TargetNodeResponse, TargetNodeSummary};
 pub use wire::{
     SyncMessage, decode_beamr_sync_frame, decode_sync_message, encode_beamr_sync_frame,
-    encode_sync_message, register_beamr_sync_handler, send_pull_request_via_beamr,
-    send_push_response_via_beamr, send_root_exchange_request_via_beamr,
-    send_root_exchange_response_via_beamr, send_sync_message_via_beamr,
-    send_target_node_request_via_beamr, send_target_node_response_via_beamr,
-    send_write_ack_via_beamr, send_write_proposal_via_beamr,
+    encode_sync_message, register_beamr_sync_handler, send_nack_via_beamr, send_prepare_via_beamr,
+    send_promise_via_beamr, send_pull_request_via_beamr, send_push_response_via_beamr,
+    send_root_exchange_request_via_beamr, send_root_exchange_response_via_beamr,
+    send_sync_message_via_beamr, send_target_node_request_via_beamr,
+    send_target_node_response_via_beamr, send_write_ack_via_beamr, send_write_proposal_via_beamr,
 };
 
 /// Decision made by the root-hash exchange for one shard.
@@ -307,6 +308,39 @@ pub struct WriteAck {
     pub acker: SyncNodeId,
     pub acker_creation: u32,
     pub outcome: AckOutcome,
+}
+
+/// Step-3 Phase-1 Prepare: a candidate asks every node to promise its ballot
+/// for `shard` (§2.2). The receiver promises iff `ballot` exceeds its current
+/// `promised[shard]`, otherwise replies [`Nack`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Prepare {
+    pub shard_id: ShardId,
+    pub ballot: Ballot,
+}
+
+/// Step-3 Phase-1 Promise: a node's grant of a [`Prepare`] (§2.2).
+///
+/// It carries the promiser's last-accepted epoch and last-committed root so the
+/// new owner can state-sync (§2.4). Both are `Option` because a fresh node has
+/// neither.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Promise {
+    pub shard_id: ShardId,
+    pub ballot: Ballot,
+    /// The highest epoch the promiser previously accepted, if any.
+    pub accepted_epoch: Option<Ballot>,
+    /// The promiser's last committed root for `shard`, if any (§2.4).
+    pub committed_root: Option<Hash>,
+}
+
+/// Step-3 Phase-1 Nack: a node's refusal of a [`Prepare`] whose ballot did not
+/// exceed its already-`promised` ballot (§2.2), surfacing that higher ballot so
+/// the candidate can retry above it or back off.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Nack {
+    pub shard_id: ShardId,
+    pub promised: Ballot,
 }
 
 /// One content-addressed node to transfer from source to target.
