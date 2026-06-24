@@ -36,12 +36,9 @@ use std::sync::Arc;
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
-use haematite::db::respond_to_inbound_writes;
+use haematite::db::{DatabaseError, respond_to_inbound_writes};
 use haematite::sync::membership::WriteMembership;
-use haematite::sync::{
-    AckOutcome, ConsistencyError, DistributionEndpoint, QuorumOutcome, SyncNodeId, WriteId,
-    WriteProposal,
-};
+use haematite::sync::{ConsistencyError, DistributionEndpoint, SyncNodeId};
 use haematite::{Database, DatabaseConfig};
 
 type TestResult = Result<(), Box<dyn Error>>;
@@ -185,73 +182,69 @@ fn membership(total_nodes: usize, send_targets: &[&str]) -> WriteMembership {
     }
 }
 
-/// Propose a Strong CAS create through the REAL transport AND — on commit —
-/// durably apply the writer's own value LOCALLY through the REAL receiver apply
-/// path.
+/// Post-heal, assert node C is FENCED when it re-proposes a stale CAS create to
+/// {A,B} (which already hold the winning value) — both structurally and via the
+/// production path.
 ///
-/// # Why the local apply is required (resolving the brief's ambiguity)
+/// 1. A direct `propose_write` to `[A,B]` must return `ConsistencyError::Fenced`
+///    (CAS rejects from A and B drop possible accepts below quorum) — proving C is
+///    out-voted by CAS MISMATCH, not merely timed out.
+/// 2. The production `replicate_write` to `[A,B]` must surface that fence as a
+///    `DatabaseError::ConsistencyError` whose message reflects the CAS fence AND,
+///    because it applies locally only on quorum success, must apply NOTHING on C.
 ///
-/// `DistributionEndpoint::propose_write` counts the proposer's local ack toward
-/// quorum but does NOT itself apply the value on the proposer (it is transport-
-/// only; the apply lives on `Database`). So after a bare `propose_write` commit,
-/// the value is durable on the APPLIER peers but NOT on the proposer. That is a
-/// real hole: a "committed" write that is absent on its own writer lets a later
-/// stale CAS *create* (`expected = None`) MATCH on the writer and apply — exactly
-/// reopening split-brain on heal. (Observed empirically: without this step, the
-/// healed minority's create is ACCEPTED by the proposer, which still had the key
-/// absent, and the minority reaches quorum.)
-///
-/// The faithful model of "commit" is therefore: reach quorum over the transport,
-/// THEN durably persist the writer's own committed value locally. This helper does
-/// that second step with the SAME real conditional-durable apply the receiver runs
-/// (`Database::apply_write_proposal`), so the committed value is durable on the
-/// FULL quorum {proposer + appliers}. No transport or apply is mocked.
-///
-/// Returns the quorum outcome (so callers can assert on `reached`/`acknowledged`).
-fn propose_and_commit_locally(
-    node: &Node,
-    key: &[u8],
-    expected: Option<haematite::tree::Hash>,
-    value: &[u8],
-    membership: &WriteMembership,
-    timeout: Duration,
-) -> Result<QuorumOutcome<SyncNodeId>, Box<dyn Error>> {
-    let endpoint = node.db.distribution().ok_or("proposer has no endpoint")?;
-    let outcome = endpoint.propose_write(
-        key.to_vec(),
-        expected,
-        value.to_vec(),
-        None,
-        membership,
-        timeout,
-    )?;
+/// Both proposals reject idempotently (A,B still hold the winning value), so
+/// neither mutates any node.
+fn assert_post_heal_c_fenced(node_c: &Node, key: &[u8], value_c: &[u8]) -> TestResult {
+    let endpoint = node_c.db.distribution().ok_or("C has no endpoint")?;
 
-    // On commit, the writer durably persists its OWN committed value via the real
-    // receiver apply path. A self-proposal carries the writer's identity; the CAS
-    // `expected` is the same precondition the cluster just agreed on, so this apply
-    // is the durable local half of the commit (and is itself CAS-guarded).
-    if outcome.reached() {
-        let self_proposal = WriteProposal {
-            write_id: WriteId {
-                origin: SyncNodeId::from(node.name),
-                origin_creation: endpoint.local_creation(),
-                counter: u64::MAX, // local-commit marker; never collides on the wire
-            },
-            key: key.to_vec(),
-            expected,
-            value: value.to_vec(),
-            ttl: None,
-        };
-        let ack = node.db.apply_write_proposal(&self_proposal);
-        if !matches!(ack.outcome, AckOutcome::Applied) {
+    // (1) Structured proof: fenced specifically by CAS rejects.
+    let structured = endpoint.propose_write(
+        key.to_vec(),
+        None,
+        value_c.to_vec(),
+        None,
+        &membership(3, &[NODE_A, NODE_B]),
+        QUORUM_TIMEOUT,
+    );
+    match structured {
+        Err(ConsistencyError::Fenced {
+            required,
+            possible_accepts,
+        }) => {
+            assert_eq!(required, 2, "quorum over 3 is 2");
+            assert!(
+                possible_accepts < 2,
+                "CAS rejects from A and B must drop possible accepts below quorum, got {possible_accepts}"
+            );
+        }
+        other => {
             return Err(format!(
-                "writer {} failed to durably commit its own value locally: {:?}",
-                node.name, ack.outcome
+                "post-heal C must be CAS-REJECTED -> Fenced (NOT timeout, NOT commit), got {other:?}"
             )
             .into());
         }
     }
-    Ok(outcome)
+
+    // (2) Production path: replicate_write reports the fence and applies nothing.
+    let production = node_c.db.replicate_write(
+        key.to_vec(),
+        None,
+        value_c.to_vec(),
+        None,
+        &membership(3, &[NODE_A, NODE_B]),
+        QUORUM_TIMEOUT,
+    );
+    match production {
+        Err(DatabaseError::ConsistencyError(message)) => assert!(
+            message.contains("fenced"),
+            "production replicate_write must report C fenced by CAS rejects, got: {message}"
+        ),
+        other => {
+            return Err(format!("post-heal C replicate_write must fail (fenced), got {other:?}").into());
+        }
+    }
+    Ok(())
 }
 
 // ===========================================================================
@@ -279,11 +272,13 @@ fn majority_commits_via_real_transport() -> TestResult {
 
     let key = b"majority-key".to_vec();
     let value = b"majority-value".to_vec();
-    let outcome = propose_and_commit_locally(
-        &node_a,
-        &key,
+    // The REAL production proposer-commit path: drive to peer-quorum, then durably
+    // apply the proposer's own committed value locally.
+    let outcome = node_a.db.replicate_write(
+        key.clone(),
         None,
-        &value,
+        value.clone(),
+        None,
         &membership(3, &[NODE_B, NODE_C]),
         QUORUM_TIMEOUT,
     )?;
@@ -324,15 +319,17 @@ fn majority_commits_via_real_transport() -> TestResult {
 // ===========================================================================
 
 /// Node C is partitioned: it is never linked to A or B, so it has no reachable
-/// peers. C proposes a CAS create with `total_nodes = 3` (quorum 2) and EMPTY
-/// `send_targets`. It can only count its own local ack (1 < 2), so it must FAIL
-/// with [`ConsistencyError::QuorumTimeout`].
+/// peers. C calls the production `replicate_write` with `total_nodes = 3`
+/// (quorum 2) and EMPTY `send_targets`. It can only count its own local ack
+/// (1 < 2), so the write FAILS to reach quorum.
 ///
 /// "Fenced" here means precisely: the QUORUM fails, so the write is NOT
-/// acknowledged as durable across the cluster. Note `propose_write` does NOT
-/// locally apply the value on the proposer — it only proposes to peers and counts
-/// the local ack — so we assert C does NOT report a quorum AND that C's own store
-/// never received the value (nothing applied it: no peer, and not the proposer).
+/// acknowledged as durable across the cluster. `replicate_write` applies locally
+/// ONLY on quorum success (step 2), so a fenced write applies NOTHING on C — we
+/// assert both that it returns an error and that C's store never received the
+/// value. We also assert, via a direct `propose_write`, the EXACT fence shape
+/// (`QuorumTimeout { required: 2, acknowledged: 1 }`) so the structured proof of
+/// "cannot self-quorum" is preserved.
 #[test]
 fn minority_is_fenced_without_reachable_peers() -> TestResult {
     let dir_a = tempfile::tempdir()?;
@@ -348,20 +345,34 @@ fn minority_is_fenced_without_reachable_peers() -> TestResult {
 
     let key = b"minority-key".to_vec();
     let value = b"from-isolated-C".to_vec();
-    let result = node_c.db.distribution().ok_or("C has no endpoint")?.propose_write(
+
+    // The PRODUCTION path: replicate_write must fail (no quorum) and apply nothing.
+    let result = node_c.db.replicate_write(
         key.clone(),
         None,
-        value,
+        value.clone(),
         None,
         // total_nodes = 3 (FULL membership, never the reachable subset), but NO
         // reachable peers to propose to.
         &membership(3, &[]),
         FENCE_TIMEOUT,
     );
+    assert!(
+        matches!(result, Err(DatabaseError::ConsistencyError(_))),
+        "minority replicate_write must fail with a consistency error, got {result:?}"
+    );
 
-    // C cannot reach quorum: only its local ack (1) against a required 2. The
-    // CAS tally times out (no rejects arrive — there are no peers to reject).
-    match result {
+    // The structured fence shape: directly drive the quorum primitive to prove C
+    // counts ONLY its local ack (1) against required 2 — it cannot self-quorum.
+    let direct = node_c.db.distribution().ok_or("C has no endpoint")?.propose_write(
+        key.clone(),
+        None,
+        value,
+        None,
+        &membership(3, &[]),
+        FENCE_TIMEOUT,
+    );
+    match direct {
         Err(ConsistencyError::QuorumTimeout {
             required,
             acknowledged,
@@ -374,8 +385,8 @@ fn minority_is_fenced_without_reachable_peers() -> TestResult {
     }
 
     // The write did not commit anywhere: no peer applied it (none reachable) and
-    // the proposer does not locally apply. C's store reflects only what it could
-    // durably do locally for THIS write, which is nothing.
+    // replicate_write applies locally only on quorum success. C's store reflects
+    // only what it could durably do locally for THIS write, which is nothing.
     assert_eq!(
         node_c.db.get(&key)?,
         None,
@@ -432,12 +443,12 @@ fn heal_mid_write_exactly_one_side_acquires() -> TestResult {
 
     // --- Majority {A,B}: A proposes the create; B applies + acks; A commits AND
     // durably persists its own committed value locally (so the winning value lives
-    // on the FULL quorum {A,B} — see propose_and_commit_locally). ---------------
-    let ab_outcome = propose_and_commit_locally(
-        &node_a,
-        &key,
+    // on the FULL quorum {A,B}). This is the REAL production replicate_write. -----
+    let ab_outcome = node_a.db.replicate_write(
+        key.clone(),
         None,
-        &value_ab,
+        value_ab.clone(),
+        None,
         &membership(3, &[NODE_B]),
         QUORUM_TIMEOUT,
     )?;
@@ -481,37 +492,11 @@ fn heal_mid_write_exactly_one_side_acquires() -> TestResult {
     link_both(&node_c, &node_b)?;
 
     // --- C RE-proposes the SAME create now that it can reach A and B. --------
-    // A and B already hold k = "from-AB", so their CAS compare (expected None vs a
-    // present value) MISMATCHES -> both ack Rejected(CasMismatch) -> C's tally
-    // sees 2 distinct rejects -> possible_accepts = 3 - 2 = 1 < required 2 ->
-    // deterministic Fenced. This is the split-brain fence: C is out-voted, not
-    // allowed to overwrite.
-    let c_fenced_post_heal = node_c.db.distribution().ok_or("C has no endpoint")?.propose_write(
-        key.clone(),
-        None,
-        value_c.clone(),
-        None,
-        &membership(3, &[NODE_A, NODE_B]),
-        QUORUM_TIMEOUT,
-    );
-    match c_fenced_post_heal {
-        Err(ConsistencyError::Fenced {
-            required,
-            possible_accepts,
-        }) => {
-            assert_eq!(required, 2, "quorum over 3 is 2");
-            assert!(
-                possible_accepts < 2,
-                "CAS rejects from A and B must drop possible accepts below quorum, got {possible_accepts}"
-            );
-        }
-        other => {
-            return Err(format!(
-                "post-heal C must be CAS-REJECTED -> Fenced (NOT timeout, NOT commit), got {other:?}"
-            )
-            .into());
-        }
-    }
+    // A and B already hold k = "from-AB", so their CAS compare MISMATCHES -> both
+    // ack Rejected(CasMismatch) -> C is deterministically Fenced (out-voted, not
+    // allowed to overwrite). Proven both structurally (`Fenced`) and via the real
+    // production replicate_write (errors AND applies nothing locally).
+    assert_post_heal_c_fenced(&node_c, &key, &value_c)?;
 
     // --- EXACTLY ONE ACQUIRER: the majority value won; C overwrote no one. ----
     // A CAS reject applies NOTHING, so the durable value on A and B must be
