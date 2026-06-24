@@ -1,0 +1,198 @@
+# CORE-005: WAL buffer and durable WAL writer
+
+**Cluster:** core
+**Repo:** `/Users/tom/Developer/ablative/haematite`
+**Clone URL:** https://github.com/ablative-io/haematite.git
+**Base ref:** `main`
+**Reviewers:** Waffles the Terrible
+**Depends on:** CORE-002
+
+---
+
+## Purpose
+
+Deliver the write-amortisation layer described in ADR-003: a per-shard in-memory WAL buffer that accumulates mutations at sequential-append latency and a durable WAL writer that makes those mutations crash-safe before they reach the prolly tree. Together they ensure that N buffered writes produce exactly one path-to-root rewrite on commit (CN8), that buffered values shadow tree values so reads are always consistent (CN6), and that every mutation is persisted to an append-only file before acknowledgement. This brief delivers only the WAL module — the recovery replay of the durable file is CORE-006; the shard actor that drives the commit cycle is CORE-007.
+
+## Task
+
+Create the wal module with three files: wal/mod.rs (module root, declarations and re-exports only), wal/buffer.rs (WalBuffer — in-memory sorted mutation log), and wal/durable.rs (DurableWal — append-only file writer). WalBuffer accumulates Put and Delete mutations in a BTreeMap keyed by the mutation key, provides a get method that shadows the tree, and provides a commit method that flushes all buffered mutations to the prolly tree as a single batch returning a new root Hash. DurableWal appends each mutation to an on-disk file in a length-prefixed binary format with CRC32 checksums before the mutation enters the in-memory buffer; WAL entries are NOT compressed (ADR-006). This brief does not implement crash recovery/replay — that is CORE-006. It does not implement the shard actor that calls commit — that is CORE-007.
+
+## Requirements
+
+### R1: WAL module root
+
+**Spec:** Create wal/mod.rs containing only pub mod declarations for buffer and durable, and pub use re-exports of the public types WalBuffer, Mutation, DurableWal, and WalError. SHALL NOT contain any logic, trait implementations, or type definitions.
+
+**Acceptance criteria:**
+- crates/haematite/src/wal/mod.rs exists and contains only pub mod and pub use statements
+- WalBuffer, Mutation, DurableWal, and WalError are accessible from haematite::wal::* after the module is wired into lib.rs
+- cargo check -p haematite succeeds with the new module present
+
+**Files:**
+- `crates/haematite/src/wal/mod.rs` (create)
+- `crates/haematite/src/lib.rs` (modify)
+
+### R2: Mutation enum
+
+**Spec:** Define a Mutation enum with two variants: Put { key: Vec<u8>, value: Vec<u8> } and Delete { key: Vec<u8> }. THE SYSTEM SHALL derive Clone, Debug, and PartialEq on Mutation. THE SYSTEM SHALL NOT add any variants beyond Put and Delete — sequence or version fields belong to the shard actor layer (CORE-007).
+
+**Acceptance criteria:**
+- Mutation::Put { key, value } and Mutation::Delete { key } are the only variants
+- Mutation derives Clone, Debug, PartialEq
+- Mutation::Put { key: b"k".to_vec(), value: b"v".to_vec() }.clone() equals the original
+- Mutation has no sequence or timestamp fields
+
+**Files:**
+- `crates/haematite/src/wal/buffer.rs` (create)
+
+*Checklist: C22*
+
+### R3: WalBuffer: sorted in-memory mutation log
+
+**Spec:** WHILE a WalBuffer is active, WHEN put(key, value) is called, THE SYSTEM SHALL insert Mutation::Put into an internal BTreeMap<Vec<u8>, Mutation> keyed by key, overwriting any prior mutation for that key. WHEN delete(key) is called, THE SYSTEM SHALL insert Mutation::Delete into the BTreeMap, overwriting any prior mutation for that key. THE SYSTEM SHALL maintain the BTreeMap in sorted key order at all times. THE SYSTEM SHALL NOT store duplicate entries for the same key — the latest mutation wins.
+
+**Acceptance criteria:**
+- WalBuffer::new() returns an empty buffer
+- After put(b"a", b"1") and put(b"a", b"2"), the buffer contains exactly one entry for key b"a" with value b"2"
+- After put(b"a", b"1") and delete(b"a"), the buffer contains Mutation::Delete for key b"a"
+- WalBuffer::len() returns the count of distinct keys in the buffer
+- WalBuffer::is_empty() returns true for a new buffer
+- Iterating WalBuffer mutations yields entries in ascending key order
+- WalBuffer implements Debug
+
+**Files:**
+- `crates/haematite/src/wal/buffer.rs` (modify)
+
+*Checklist: C22*
+
+### R4: WalBuffer::get — buffered reads shadow the tree
+
+**Spec:** WHEN get(key) is called on a WalBuffer, THE SYSTEM SHALL return Some(value) if the buffer contains Mutation::Put for that key, None if the buffer contains Mutation::Delete for that key (the deletion shadows any tree value), and a sentinel indicating the key is absent from the buffer if no mutation exists for that key (the caller must then consult the tree). THE SYSTEM SHALL NOT perform any tree I/O inside get — the buffer lookup is purely in-memory. THE SYSTEM SHALL NOT return a stale tree value when a more recent buffered mutation exists for the same key (CN6).
+
+**Acceptance criteria:**
+- WalBuffer::get returns a LookupResult enum (or equivalent) with three cases: BufferedValue(Vec<u8>), BufferedDelete, NotBuffered
+- After put(b"key", b"val"), get(b"key") returns BufferedValue(b"val")
+- After delete(b"key"), get(b"key") returns BufferedDelete regardless of any prior put
+- On a fresh buffer, get(b"key") returns NotBuffered
+- After put(b"key", b"v1") then put(b"key", b"v2"), get(b"key") returns BufferedValue(b"v2")
+
+**Files:**
+- `crates/haematite/src/wal/buffer.rs` (modify)
+
+*Checklist: C23*
+
+### R5: WalBuffer::commit — single-batch tree flush
+
+**Spec:** WHEN commit(tree_root, store) is called on a WalBuffer, THE SYSTEM SHALL apply all buffered mutations to the prolly tree as a single batch operation, passing the complete BTreeMap of mutations to the tree's batch mutate function (from CORE-002) rather than calling put/delete individually in a loop. THE SYSTEM SHALL return the new root Hash produced by the batch. THE SYSTEM SHALL clear the buffer after a successful commit. THE SYSTEM SHALL NOT call tree put or delete once per buffered mutation — exactly one path-to-root rewrite must result from the entire flush (CN8, C25). IF the batch operation returns an error, THE SYSTEM SHALL return that error without partially clearing the buffer.
+
+**Acceptance criteria:**
+- After buffering 50 puts and calling commit, the buffer is empty (len() == 0)
+- commit returns Ok(Hash) on success where Hash equals the tree's new root after all mutations applied
+- A test that instruments tree mutation calls confirms commit triggers exactly one batch operation, not 50 individual puts
+- If the tree batch returns Err, the buffer retains all 50 mutations and commit returns Err
+- commit on an empty buffer is a no-op that returns the current root hash unchanged
+
+**Files:**
+- `crates/haematite/src/wal/buffer.rs` (modify)
+
+*Checklist: C24, C25 | Stories: S4, S9*
+
+### R6: WalError type
+
+**Spec:** Define a WalError enum covering the distinct failure cases across both WalBuffer and DurableWal: Io(std::io::Error) for file I/O failures, ChecksumMismatch { expected: u32, actual: u32 } for CRC32 validation failures on read, and TreeError(String) for errors propagated from the prolly tree on commit. THE SYSTEM SHALL implement std::error::Error and std::fmt::Display on WalError. THE SYSTEM SHALL NOT use a single-string catch-all variant — distinct error cases must be distinct variants.
+
+**Acceptance criteria:**
+- WalError has variants Io, ChecksumMismatch, and TreeError
+- WalError implements std::error::Error
+- WalError implements Display with human-readable messages for each variant
+- ChecksumMismatch { expected: 0xDEAD, actual: 0xBEEF } formats as a message naming both values
+- WalError::Io wraps std::io::Error and implements From<std::io::Error>
+
+**Files:**
+- `crates/haematite/src/wal/buffer.rs` (modify)
+
+### R7: DurableWal: append-only file writer with CRC32 framing
+
+**Spec:** WHEN DurableWal::open(path) is called, THE SYSTEM SHALL open or create the file at path for appending and return a DurableWal handle. WHEN append(mutation) is called, THE SYSTEM SHALL serialise the Mutation to bytes using a length-prefixed binary format (4-byte little-endian payload length, then the payload bytes), compute a CRC32 checksum of the payload bytes, write the 4-byte checksum immediately after the payload, and fsync the file before returning Ok(()). WHEN write_commit(root_hash) is called, THE SYSTEM SHALL write a frame with tag 0x03 followed by 32 bytes of root hash with the same length-prefix + CRC32 framing as mutation entries. Commit is a WAL-level marker, not a Mutation variant — it records the root hash at the durability boundary so CORE-006 can locate the last committed state during recovery. THE SYSTEM SHALL NOT compress WAL entries (ADR-006 — WAL is uncompressed for append speed). THE SYSTEM SHALL NOT buffer multiple mutations before writing — each append must be individually durable. IF the file write or fsync fails, THE SYSTEM SHALL return WalError::Io wrapping the underlying io::Error.
+
+**Acceptance criteria:**
+- DurableWal::open(path) creates the file if it does not exist
+- DurableWal::open(path) opens an existing file in append mode without truncating it
+- After append(Mutation::Put { key: b"k".to_vec(), value: b"v".to_vec() }), the file contains exactly 4 bytes of length + payload bytes + 4 bytes of CRC32
+- The CRC32 in the written frame matches crc32fast::hash(payload_bytes)
+- After two appends, the file contains two consecutive frames with no gaps or delimiters between them
+- DurableWal serialises Put with a 1-byte tag (0x01) followed by key length (4-byte LE), key bytes, value length (4-byte LE), value bytes
+- DurableWal serialises Delete with a 1-byte tag (0x02) followed by key length (4-byte LE), key bytes
+- DurableWal::write_commit(root_hash) writes a frame with tag 0x03 followed by 32 bytes of root hash — this is the Commit marker that CORE-006 reads during recovery and CORE-007 writes after each tree flush
+- Commit is a WAL-level entry (tag 0x03), NOT a Mutation variant — the Mutation enum contains only Put and Delete
+- DurableWal implements Debug
+
+**Files:**
+- `crates/haematite/src/wal/durable.rs` (create)
+
+*Checklist: C26*
+
+## Boundaries
+
+- SHALL NOT implement WAL recovery or replay — that is CORE-006
+- SHALL NOT implement the shard actor that drives the commit cycle — that is CORE-007
+- SHALL NOT compress WAL entries — ADR-006 mandates WAL entries are uncompressed; compression belongs to the tree node store (CORE-004)
+- SHALL NOT implement tree traversal or mutation logic — those are CORE-002; this brief consumes the batch mutate function as a black box
+- SHALL NOT add sequence numbers, vector clocks, or version fields to Mutation — versioning belongs to the shard actor layer
+- SHALL NOT implement WAL compaction or truncation — deferred to a future phase
+
+## Verification
+
+- cargo check -p haematite succeeds with no errors
+- cargo test -p haematite --lib passes all tests in the wal module
+- cargo clippy -p haematite -- -D warnings produces no warnings
+- grep -r 'unwrap()\|expect(' crates/haematite/src/wal/ --include='*.rs' produces no matches outside #[cfg(test)] blocks
+- No file in crates/haematite/src/wal/ exceeds 500 lines
+- grep -n '.' crates/haematite/src/wal/mod.rs | grep -v 'pub mod\|pub use\|^[[:space:]]*$\|//' produces no output — mod.rs contains only declarations
+- A test that appends 100 mutations and commits confirms the buffer is empty and the tree received exactly one batch call
+
+## Architecture Decision Records
+
+### ADR-003: WAL buffer for write amortization rather than direct tree mutation
+
+**Decision:** WAL buffer over direct tree mutation, because it gives sequential-append write latency (the WAL) with amortized tree cost (one path-to-root rewrite per flush, not per write). The rejected alternative (direct mutation with batching windows) forces callers to accept high write latency or risk high write amplification with small batches.
+**Decided by:** Bono
+
+### ADR-006: zstd compression per content-addressed node, WAL uncompressed
+
+**Decision:** zstd compression per content-addressed tree node, WAL entries uncompressed, over compressing both or neither. The rejected alternatives: compressing WAL entries (poor ratio, added write latency on the hot path); no compression (wasted disk for tree nodes that compress well at ~3:1 for structured data).
+**Decided by:** Bono, Frodo Baggins
+
+## Constraints
+
+- **CN1:** No file over 500 lines. If a module approaches this limit, extract into submodules.
+- **CN2:** No panics in production code. .unwrap() and .expect() only in tests.
+- **CN3:** mod.rs contains ONLY pub mod declarations and pub use re-exports. No logic.
+- **CN4:** All public types implement Debug. All error types implement std::error::Error.
+- **CN5:** The prolly tree root hash for a given key-value set must be deterministic and history-independent: the same keys and values always produce the same root hash regardless of insertion order.
+- **CN6:** WAL buffer reads must shadow tree reads: a key written to the buffer but not yet committed must be returned by get, not the stale tree value.
+- **CN7:** Shard actor crash must not affect other shards. Supervision restarts only the failed shard.
+- **CN8:** Batch append (multiple key-value pairs in one call) must produce exactly one tree commit, not N individual commits.
+
+## Checklist Items
+
+- **C22:** WalBuffer accumulates put/delete mutations in memory as a sorted log.
+- **C23:** WalBuffer.get(key) returns the buffered value, shadowing any tree value (CN6).
+- **C24:** WalBuffer.commit() flushes all buffered mutations to the prolly tree as a single batch and returns the new root hash.
+- **C25:** A commit of N buffered writes produces exactly one path-to-root rewrite (CN8).
+- **C26:** DurableWal appends mutations to an append-only file before buffering.
+
+## User Stories
+
+- **S4:** As an application developer, I want to batch multiple writes into a single atomic commit so that my data is always in a consistent state.
+- **S9:** As the Aion engine, I want to batch-append WorkflowStarted and SearchAttributesUpdated atomically so that a crash between them never leaves an orphaned workflow.
+
+## Design Intention
+
+Haematite's core is a storage engine where concurrency is free and branching is structural. When this cluster is complete, a developer can open a haematite database, write to it from hundreds of concurrent actors without any locking discipline, fork it instantly by sharing a hash, and merge two forks by walking only the nodes that differ. The experience should feel like working with an in-memory data structure that happens to be durable — no connection pools, no transaction coordinators, no lock managers. The content-addressed prolly tree is what makes branching zero-friction; the actor-per-shard model is what makes concurrency zero-contention; the WAL buffer is what makes writes fast despite the content-addressing overhead. All three are load-bearing.
+
+## Workflow Config
+
+- Isolation: worktree
+- Verify-fix cap: 3
+- Review cap: 1
