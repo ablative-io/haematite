@@ -42,9 +42,10 @@ pub use wal::{
 };
 
 pub use sync::{
-    Ack, ConsistencyError, ConsistencyMode, ConvergenceProperties, EventualConsistency,
-    NoopSyncPullTrigger, QuorumOutcome, StrongConsistency, SyncMergeError, SyncMergeResult,
-    SyncMergeRoots, SyncNodeId, SyncPair, SyncPullTrigger, SyncSchedulerConfig, SyncSchedulerError,
-    SyncSchedulerHandle, SyncSchedulerStats, SyncTopology, TopologyError, execute_with_consistency,
-    merge_synced_roots, quorum_size, wait_for_quorum, wait_for_quorum_from_receiver,
+    Ack, ConsistencyError, ConsistencyMode, ConvergenceProperties, DistributionEndpoint,
+    EventualConsistency, InboundSync, NoopSyncPullTrigger, QuorumOutcome, StrongConsistency,
+    SyncMergeError, SyncMergeResult, SyncMergeRoots, SyncNodeId, SyncPair, SyncPullTrigger,
+    SyncSchedulerConfig, SyncSchedulerError, SyncSchedulerHandle, SyncSchedulerStats, SyncTopology,
+    TopologyError, execute_with_consistency, merge_synced_roots, quorum_size, wait_for_quorum,
+    wait_for_quorum_from_receiver,
 };

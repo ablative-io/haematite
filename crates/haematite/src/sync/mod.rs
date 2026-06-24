@@ -1,4 +1,5 @@
 pub mod consistency;
+pub mod endpoint;
 pub mod merge;
 pub mod protocol;
 pub mod pull;
@@ -10,6 +11,7 @@ pub use consistency::{
     Ack, ConsistencyError, ConsistencyMode, EventualConsistency, QuorumOutcome, StrongConsistency,
     execute_with_consistency, quorum_size, wait_for_quorum, wait_for_quorum_from_receiver,
 };
+pub use endpoint::{DistributionEndpoint, InboundSync};
 pub use merge::{SyncMergeError, SyncMergeResult, SyncMergeRoots, merge_synced_roots};
 pub use protocol::{
     MissingNodes, NodeTransfer, PullRequest, PushResponse, RootExchange, RootExchangeRequest,
