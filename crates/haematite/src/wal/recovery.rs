@@ -13,6 +13,7 @@ use super::buffer::{
     WalError,
 };
 use super::entry::{TAG_DELETE, TAG_PUT};
+use super::promise::{PromiseRecord, TAG_PROMISE};
 
 const CHECKSUM_SIZE: usize = 4;
 const FRAME_LEN_SIZE: usize = 4;
@@ -30,6 +31,7 @@ pub struct RecoveredWal {
     buffer: WalBuffer,
     replayed_mutations: usize,
     stopped_at_corruption: bool,
+    promise: Option<PromiseRecord>,
 }
 
 impl RecoveredWal {
@@ -39,12 +41,23 @@ impl RecoveredWal {
             buffer: WalBuffer::new(),
             replayed_mutations: 0,
             stopped_at_corruption: false,
+            promise: None,
         }
     }
 
     /// Last committed root hash read from a truncation marker, if one exists.
     pub const fn committed_root(&self) -> Option<Hash> {
         self.committed_root
+    }
+
+    /// The latest durable promise-state snapshot replayed from the WAL (AA-3-0),
+    /// or `None` if this shard never persisted promise state. Because each
+    /// promise frame carries the full snapshot, the LAST one seen is the latest
+    /// of every field; the caller seeds the shard actor's promise state from it,
+    /// defaulting to bottom `(0,"")` / `None` / `0` when absent.
+    #[must_use]
+    pub const fn promise(&self) -> Option<&PromiseRecord> {
+        self.promise.as_ref()
     }
 
     /// Replayed in-memory WAL buffer containing mutations after the last marker.
@@ -138,6 +151,7 @@ impl WalRecovery {
         let mut committed_root = None;
         let mut replayed_mutations = 0;
         let mut stopped_at_corruption = false;
+        let mut promise = None;
 
         loop {
             let payload = match self.read_frame() {
@@ -165,6 +179,14 @@ impl WalRecovery {
                     buffer = WalBuffer::new();
                     replayed_mutations = 0;
                 }
+                // Promise-state frames (AA-3-0) are coordination metadata, not
+                // data: a commit marker NEVER resets them. Each frame carries the
+                // full snapshot, so keep the LAST one seen — that is the latest of
+                // every field. Surviving a commit truncation is guaranteed by the
+                // writer re-emitting the snapshot after the marker.
+                Ok(RecoveredEntry::Promise(record)) => {
+                    promise = Some(record);
+                }
                 Err(error @ WalError::ChecksumMismatch { .. }) => {
                     log::warn!("wal recovery stopped at corrupted payload: {error}");
                     stopped_at_corruption = true;
@@ -180,6 +202,7 @@ impl WalRecovery {
             buffer,
             replayed_mutations,
             stopped_at_corruption,
+            promise,
         })
     }
 
@@ -271,6 +294,7 @@ fn read_exact_or_none<R: Read>(reader: &mut R, bytes: &mut [u8]) -> Result<Optio
 enum RecoveredEntry {
     Mutation(Mutation),
     Commit(Hash),
+    Promise(PromiseRecord),
 }
 
 fn decode_payload(payload: &[u8]) -> Result<RecoveredEntry, WalError> {
@@ -281,6 +305,9 @@ fn decode_payload(payload: &[u8]) -> Result<RecoveredEntry, WalError> {
         TAG_PUT => decode_put(&mut cursor),
         TAG_DELETE => decode_delete(&mut cursor),
         TAG_COMMIT => decode_commit(&mut cursor),
+        // The promise codec owns its own framing; decode from the full payload
+        // (including the tag byte it re-reads).
+        TAG_PROMISE => PromiseRecord::decode(payload).map(RecoveredEntry::Promise),
         found => Err(unknown_tag(found)),
     }
 }
