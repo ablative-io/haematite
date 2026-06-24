@@ -101,19 +101,19 @@ pub fn encode_sync_message(message: &SyncMessage) -> Result<Vec<u8>, SyncError> 
         }
         SyncMessage::Prepare(prepare) => {
             bytes.push(MESSAGE_PREPARE);
-            bytes.extend_from_slice(&prepare.shard.to_be_bytes());
+            append_shard_id(&mut bytes, prepare.shard_id);
             append_ballot(&mut bytes, &prepare.ballot);
         }
         SyncMessage::Promise(promise) => {
             bytes.push(MESSAGE_PROMISE);
-            bytes.extend_from_slice(&promise.shard.to_be_bytes());
+            append_shard_id(&mut bytes, promise.shard_id);
             append_ballot(&mut bytes, &promise.ballot);
             append_optional_ballot(&mut bytes, promise.accepted_epoch.as_ref());
             append_optional_hash(&mut bytes, promise.committed_root);
         }
         SyncMessage::Nack(nack) => {
             bytes.push(MESSAGE_NACK);
-            bytes.extend_from_slice(&nack.shard.to_be_bytes());
+            append_shard_id(&mut bytes, nack.shard_id);
             append_ballot(&mut bytes, &nack.promised);
         }
     }
@@ -167,17 +167,17 @@ pub fn decode_sync_message(bytes: &[u8]) -> Result<SyncMessage, SyncError> {
             outcome: cursor.read_ack_outcome()?,
         }),
         MESSAGE_PREPARE => SyncMessage::Prepare(Prepare {
-            shard: cursor.read_u32()?,
+            shard_id: cursor.read_shard_id()?,
             ballot: cursor.read_ballot()?,
         }),
         MESSAGE_PROMISE => SyncMessage::Promise(Promise {
-            shard: cursor.read_u32()?,
+            shard_id: cursor.read_shard_id()?,
             ballot: cursor.read_ballot()?,
             accepted_epoch: cursor.read_optional_ballot()?,
             committed_root: cursor.read_optional_hash()?,
         }),
         MESSAGE_NACK => SyncMessage::Nack(Nack {
-            shard: cursor.read_u32()?,
+            shard_id: cursor.read_shard_id()?,
             promised: cursor.read_ballot()?,
         }),
         _ => return Err(SyncError::InvalidMessage),

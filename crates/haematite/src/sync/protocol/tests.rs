@@ -440,11 +440,11 @@ fn ballot(counter: u64, node: &str) -> Ballot {
 fn prepare_round_trips() -> Result<(), Box<dyn std::error::Error>> {
     let messages = [
         SyncMessage::Prepare(Prepare {
-            shard: 0,
+            shard_id: 0,
             ballot: Ballot::bottom(),
         }),
         SyncMessage::Prepare(Prepare {
-            shard: u32::MAX,
+            shard_id: usize::MAX,
             ballot: ballot(7, "node-\u{00e9}-multi-byte"),
         }),
     ];
@@ -461,28 +461,28 @@ fn promise_round_trips_with_and_without_options()
     let messages = [
         // both options absent
         SyncMessage::Promise(Promise {
-            shard: 3,
+            shard_id: 3,
             ballot: ballot(2, "node-a"),
             accepted_epoch: None,
             committed_root: None,
         }),
         // accepted_epoch present, committed_root absent
         SyncMessage::Promise(Promise {
-            shard: 3,
+            shard_id: 3,
             ballot: ballot(9, "node-b"),
             accepted_epoch: Some(ballot(4, "prior-owner")),
             committed_root: None,
         }),
         // committed_root present, accepted_epoch absent
         SyncMessage::Promise(Promise {
-            shard: 3,
+            shard_id: 3,
             ballot: ballot(9, "node-b"),
             accepted_epoch: None,
             committed_root: Some(root),
         }),
         // both present
         SyncMessage::Promise(Promise {
-            shard: 1,
+            shard_id: 1,
             ballot: ballot(11, "node-c"),
             accepted_epoch: Some(ballot(10, "prior-\u{1f600}")),
             committed_root: Some(root),
@@ -498,11 +498,11 @@ fn promise_round_trips_with_and_without_options()
 fn nack_round_trips() -> Result<(), Box<dyn std::error::Error>> {
     let messages = [
         SyncMessage::Nack(Nack {
-            shard: 0,
+            shard_id: 0,
             promised: Ballot::bottom(),
         }),
         SyncMessage::Nack(Nack {
-            shard: 42,
+            shard_id: 42,
             promised: ballot(99, "higher-ballot-owner"),
         }),
     ];
@@ -519,15 +519,15 @@ fn ballot_round_trips_for_multibyte_and_empty_node()
     // a Prepare round-trip (the ballot is exercised inside the message codec).
     let messages = [
         SyncMessage::Prepare(Prepare {
-            shard: 5,
+            shard_id: 5,
             ballot: ballot(u64::MAX, "\u{00e9}\u{1f600}\u{4e2d}\u{6587}"),
         }),
         SyncMessage::Prepare(Prepare {
-            shard: 5,
+            shard_id: 5,
             ballot: Ballot::bottom(),
         }),
         SyncMessage::Prepare(Prepare {
-            shard: 5,
+            shard_id: 5,
             ballot: ballot(1, ""),
         }),
     ];
@@ -545,19 +545,19 @@ fn truncated_election_messages_decode_to_clean_error()
         // Prepare: cuts land inside shard, inside ballot counter, inside the
         // node-length prefix, and inside the node bytes.
         SyncMessage::Prepare(Prepare {
-            shard: 7,
+            shard_id: 7,
             ballot: ballot(0x0102_0304_0506_0708, "node-name"),
         }),
         // Promise with both options present: extra cut points across the
         // option presence tags, the inner ballot, and the hash.
         SyncMessage::Promise(Promise {
-            shard: 7,
+            shard_id: 7,
             ballot: ballot(5, "owner"),
             accepted_epoch: Some(ballot(4, "prior")),
             committed_root: Some(root),
         }),
         SyncMessage::Nack(Nack {
-            shard: 7,
+            shard_id: 7,
             promised: ballot(3, "promised-node"),
         }),
     ];
@@ -591,7 +591,7 @@ fn election_ballot_node_length_overflow_is_rejected()
     // 8-byte node-length prefix (which follows the version+tag+shard+counter)
     // with a huge value.
     let message = SyncMessage::Prepare(Prepare {
-        shard: 1,
+        shard_id: 1,
         ballot: ballot(1, "n"),
     });
     let mut payload = encode_sync_message(&message)?;
@@ -611,7 +611,7 @@ fn election_optional_ballot_bad_presence_tag_is_rejected()
     // The accepted_epoch presence tag must be 0 or 1; anything else is a clean
     // error rather than a misread.
     let message = SyncMessage::Promise(Promise {
-        shard: 1,
+        shard_id: 1,
         ballot: ballot(1, "n"),
         accepted_epoch: None,
         committed_root: None,
@@ -634,17 +634,17 @@ fn election_messages_round_trip_through_beamr_frame()
     let root = sample_hash(b"c", b"r")?;
     let messages = [
         SyncMessage::Prepare(Prepare {
-            shard: 2,
+            shard_id: 2,
             ballot: ballot(8, "node-a"),
         }),
         SyncMessage::Promise(Promise {
-            shard: 2,
+            shard_id: 2,
             ballot: ballot(8, "node-a"),
             accepted_epoch: Some(ballot(7, "node-b")),
             committed_root: Some(root),
         }),
         SyncMessage::Nack(Nack {
-            shard: 2,
+            shard_id: 2,
             promised: ballot(9, "node-c"),
         }),
     ];

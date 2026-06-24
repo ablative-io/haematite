@@ -315,7 +315,7 @@ pub struct WriteAck {
 /// `promised[shard]`, otherwise replies [`Nack`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Prepare {
-    pub shard: u32,
+    pub shard_id: ShardId,
     pub ballot: Ballot,
 }
 
@@ -326,7 +326,7 @@ pub struct Prepare {
 /// neither.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Promise {
-    pub shard: u32,
+    pub shard_id: ShardId,
     pub ballot: Ballot,
     /// The highest epoch the promiser previously accepted, if any.
     pub accepted_epoch: Option<Ballot>,
@@ -339,7 +339,7 @@ pub struct Promise {
 /// the candidate can retry above it or back off.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Nack {
-    pub shard: u32,
+    pub shard_id: ShardId,
     pub promised: Ballot,
 }
 
