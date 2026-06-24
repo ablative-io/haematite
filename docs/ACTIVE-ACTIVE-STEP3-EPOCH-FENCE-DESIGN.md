@@ -211,39 +211,81 @@ success. Because there is now a single owner per shard, the concurrent-proposer 
 made the phantom-local-ack dangerous in 2a **cannot arise** — the regime collapses to the
 single-writer case 2a already proves.
 
-### 2.4 Handoff state-sync — DO NOT replay only local disk
+### 2.4 Handoff reconciliation — REVISED (causal commit stamp + union merge)
 
-A freshly-elected owner must NOT serve reads/writes from its *local* shard state: its local copy may
-be stale (it might have been in the minority for prior writes). It must reconcile to the latest
-**committed** state first.
+> ⚠️ **CORRECTION (supersedes the original "adopt the most-advanced committed_root").** The original
+> §2.4 assumed the promise-majority committed states are **totally ordered**, so a new owner could
+> just adopt the single most-advanced `committed_root`. **That assumption is false**, and a
+> single-root adoption can silently drop a *committed, client-acked* write. The corrected design
+> below merges the promise-majority states using a causal commit stamp. (Found in 3-4 verification;
+> the original is preserved only as the cautionary header.)
 
-The Promise replies (§2.2 step 3) carry each promiser's `last_committed_root[s]`. Because the
-Promise set is a majority, it **intersects every prior committed-write majority** (§4), so the
-maximal committed state is present in at least one Promise reply. The new owner:
+**Why a single root is insufficient — forks arise even under single ownership.** Committed state
+across the promise majority can be **incomparable**, not totally ordered, because *per-key follower
+lag forks it under one owner*. Shard `s`, keys `k2,k3`, cluster `{A,B,C}`, quorum 2:
 
-1. Identifies the most-advanced `committed_root` among its majority of Promises.
-2. Pulls any missing tree nodes / values for `s` from that promiser (reuse the existing pull/sync
-   path; `WalRecovery` + `DiskStore` read, `shard/actor/native.rs:91-96`, `store/disk.rs`) until its
-   local committed state ≥ that root.
-3. Only THEN begins serving. Until step 3 completes the owner is "elected but not live."
+1. Owner `A` commits `k2=v2` to majority `{A,C}` (B lagged) — client-acked (§2.0).
+2. `A` commits `k3=v3` to majority `{A,B}` (C lagged) — client-acked. (Different keys ⟹ no CAS chain
+   ties them to the same followers; the two writes legitimately reach different quorums.)
+3. Now `B` holds `{k3}`, `C` holds `{k2}` — each holds a committed write the other lacks. `A` is
+   removed; the only promise majority is `{B,C}`. **No single committed_root contains both**, so
+   adopting either promiser's root drops a committed write. The new owner must take the **union**.
 
-This converts explorer-flagged risk "replay from local WAL" into "**replay from the promise-quorum**"
-— the correctness-load-bearing distinction.
+**Why there is nonetheless NO genuine same-key conflict to "resolve".** For a *single key*, the
+epoch fence (§2.3) guarantees the committed values across the cluster form a **chain**
+`v1 → v2 → v3 …` along the CAS precondition, never an incomparable fork. A fork would require two
+*concurrent committed writers* to that key from the same base — exactly what single-owner + the fence
+prevent (the lower-epoch owner is fenced; at most one of the racing writes ever commits/acks). So the
+only thing handoff lacks is the **ability to order two values of one key** — content-addressed value
+bytes do not encode their CAS predecessor, so `v1` and `v2` are indistinguishable by content alone.
 
-**Why this recovers every committed write (R5).** By §2.0 a committed write is durable on a full
-quorum. The Promise set is a majority; two majorities of a fixed membership intersect; so at least
-one promiser holds every committed write, and "most-advanced committed_root among the Promise
-majority" dominates every committed write. The argument quantifies over **committed** writes only.
+**The primitive: a causal commit stamp.** Every committed write carries
+`stamp = (epoch: Ballot, seq: u64)`:
+- `epoch` — the owner's ballot under which the write was made (already threaded on the write path by
+  §2.3 / increment 3-3). Globally unique and monotonic across owners.
+- `seq` — the owner's **monotonic per-shard write counter**, durably persisted (same fsync discipline
+  as `persisted_max_minted`, §3) and advanced once per committed write. Orders writes *within* one
+  epoch (needed: two sequential same-key writes by one owner share an epoch and must still be
+  ordered).
 
-**In-doubt tails (R5).** A node in the Promise majority may also hold an *in-doubt* write (one that
-reached phantom-quorum on a now-dead proposer, present on a minority, never client-acked). The new
-owner must converge the cluster rather than leave a permanent divergence:
-- It adopts the **max committed_root** (committed data is never dropped, per above).
-- For divergent *in-doubt* entries beyond that root, it MUST pick one outcome and drive it to the
-  whole quorum via its own epoch-stamped writes (adopt-and-republish, or truncate-and-overwrite) so
-  every node converges. Since no client was told these succeeded, either choice is correct; the only
-  requirement is **convergence**, enforced by the new owner re-writing under its epoch (which the
-  CAS+fence then makes uniform). This anti-entropy step is part of increment 3-4, not an afterthought.
+`(epoch, seq)` is therefore **globally unique and totally ordered**, and — because the fence forces
+same-key commits into a CAS chain — the higher stamp on a key is always the chain *descendant*. The
+stamp is the minimal thing a replicated log would have given us (a total order on writes) **without**
+rebuilding haematite's state/CAS replication as a log.
+
+**Handoff = union + per-key max-stamp merge.** The new owner, after winning (§2.2) and before
+serving:
+
+1. Fetches the committed state of each promiser in its majority (reuse the existing pull/transfer
+   primitive — `find_missing_nodes` + the content-addressed apply path; this plumbing is sound, only
+   the *adoption* logic changes).
+2. **Merges** them on the existing prolly-tree merge engine (`branch::merge`), with a **stamp-aware
+   resolver**: different keys **union**; the same key resolves to the entry with the **max
+   `(epoch, seq)`** (the chain tip). Adopts the merged root as its committed baseline, fsync'd.
+3. Recovers its own `seq` floor as `max(seq)` over the merged state, so its first writes continue the
+   counter monotonically. Only THEN begins serving ("elected but not live" until merge completes).
+
+**Why this loses no committed write (R5).** Each committed write is durable on a quorum; the promise
+majority intersects every such quorum; so for every committed key the chain-tip value is present on
+at least one promiser. Per-key max-stamp selects exactly that tip, and cross-key union keeps every
+key — so the merged state dominates **every** committed write across the majority, forks included.
+The argument quantifies over **committed** writes (§2.0); it never depends on roots being totally
+ordered.
+
+**In-doubt tails.** In-doubt writes (un-acked, §2.0) live in the WAL buffer *beyond* the committed
+root, so they are **not** part of any promiser's committed state and never enter the merge. They are
+not separately reconciled here; they converge via the new owner's subsequent epoch-stamped writes
+(the CAS+fence makes the majority uniform) and ordinary anti-entropy. Since no client was told they
+succeeded, this is correct — losing or converging an in-doubt write is always permitted.
+
+**Reused vs. discarded from the first 3-4 attempt.** The pull/transport plumbing (the
+`ShardSyncRequest`/`PushResponse` round, `export_reachable`, the catch-up coordinator) is correct and
+kept. The **single-root `import_synced`/`become_live` adoption is discarded** and replaced by the
+stamp-aware union merge above.
+
+**2b lands cleanly on top.** The "don't clobber run-history events" requirement (2b) becomes a
+*per-keyspace resolver swap*: for the run-history keyspace the merge **unions the values** instead of
+taking max-stamp. Same machinery; the general kv path stays max-stamp-correct regardless.
 
 ### 2.5 Epoch-key exemption (avoid regress)
 
@@ -358,8 +400,12 @@ Same discipline as 2a. NEVER trust a green without my own adversarial read + re-
   of Promises with unique-ballot logic, Nack-driven retry/backoff. Reuse the 2a quorum tally shape.
 - **3-3 — Epoch fence in `apply_durable`**: the `< promised → Fenced` / `≥ → adopt+CAS` rule at
   `shard/actor.rs:331`, plumb `epoch` through `WriteProposal` and `replicate_write`.
-- **3-4 — Handoff state-sync**: most-advanced-committed-root selection from the Promise majority +
-  pull-to-catch-up before serving (§2.4).
+- **3-4 — Handoff reconciliation (REVISED, §2.4):** a **causal commit stamp** `(epoch, seq)` on every
+  committed write (durable `seq`, fsync-discipline of §3), and a **union + per-key max-stamp merge**
+  of the promise-majority committed states on `branch::merge` before serving. Keep the pull/transport
+  plumbing from the first attempt; **discard** single-root adoption. *Gate: a FORKED-committed-state
+  failover test — owner commits k2 to {A,C} and k3 to {A,B}, then a new owner over {B,C} must serve
+  BOTH (single-root adoption fails this).*
 - **3-5 — End-to-end concurrent-proposer proof.** The adversarial counterpart to 2a-5: spin a
   cluster, drive **two nodes to acquire the same shard concurrently**, assert **exactly one** wins,
   the loser is `Fenced` (explicitly, not `QuorumTimeout`), and a deposed owner that keeps writing is
@@ -377,9 +423,13 @@ Same discipline as 2a. NEVER trust a green without my own adversarial read + re-
    touch only a minority before the true owner's majority fences it — verify rigorously.)
 3. **Crash windows:** between Promise-fsync and reply; between election win and `owner_epoch` fsync;
    between data CAS-commit and ack. Does any crash double-own or lose a committed write?
-4. **State-sync correctness:** can a new owner serve *before* catching up to the max committed root
-   and thereby roll back a committed write? Is "max committed_root among a Promise majority" truly
-   ≥ every previously-committed write?
+4. **Handoff merge correctness (REVISED §2.4 — attack this hardest):** (a) Can the **union + per-key
+   max-stamp merge** ever drop a committed write, given forked per-key committed states? (b) Is the
+   claim "same-key committed values are always a CAS chain, never an incomparable fork" actually
+   airtight under the fence — find a committed same-key fork if one exists. (c) Can two committed
+   writes share a `(epoch, seq)` stamp (a tie would make max-stamp ambiguous)? (d) Does `seq`
+   survive owner change + crash monotonically (recovered as `max(seq)` over merged state)? (e) Can a
+   new owner serve before the merge completes and roll back a committed write?
 5. **Epoch-key regress / metadata-vs-data boundary:** any path where ownership state is mutated by a
    fenced data write, or a data write escapes the fence?
 6. **Ballot monotonicity under restart:** can a restarted node reuse or regress a `counter` and mint
