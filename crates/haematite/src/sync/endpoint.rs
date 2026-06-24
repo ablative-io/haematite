@@ -151,6 +151,7 @@ impl DistributionEndpoint {
         local_creation: u32,
         cookie: Option<&str>,
     ) -> Result<Self, SyncError> {
+        ensure_outside_runtime()?;
         let local_name = local_name.into();
         let runtime = Arc::new(
             Builder::new_multi_thread()
@@ -228,6 +229,7 @@ impl DistributionEndpoint {
     /// On success the connection table is keyed by the name the peer advertises in
     /// the handshake; address that peer through [`DistributionEndpoint::peer_atom`].
     pub fn connect(&self, peer_name: &str) -> Result<(), SyncError> {
+        ensure_outside_runtime()?;
         let manager = self.manager.clone();
         let peer_name = peer_name.to_owned();
         self.runtime()?
@@ -258,13 +260,15 @@ impl DistributionEndpoint {
     ///
     /// # Threading contract
     ///
-    /// This call blocks the calling thread until the frame is written. It MUST
-    /// NOT be invoked from within the endpoint runtime's own worker threads —
-    /// `Handle::block_on` panics if called from inside a runtime. Production
-    /// callers run on haematite's synchronous shard/database threads, which
-    /// satisfies this contract; async callers must instead drive the send through
-    /// [`DistributionEndpoint::runtime_handle`].
+    /// This call blocks the calling thread until the frame is written, so it must
+    /// run on a synchronous (non-async) thread. If invoked from within ANY tokio
+    /// runtime context it returns [`SyncError::TransportBlockingFromAsync`] rather
+    /// than panicking. Production callers run on haematite's synchronous
+    /// shard/database threads, which satisfies this; async callers must instead
+    /// drive the send through [`DistributionEndpoint::runtime_handle`].
+    /// (`connect` and `bind` carry the same guard.)
     pub fn send(&self, remote: Atom, message: &SyncMessage) -> Result<(), SyncError> {
+        ensure_outside_runtime()?;
         let handle = self.runtime()?.handle().clone();
         send_sync_message_via_beamr(&self.manager, remote, message, |connection, frame| {
             handle.block_on(async move {
@@ -280,6 +284,12 @@ impl DistributionEndpoint {
     ///
     /// Convenience wrapper over [`DistributionEndpoint::send`] that interns the
     /// peer name in this endpoint's atom table.
+    ///
+    /// `peer_name` must be the name the peer **advertises in its handshake** (its
+    /// own `local_name`), because the connection table is keyed by the advertised
+    /// name, not the dial/resolver key. If a peer is dialed under one name but
+    /// advertises another, this fails closed with
+    /// [`SyncError::TransportConnectionUnavailable`] (never mis-delivers).
     pub fn send_to(&self, peer_name: &str, message: &SyncMessage) -> Result<(), SyncError> {
         self.send(self.atom_table.intern(peer_name), message)
     }
@@ -315,6 +325,17 @@ impl DistributionEndpoint {
             .as_ref()
             .ok_or(SyncError::TransportRuntimeUnavailable)
     }
+}
+
+/// Guard the `block_on` bridges (`bind`/`connect`/`send`) against being called
+/// from inside a tokio runtime, where `block_on` panics ("Cannot start a runtime
+/// from within a runtime"). Fails safe with a `SyncError` instead of panicking so
+/// an async-context caller gets a recoverable error, not a crash.
+fn ensure_outside_runtime() -> Result<(), SyncError> {
+    if Handle::try_current().is_ok() {
+        return Err(SyncError::TransportBlockingFromAsync);
+    }
+    Ok(())
 }
 
 impl Drop for DistributionEndpoint {

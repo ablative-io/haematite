@@ -15,7 +15,7 @@
 
 use std::time::{Duration, Instant};
 
-use haematite::sync::{DistributionEndpoint, RootExchangeRequest, SyncMessage};
+use haematite::sync::{DistributionEndpoint, RootExchangeRequest, SyncError, SyncMessage};
 use haematite::tree::Hash;
 use haematite::{Database, DatabaseConfig};
 
@@ -109,5 +109,20 @@ fn sync_message_round_trips_between_two_live_databases() {
             assert_eq!(got, sent, "RootExchangeRequest round-trips through the Database API");
         }
         other => panic!("expected RootRequest, got {other:?}"),
+    }
+}
+
+/// The `block_on` bridges (`bind`/`connect`/`send`) must FAIL SAFE — return a
+/// `SyncError`, not panic — when invoked from within a tokio runtime context.
+/// This is the must-fix from the 2a-0 endpoint review: a `#[tokio::main]`
+/// consumer calling into the endpoint from an async task previously got a
+/// guaranteed `block_on` panic. `bind` exercises the shared `ensure_outside_runtime`
+/// guard that all three entry points share.
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+async fn distribution_calls_from_async_context_error_not_panic() {
+    let loopback = "127.0.0.1:0".parse().expect("loopback addr parses");
+    match DistributionEndpoint::bind(NODE_A_NAME, loopback, 1, None) {
+        Err(SyncError::TransportBlockingFromAsync) => {}
+        other => panic!("expected TransportBlockingFromAsync from async context, got {other:?}"),
     }
 }
