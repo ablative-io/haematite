@@ -463,6 +463,7 @@ fn promise_round_trips_with_and_without_options()
         SyncMessage::Promise(Promise {
             shard_id: 3,
             ballot: ballot(2, "node-a"),
+            promiser: SyncNodeId::from("voter-a"),
             accepted_epoch: None,
             committed_root: None,
         }),
@@ -470,6 +471,7 @@ fn promise_round_trips_with_and_without_options()
         SyncMessage::Promise(Promise {
             shard_id: 3,
             ballot: ballot(9, "node-b"),
+            promiser: SyncNodeId::from("voter-\u{1f600}"),
             accepted_epoch: Some(ballot(4, "prior-owner")),
             committed_root: None,
         }),
@@ -477,6 +479,7 @@ fn promise_round_trips_with_and_without_options()
         SyncMessage::Promise(Promise {
             shard_id: 3,
             ballot: ballot(9, "node-b"),
+            promiser: SyncNodeId::from("voter-c"),
             accepted_epoch: None,
             committed_root: Some(root),
         }),
@@ -484,6 +487,7 @@ fn promise_round_trips_with_and_without_options()
         SyncMessage::Promise(Promise {
             shard_id: 1,
             ballot: ballot(11, "node-c"),
+            promiser: SyncNodeId::from(""),
             accepted_epoch: Some(ballot(10, "prior-\u{1f600}")),
             committed_root: Some(root),
         }),
@@ -553,6 +557,7 @@ fn truncated_election_messages_decode_to_clean_error()
         SyncMessage::Promise(Promise {
             shard_id: 7,
             ballot: ballot(5, "owner"),
+            promiser: SyncNodeId::from("voter"),
             accepted_epoch: Some(ballot(4, "prior")),
             committed_root: Some(root),
         }),
@@ -613,13 +618,15 @@ fn election_optional_ballot_bad_presence_tag_is_rejected()
     let message = SyncMessage::Promise(Promise {
         shard_id: 1,
         ballot: ballot(1, "n"),
+        promiser: SyncNodeId::from(""),
         accepted_epoch: None,
         committed_root: None,
     });
     let mut payload = encode_sync_message(&message)?;
     // layout: version(1) tag(1) shard(4) counter(8) node_len(8) "n"(1)
+    //         promiser_len(8) promiser(0)
     //         accepted_epoch_tag(1) committed_root_tag(1)
-    let accepted_tag = 1 + 1 + 4 + 8 + 8 + 1;
+    let accepted_tag = 1 + 1 + 4 + 8 + 8 + 1 + 8;
     payload[accepted_tag] = 2;
     assert!(matches!(
         decode_sync_message(&payload),
@@ -640,6 +647,7 @@ fn election_messages_round_trip_through_beamr_frame()
         SyncMessage::Promise(Promise {
             shard_id: 2,
             ballot: ballot(8, "node-a"),
+            promiser: SyncNodeId::from("node-b"),
             accepted_epoch: Some(ballot(7, "node-b")),
             committed_root: Some(root),
         }),

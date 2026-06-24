@@ -108,6 +108,7 @@ pub fn encode_sync_message(message: &SyncMessage) -> Result<Vec<u8>, SyncError> 
             bytes.push(MESSAGE_PROMISE);
             append_shard_id(&mut bytes, promise.shard_id);
             append_ballot(&mut bytes, &promise.ballot);
+            append_len_prefixed_bytes(&mut bytes, promise.promiser.as_str().as_bytes());
             append_optional_ballot(&mut bytes, promise.accepted_epoch.as_ref());
             append_optional_hash(&mut bytes, promise.committed_root);
         }
@@ -173,6 +174,7 @@ pub fn decode_sync_message(bytes: &[u8]) -> Result<SyncMessage, SyncError> {
         MESSAGE_PROMISE => SyncMessage::Promise(Promise {
             shard_id: cursor.read_shard_id()?,
             ballot: cursor.read_ballot()?,
+            promiser: cursor.read_sync_node_id()?,
             accepted_epoch: cursor.read_optional_ballot()?,
             committed_root: cursor.read_optional_hash()?,
         }),

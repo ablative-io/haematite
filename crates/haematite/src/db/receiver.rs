@@ -19,11 +19,15 @@
 use std::time::Duration;
 
 use crate::api::kv::{KvKey, KvValue};
+use crate::branch::ShardId;
+use crate::db::helpers::map_shard_error;
 use crate::db::{Database, DatabaseError};
-use crate::shard::actor::ShardError;
+use crate::shard::actor::{PromiseState, RecordPromiseOutcome, ShardError};
+use crate::sync::ballot::Ballot;
+use crate::sync::endpoint::{ElectionError, ElectionOutcome};
 use crate::sync::membership::WriteMembership;
 use crate::sync::{QuorumOutcome, SyncNodeId};
-use crate::sync::protocol::{AckOutcome, RejectReason, WriteAck, WriteProposal};
+use crate::sync::protocol::{AckOutcome, Nack, Prepare, Promise, RejectReason, WriteAck, WriteProposal};
 use crate::tree::Hash;
 
 impl Database {
@@ -205,6 +209,235 @@ impl Database {
             },
         )
     }
+
+    // =====================================================================
+    // AA-3-2: AcquireShard election — acceptor + candidate (Phase 1).
+    // =====================================================================
+
+    /// Acceptor side of Phase-1 (§2.2 step 3): respond to an inbound `Prepare`.
+    ///
+    /// Routes to the owning shard by `prepare.shard_id` and durably records the
+    /// promise through the shard handle (`record_promise` fsyncs BEFORE it returns,
+    /// §3 value 1). The outcome decides the reply:
+    ///
+    /// * [`RecordPromiseOutcome::Promised`] (the ballot strictly exceeded the
+    ///   persisted `promised`) → send back `Promise{shard_id, ballot,
+    ///   accepted_epoch, committed_root}`, where `accepted_epoch` is THIS shard's
+    ///   current `owner_epoch` and `committed_root` is its current committed root.
+    ///   Both are read in the SAME in-slice snapshot as the (just-advanced) state so
+    ///   the new owner can state-sync in 3-4. They are populated correctly, never
+    ///   fabricated: a fresh shard reports `None`/`None`.
+    /// * [`RecordPromiseOutcome::Rejected { promised }`] → send back
+    ///   `Nack{shard_id, promised}` so the candidate learns the higher ballot.
+    ///
+    /// # Errors
+    /// Returns a [`DatabaseError`] only if routing/recording/sending failed (no
+    /// endpoint, dead shard, transport fault). A Nack is NOT an error — it is the
+    /// correct, expected reply to a losing Prepare.
+    pub fn handle_inbound_prepare(&self, prepare: &Prepare) -> Result<(), DatabaseError> {
+        let handle = self.handle_for_shard(prepare.shard_id)?;
+        let outcome = handle
+            .record_promise(prepare.ballot.clone(), self.timeout())
+            .map_err(map_shard_error)?;
+        let origin = prepare.ballot.node.as_str().to_owned();
+        let message = match outcome {
+            RecordPromiseOutcome::Promised => {
+                // Read the post-promise snapshot in one in-slice command so the
+                // accepted_epoch/committed_root we return are consistent with the
+                // ballot we just promised. These two fields are for 3-4 handoff
+                // state-sync; populated from real shard state, not stubbed.
+                let state = handle
+                    .read_promise_state(self.timeout())
+                    .map_err(map_shard_error)?;
+                let (promiser, _) = self.acker_identity();
+                crate::sync::SyncMessage::Promise(Promise {
+                    shard_id: prepare.shard_id,
+                    ballot: prepare.ballot.clone(),
+                    promiser,
+                    accepted_epoch: state.owner_epoch,
+                    committed_root: state.committed_root,
+                })
+            }
+            RecordPromiseOutcome::Rejected { promised } => {
+                crate::sync::SyncMessage::Nack(Nack {
+                    shard_id: prepare.shard_id,
+                    promised,
+                })
+            }
+        };
+        self.send_sync_message(&origin, &message)
+    }
+
+    /// Candidate side of Phase-1 (§2.2): run `AcquireShard` for `shard_id` and, on
+    /// a majority of promises, become the shard's owner under a fresh epoch.
+    ///
+    /// Steps, in the SAFETY-CRITICAL order (§2.2):
+    ///
+    /// 1. Read this shard's `(promised, owner_epoch, persisted_max_minted)` in one
+    ///    in-slice snapshot, compute the mint floor
+    ///    `max(promised.counter, owner_epoch.counter, persisted_max_minted) + 1`,
+    ///    and `reserve_minted(floor)` — which FSYNCs `persisted_max_minted` BEFORE
+    ///    any Prepare leaves the node (R4). Ballot = `(reserved, local_node_id)`.
+    /// 2. Record the candidate's OWN promise locally via `record_promise(ballot)`.
+    ///    By construction the ballot strictly exceeds everything persisted, so this
+    ///    MUST return `Promised`; it is counted as the first of the quorum.
+    /// 3. Send `Prepare` to every reachable peer and (step 4) collect Promise/Nack
+    ///    to a strict majority (delegated to
+    ///    [`run_prepare_round`](crate::sync::DistributionEndpoint::run_prepare_round)).
+    /// 5. On a majority → `record_owner_epoch(ballot)` (FSYNC before serving, §3
+    ///    value 2) and return [`ElectionOutcome`].
+    /// 6. On a Nack-driven loss / timeout → bounded retry: re-mint strictly above
+    ///    the highest ballot seen with randomized backoff, up to a small cap, then
+    ///    return a clean [`DatabaseError`]. Retry/backoff is LIVENESS ONLY: every
+    ///    attempt re-mints+fsyncs a strictly higher ballot and re-takes its own
+    ///    majority, so the unique-ballot / majority invariants are never relaxed.
+    ///
+    /// The whole call BLOCKS (it parks on the vote receiver), so it must run OUTSIDE
+    /// the distribution runtime — the same `ensure_outside_runtime` guard
+    /// `propose_write` carries, enforced inside `run_prepare_round`.
+    ///
+    /// # Errors
+    /// Returns [`DatabaseError::ElectionLost`] if a higher ballot was promised
+    /// elsewhere on every attempt, [`DatabaseError::ElectionTimeout`] if a majority
+    /// never promised in time, or [`DatabaseError::ConsistencyError`] /
+    /// [`DatabaseError::ShardError`] on a transport/local fault.
+    pub fn acquire_shard(
+        &self,
+        shard_id: ShardId,
+        membership: &WriteMembership,
+        timeout: Duration,
+    ) -> Result<ElectionOutcome, DatabaseError> {
+        const MAX_ATTEMPTS: u32 = 5;
+
+        let endpoint = self
+            .distribution()
+            .ok_or_else(|| DatabaseError::Distribution("no distribution endpoint".to_owned()))?;
+        let local_node = SyncNodeId::new(endpoint.local_name().to_owned());
+        let handle = self.handle_for_shard(shard_id)?;
+
+        // The floor a re-mint must strictly exceed, carried across retries: starts
+        // unconstrained (0) and is raised to any higher competing ballot a Nack
+        // reveals, so each attempt's ballot dominates everything seen so far.
+        let mut competing_floor: u64 = 0;
+
+        for attempt in 0..MAX_ATTEMPTS {
+            // --- Step 1: mint floor from a fresh in-slice snapshot, then reserve. --
+            let state: PromiseState = handle
+                .read_promise_state(self.timeout())
+                .map_err(map_shard_error)?;
+            let local_floor = mint_floor(&state);
+            let floor = local_floor.max(competing_floor.saturating_add(1));
+            let reserved = handle
+                .reserve_minted(floor, self.timeout())
+                .map_err(map_shard_error)?;
+            let ballot = Ballot::new(reserved, local_node.clone());
+
+            // --- Step 2: record the candidate's OWN promise (must succeed). -------
+            match handle
+                .record_promise(ballot.clone(), self.timeout())
+                .map_err(map_shard_error)?
+            {
+                RecordPromiseOutcome::Promised => {}
+                RecordPromiseOutcome::Rejected { promised } => {
+                    // A ballot we just minted strictly above persisted_max_minted and
+                    // promised cannot be rejected by our own actor unless another
+                    // concurrent local acquire raced ahead. Treat that promised as a
+                    // competing floor and retry above it rather than miscount it.
+                    competing_floor = competing_floor.max(promised.counter);
+                    continue;
+                }
+            }
+
+            // The self-promise carries this node's accepted_epoch/committed_root for
+            // 3-4 handoff (read from the same post-promise snapshot semantics as a
+            // peer's Promise). It is counted as the first quorum vote.
+            let self_promise = Promise {
+                shard_id,
+                ballot: ballot.clone(),
+                promiser: local_node.clone(),
+                accepted_epoch: state.owner_epoch.clone(),
+                committed_root: state.committed_root,
+            };
+
+            // --- Steps 3-4: Prepare round, collect to a majority. -----------------
+            match endpoint.run_prepare_round(shard_id, &ballot, self_promise, membership, timeout) {
+                Ok(promises) => {
+                    // --- Step 5: WON. Persist owner_epoch (fsync) before serving. --
+                    handle
+                        .record_owner_epoch(ballot.clone(), self.timeout())
+                        .map_err(map_shard_error)?;
+                    return Ok(ElectionOutcome { ballot, promises });
+                }
+                // --- Step 6: lost to a higher ballot — re-mint strictly above it. --
+                Err(ElectionError::Lost { highest_seen }) => {
+                    competing_floor = competing_floor.max(highest_seen.counter);
+                    backoff_before_retry(attempt, &local_node, reserved);
+                }
+                // Timed out without a higher ballot: retry too (a transient
+                // reachability blip), still bounded by MAX_ATTEMPTS.
+                Err(ElectionError::Timeout { .. }) => {
+                    backoff_before_retry(attempt, &local_node, reserved);
+                }
+                // A local precondition failed — not a clean election loss; surface it.
+                Err(ElectionError::Transport(message)) => {
+                    return Err(DatabaseError::ConsistencyError(message));
+                }
+            }
+        }
+
+        // Exhausted retries. Classify the loss from whether a higher ballot was seen.
+        if competing_floor > 0 {
+            Err(DatabaseError::ElectionLost {
+                highest_seen: competing_floor,
+            })
+        } else {
+            Err(DatabaseError::ElectionTimeout {
+                attempts: MAX_ATTEMPTS,
+            })
+        }
+    }
+}
+
+/// The §2.2 mint floor: `max(promised.counter, owner_epoch.counter,
+/// persisted_max_minted) + 1`. The `+1` makes the next ballot strictly exceed
+/// every counter the shard has ever promised, owned, or minted.
+fn mint_floor(state: &PromiseState) -> u64 {
+    let owner_counter = state.owner_epoch.as_ref().map_or(0, |ballot| ballot.counter);
+    state
+        .promised
+        .counter
+        .max(owner_counter)
+        .max(state.persisted_max_minted)
+        .saturating_add(1)
+}
+
+/// Randomized backoff between Prepare attempts (§2.2 step 6 / §4 liveness).
+///
+/// This is a LIVENESS mitigation ONLY — it never affects which ballots are legal,
+/// only the spacing of retries so duelling proposers desynchronise. With no `rand`
+/// dependency, jitter is derived from a cheap mix of the wall clock, the local
+/// node name, and the just-reserved counter, scaled into a small bounded window
+/// that grows with the attempt number.
+fn backoff_before_retry(attempt: u32, local_node: &SyncNodeId, reserved: u64) {
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0_u128, |elapsed| elapsed.as_nanos());
+    // Cheap deterministic-per-input mix; not cryptographic, just decorrelating.
+    let mut seed = nanos as u64 ^ reserved.wrapping_mul(0x9E37_79B9_7F4A_7C15);
+    for byte in local_node.as_str().bytes() {
+        seed = seed.wrapping_mul(31).wrapping_add(u64::from(byte));
+    }
+    // Window grows with the attempt: base 2ms, +up to (attempt+1)*8ms of jitter.
+    let base_ms = 2_u64;
+    let jitter_ceiling_ms = u64::from(attempt.saturating_add(1)).saturating_mul(8);
+    let jitter_ms = if jitter_ceiling_ms == 0 {
+        0
+    } else {
+        seed % jitter_ceiling_ms
+    };
+    std::thread::sleep(Duration::from_millis(base_ms.saturating_add(jitter_ms)));
 }
 
 /// Drain inbound [`WriteProposal`]s from the attached endpoint and apply+ack each,
@@ -230,6 +463,14 @@ pub fn respond_to_inbound_writes(
                 // A send failure here (e.g. the writer already returned) is not
                 // fatal to the responder; keep draining.
                 drop(database.handle_inbound_write(&proposal));
+            }
+            // AA-3-2 acceptor: an inbound Prepare is the election counterpart of a
+            // WriteProposal — record the promise and reply Promise/Nack. A send
+            // failure (candidate already returned) is non-fatal; keep draining.
+            // (Promise/Nack themselves never land here — they are REPLIES, routed to
+            // the candidate's election registry, not the generic drain.)
+            Some(Ok(SyncMessage::Prepare(prepare))) => {
+                drop(database.handle_inbound_prepare(&prepare));
             }
             // Other inbound messages are not this responder's concern.
             Some(_) => {}

@@ -59,6 +59,25 @@ pub enum RecordPromiseOutcome {
     Rejected { promised: Ballot },
 }
 
+/// An in-slice snapshot of a shard's election-relevant state (AA-3-2).
+///
+/// Read through the actor in ONE slice so the candidate's mint floor and the
+/// acceptor's Promise reply observe a consistent `(promised, owner_epoch,
+/// persisted_max_minted, committed_root)` — never a torn read across two
+/// commands. `promised`/`owner_epoch`/`persisted_max_minted` drive the election
+/// (§2.2); `committed_root` is carried in a Promise for handoff state-sync (§2.4).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PromiseState {
+    /// Highest ballot promised in a Prepare (monotonic, never regresses).
+    pub promised: Ballot,
+    /// The ballot under which this node was elected owner, if any.
+    pub owner_epoch: Option<Ballot>,
+    /// Highest minted-ballot counter ever persisted (R4 mint-floor input).
+    pub persisted_max_minted: u64,
+    /// This shard's last committed root, if any (§2.4 handoff state-sync).
+    pub committed_root: Option<Hash>,
+}
+
 impl ShardActor {
     /// Build a shard write boundary around an already-open durable WAL.
     #[cfg(test)]
@@ -384,6 +403,21 @@ impl ShardActor {
                 self.buffer = previous_buffer;
                 Err(HashCasError::from(error))
             }
+        }
+    }
+
+    /// Snapshot this shard's election-relevant state in ONE in-slice read
+    /// (AA-3-2). Used by the candidate to compute the mint floor and by the
+    /// acceptor to populate a Promise's `accepted_epoch`/`committed_root`. Reading
+    /// all four through the same actor command guarantees they are mutually
+    /// consistent (no torn read across a concurrent Prepare or commit).
+    #[must_use]
+    pub fn promise_state(&self) -> PromiseState {
+        PromiseState {
+            promised: self.promised().clone(),
+            owner_epoch: self.owner_epoch().cloned(),
+            persisted_max_minted: self.persisted_max_minted(),
+            committed_root: self.committed_root(),
         }
     }
 

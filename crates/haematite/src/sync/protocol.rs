@@ -328,6 +328,12 @@ pub struct Prepare {
 pub struct Promise {
     pub shard_id: ShardId,
     pub ballot: Ballot,
+    /// The node that granted this promise. The `ballot` echoes the CANDIDATE's
+    /// ballot (so the candidate can confirm the reply is for its attempt), so it
+    /// cannot identify the promiser; `promiser` carries the granting node's id so
+    /// the candidate can count promises from a strict majority of DISTINCT nodes
+    /// (§2.2 step 4) and dedup duplicate frames. Mirrors [`WriteAck::acker`].
+    pub promiser: SyncNodeId,
     /// The highest epoch the promiser previously accepted, if any.
     pub accepted_epoch: Option<Ballot>,
     /// The promiser's last committed root for `shard`, if any (§2.4).

@@ -170,6 +170,10 @@ impl ShardState {
                 drop(reply.send(result));
                 None
             }
+            ShardCommandKind::ReadPromiseState { reply } => {
+                drop(reply.send(Ok(self.actor.promise_state())));
+                None
+            }
             extra @ (ShardCommandKind::Cas { .. }
             | ShardCommandKind::ApplyDurable { .. }
             | ShardCommandKind::RecordPromise { .. }
