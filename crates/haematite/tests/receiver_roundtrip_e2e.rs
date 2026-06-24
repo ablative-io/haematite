@@ -17,6 +17,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use haematite::db::respond_to_inbound_writes;
+use haematite::sync::ballot::Ballot;
 use haematite::sync::membership::WriteMembership;
 use haematite::sync::{DistributionEndpoint, SyncNodeId};
 use haematite::{Database, DatabaseConfig};
@@ -106,6 +107,7 @@ fn real_apply_round_trip_commits_and_stores_value() -> TestResult {
         None,
         b"value".to_vec(),
         None,
+        Ballot::bottom(),
         &membership,
         Duration::from_secs(5),
     )?;

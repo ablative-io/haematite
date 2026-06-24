@@ -17,6 +17,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use haematite::sync::consistency::ConsistencyError;
+use haematite::sync::ballot::Ballot;
 use haematite::sync::membership::WriteMembership;
 use haematite::sync::{
     AckOutcome, DistributionEndpoint, SyncMessage, SyncNodeId, WriteAck, WriteProposal,
@@ -132,6 +133,7 @@ fn reaches_quorum_via_real_two_endpoint_ack() -> TestResult {
         None,
         b"v".to_vec(),
         None,
+        Ballot::bottom(),
         &membership,
         Duration::from_secs(5),
     )?;
@@ -187,6 +189,7 @@ fn duplicate_write_ack_deduped() -> TestResult {
         None,
         b"v".to_vec(),
         None,
+        Ballot::bottom(),
         &membership,
         Duration::from_secs(5),
     )?;
@@ -246,6 +249,7 @@ fn late_ack_after_quorum_dropped() -> TestResult {
         None,
         b"v".to_vec(),
         None,
+        Ballot::bottom(),
         &membership,
         Duration::from_secs(5),
     )?;
@@ -277,6 +281,7 @@ fn late_ack_after_quorum_dropped() -> TestResult {
         None,
         b"v2".to_vec(),
         None,
+        Ballot::bottom(),
         &membership,
         Duration::from_secs(5),
     )?;
@@ -330,6 +335,7 @@ fn restart_reuse_ack_rejected_fix_d() -> TestResult {
         None,
         b"v".to_vec(),
         None,
+        Ballot::bottom(),
         &membership,
         Duration::from_millis(800),
     );
@@ -368,6 +374,7 @@ async fn propose_write_from_async_context_errors_not_panics() -> TestResult {
         None,
         b"v".to_vec(),
         None,
+        Ballot::bottom(),
         &membership,
         Duration::from_millis(100),
     );

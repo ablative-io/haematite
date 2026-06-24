@@ -463,12 +463,19 @@ impl DistributionEndpoint {
     /// runtime context it returns [`ConsistencyError::TransportUnavailable`] rather
     /// than parking a beamr worker (which could wedge the single-worker runtime
     /// under load).
+    // AA-3-3 added the `epoch` stamp, taking this transport primitive to 8
+    // parameters. They are each a distinct, orthogonal write attribute (key /
+    // expected / value / ttl / epoch / membership / timeout); bundling them into a
+    // struct would only move the same fields behind one more indirection and
+    // obscure the call sites, so an exception is clearer than the cure here.
+    #[allow(clippy::too_many_arguments)]
     pub fn propose_write(
         &self,
         key: KvKey,
         expected: Option<Hash>,
         value: KvValue,
         ttl: Option<Duration>,
+        epoch: Ballot,
         membership: &WriteMembership,
         timeout: Duration,
     ) -> Result<QuorumOutcome<SyncNodeId>, ConsistencyError> {
@@ -506,6 +513,7 @@ impl DistributionEndpoint {
             expected,
             value,
             ttl,
+            epoch,
         };
 
         // Encode the proposal frame ONCE on this synchronous thread (a `SyncError`
@@ -901,7 +909,13 @@ fn route_write_ack(registry: &WriteRegistry, local_creation: u32, ack: &WriteAck
 
     let vote = match ack.outcome {
         AckOutcome::Applied => CasVote::Accept(ack.acker.clone()),
-        AckOutcome::Rejected(RejectReason::CasMismatch) => CasVote::Reject(ack.acker.clone()),
+        // A CAS mismatch AND an epoch fence are both vote-AGAINSTs: the replica
+        // refused on purpose (it is ahead / it promised a higher ballot), so each
+        // erodes possible-accepts toward ConsistencyError::Fenced. Only a genuine
+        // apply fault is a (retryable) transport-style Fault.
+        AckOutcome::Rejected(RejectReason::CasMismatch | RejectReason::Fenced) => {
+            CasVote::Reject(ack.acker.clone())
+        }
         AckOutcome::Rejected(RejectReason::ApplyError) => CasVote::Fault(ack.acker.clone()),
     };
 

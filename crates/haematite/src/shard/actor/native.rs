@@ -212,11 +212,12 @@ impl ShardState {
                 expected,
                 value,
                 ttl,
+                write_epoch,
                 reply,
             } => {
                 let result = self
                     .actor
-                    .apply_durable(&key, expected, value, ttl, &mut self.store)
+                    .apply_durable(&key, expected, value, ttl, write_epoch, &mut self.store)
                     .map_err(ShardError::from);
                 drop(reply.send(result));
             }

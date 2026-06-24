@@ -5,6 +5,7 @@
 
 use std::fmt;
 
+use crate::sync::ballot::Ballot;
 use crate::tree::Hash;
 use crate::wal::WalError;
 
@@ -116,6 +117,15 @@ pub(super) enum HashCasError {
         expected: Option<Hash>,
         actual: Option<Hash>,
     },
+    /// The epoch fence rejected the write (AA-3-3, §2.3): the write's `attempted`
+    /// epoch was strictly below this shard's actor-local `promised` ballot, so a
+    /// stale/deposed owner's write was refused and NOTHING was applied. Like
+    /// [`Self::HashMismatch`] this is a vote-against at the quorum tally, never an
+    /// apply fault.
+    Fenced {
+        promised: Ballot,
+        attempted: Ballot,
+    },
     Wal(WalError),
 }
 
@@ -126,6 +136,13 @@ impl fmt::Display for HashCasError {
                 formatter,
                 "hash cas mismatch: expected {expected:?}, actual {actual:?}"
             ),
+            Self::Fenced {
+                promised,
+                attempted,
+            } => write!(
+                formatter,
+                "epoch fence: attempted {attempted:?} < promised {promised:?}"
+            ),
             Self::Wal(error) => write!(formatter, "apply WAL error: {error}"),
         }
     }
@@ -135,7 +152,7 @@ impl std::error::Error for HashCasError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::Wal(error) => Some(error),
-            Self::HashMismatch { .. } => None,
+            Self::HashMismatch { .. } | Self::Fenced { .. } => None,
         }
     }
 }
@@ -152,6 +169,13 @@ impl From<HashCasError> for ShardError {
             HashCasError::HashMismatch { expected, actual } => {
                 Self::CasHashMismatch { expected, actual }
             }
+            HashCasError::Fenced {
+                promised,
+                attempted,
+            } => Self::Fenced {
+                promised,
+                attempted,
+            },
             HashCasError::Wal(error) => Self::from(error),
         }
     }

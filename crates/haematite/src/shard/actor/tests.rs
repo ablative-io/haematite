@@ -17,7 +17,10 @@ use beamr::process::ExitReason;
 use beamr::scheduler::{Scheduler, SchedulerConfig};
 
 use super::handle::{RangeItem, ShardError, ShardHandle};
+use super::RecordPromiseOutcome;
 use crate::store::DiskStore;
+use crate::sync::ballot::Ballot;
+use crate::sync::SyncNodeId;
 use crate::tree::{Hash, LeafNode, Node};
 use crate::wal::DurableWal;
 
@@ -323,6 +326,141 @@ fn boot_failure_keeps_scheduler_usable_and_fails_the_command() -> Result<(), Box
     let healthy = TestShard::spawn(&scheduler, "healthy-after-boot-fail")?;
     put(&healthy.handle, b"k", b"v")?;
     assert_eq!(get(&healthy.handle, b"k")?, Some(b"v".to_vec()));
+
+    scheduler.shutdown();
+    Ok(())
+}
+
+// =====================================================================
+// AA-3-3: epoch fence on the data-write path (design §2.3).
+// =====================================================================
+
+/// A test ballot `(counter, node)`.
+fn ballot(counter: u64, node: &str) -> Ballot {
+    Ballot::new(counter, SyncNodeId::new(node))
+}
+
+/// Durably promise `ballot` through the handle, asserting it was accepted (the
+/// monotone path that RAISES `promised`).
+fn promise(handle: &ShardHandle, ballot: Ballot) -> Result<(), Box<dyn Error>> {
+    match handle.record_promise(ballot, TIMEOUT)? {
+        RecordPromiseOutcome::Promised => Ok(()),
+        RecordPromiseOutcome::Rejected { promised } => {
+            Err(format!("expected Promised, got Rejected({promised:?})").into())
+        }
+    }
+}
+
+/// TEST 1 — the fence REJECTS a stale-epoch write, applying NOTHING.
+///
+/// With `promised = (5, X)`, an `apply_durable` stamped at epoch `(3, Y)` must be
+/// `Fenced`: the key stays absent and no commit marker is written.
+#[test]
+fn fence_rejects_stale_epoch_write_applying_nothing() -> Result<(), Box<dyn Error>> {
+    let scheduler = test_scheduler()?;
+    let shard = TestShard::spawn(&scheduler, "fence-stale")?;
+    let handle = &shard.handle;
+
+    // Establish promised = (5, X) via a Prepare-equivalent record_promise.
+    promise(handle, ballot(5, "X"))?;
+
+    // A write stamped BELOW promised must be fenced (expected=None create).
+    let result = handle.apply_durable(
+        b"k".to_vec(),
+        None,
+        b"stale".to_vec(),
+        None,
+        ballot(3, "Y"),
+        TIMEOUT,
+    );
+    assert!(
+        matches!(
+            result,
+            Err(ShardError::Fenced {
+                ref promised,
+                ref attempted,
+            }) if *promised == ballot(5, "X") && *attempted == ballot(3, "Y")
+        ),
+        "stale-epoch write must be Fenced{{promised:(5,X), attempted:(3,Y)}}, got {result:?}"
+    );
+
+    // NOTHING applied: the key is still absent and no committed-root marker exists.
+    assert_eq!(get(handle, b"k")?, None, "fenced write must apply nothing");
+    assert_eq!(
+        DurableWal::read_file(&shard.wal_path)?.committed_root(),
+        None,
+        "a fenced write must not have committed anything"
+    );
+
+    scheduler.shutdown();
+    Ok(())
+}
+
+/// TEST 2 — the R2 regression guard. The fence ADMITS `epoch >= promised` but a
+/// data write NEVER raises `promised`.
+///
+/// With `promised = (5, X)`: apply at `(5, X)` succeeds; `promised` is STILL
+/// `(5, X)`. Then apply at a HIGHER `(7, Z)` also succeeds (>=) and STILL does not
+/// move `promised`. We prove `promised` was never silently raised to 7 by then
+/// `record_promise((6, _))`: it must be ACCEPTED (because the live `promised` is
+/// still 5), which is impossible if either data write had raised it to 7.
+#[test]
+fn fence_admits_ge_without_ever_raising_promised() -> Result<(), Box<dyn Error>> {
+    let scheduler = test_scheduler()?;
+    let shard = TestShard::spawn(&scheduler, "fence-r2")?;
+    let handle = &shard.handle;
+
+    promise(handle, ballot(5, "X"))?;
+
+    // Apply AT promised (5,X): equal is >= so it is admitted and commits.
+    handle.apply_durable(
+        b"k".to_vec(),
+        None,
+        b"at-five".to_vec(),
+        None,
+        ballot(5, "X"),
+        TIMEOUT,
+    )?;
+    assert_eq!(get(handle, b"k")?, Some(b"at-five".to_vec()));
+    // The data write did NOT raise promised.
+    assert_eq!(
+        handle.read_promise_state(TIMEOUT)?.promised,
+        ballot(5, "X"),
+        "an admitted data write must NOT raise promised (R2)"
+    );
+
+    // Apply ABOVE promised at (7,Z): also admitted (>=). expected is now the hash
+    // of the current value "at-five".
+    let current = Hash::of(b"at-five");
+    handle.apply_durable(
+        b"k".to_vec(),
+        Some(current),
+        b"at-seven".to_vec(),
+        None,
+        ballot(7, "Z"),
+        TIMEOUT,
+    )?;
+    assert_eq!(get(handle, b"k")?, Some(b"at-seven".to_vec()));
+    // STILL not raised — a higher-epoch data write also leaves promised alone.
+    assert_eq!(
+        handle.read_promise_state(TIMEOUT)?.promised,
+        ballot(5, "X"),
+        "a higher-epoch data write STILL must not raise promised (R2)"
+    );
+
+    // The airtight proof: promised is genuinely still 5, so a Prepare at (6, W)
+    // STRICTLY exceeds it and is accepted. If either data write had silently
+    // raised promised to 7, this would be Rejected instead.
+    match handle.record_promise(ballot(6, "W"), TIMEOUT)? {
+        RecordPromiseOutcome::Promised => {}
+        RecordPromiseOutcome::Rejected { promised } => {
+            return Err(format!(
+                "record_promise((6,W)) was Rejected({promised:?}) — promised was silently \
+                 raised by a data write, violating R2"
+            )
+            .into());
+        }
+    }
 
     scheduler.shutdown();
     Ok(())

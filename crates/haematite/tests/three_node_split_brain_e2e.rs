@@ -37,6 +37,7 @@ use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use haematite::db::{DatabaseError, respond_to_inbound_writes};
+use haematite::sync::ballot::Ballot;
 use haematite::sync::membership::WriteMembership;
 use haematite::sync::{ConsistencyError, DistributionEndpoint, SyncNodeId};
 use haematite::{Database, DatabaseConfig};
@@ -204,6 +205,7 @@ fn assert_post_heal_c_fenced(node_c: &Node, key: &[u8], value_c: &[u8]) -> TestR
         None,
         value_c.to_vec(),
         None,
+        Ballot::bottom(),
         &membership(3, &[NODE_A, NODE_B]),
         QUORUM_TIMEOUT,
     );
@@ -369,6 +371,7 @@ fn minority_is_fenced_without_reachable_peers() -> TestResult {
         None,
         value,
         None,
+        Ballot::bottom(),
         &membership(3, &[]),
         FENCE_TIMEOUT,
     );
@@ -479,6 +482,7 @@ fn heal_mid_write_exactly_one_side_acquires() -> TestResult {
         None,
         value_c.clone(),
         None,
+        Ballot::bottom(),
         &membership(3, &[]),
         FENCE_TIMEOUT,
     );
