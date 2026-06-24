@@ -18,7 +18,9 @@ use std::time::Duration;
 use crate::db::helpers::{map_shard_error, ordered_hashes, range_on_handle};
 use crate::db::{Database, DatabaseError, run_indexed_parallel};
 use crate::shard::actor::ShardHandle;
-use crate::sync::{Ack, ConsistencyError, ConsistencyMode, wait_for_quorum_from_receiver};
+use crate::sync::{
+    Ack, ConsistencyError, ConsistencyMode, SyncNodeId, wait_for_quorum_from_receiver,
+};
 use crate::tree::Hash;
 
 /// Key bytes used by the general KV API.
@@ -148,7 +150,11 @@ fn wait_for_consistency(consistency: ConsistencyMode) -> Result<(), DatabaseErro
     // sync path feeds remote acknowledgments here, a single-node operation can
     // complete with the local durable WAL ack; multi-node strong writes fail
     // honestly rather than pretending replication happened.
-    let (sender, receiver) = std::sync::mpsc::channel::<Ack<usize>>();
+    //
+    // The ack channel keys on the real node identity `SyncNodeId` (2a-2): the
+    // quorum primitive is generic over the node id and the live producer is wired
+    // in 2a-3, so here the sender is still dropped immediately.
+    let (sender, receiver) = std::sync::mpsc::channel::<Ack<SyncNodeId>>();
     let result = wait_for_quorum_from_receiver(strong, &receiver)
         .map(drop)
         .map_err(|error| map_consistency_error(&error));

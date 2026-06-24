@@ -9,8 +9,9 @@ use crate::tree::{Cursor, Hash, LeafNode, Node, NodeError, batch_mutate};
 use crate::sync::{SyncMergeRoots, merge_synced_roots, pull_from_source};
 
 use super::{
-    Ack, ConsistencyError, ConsistencyMode, EventualConsistency, StrongConsistency,
-    execute_with_consistency, quorum_size, wait_for_quorum, wait_for_quorum_from_receiver,
+    Ack, CasVote, ConsistencyError, ConsistencyMode, EventualConsistency, StrongConsistency,
+    execute_with_consistency, quorum_size, wait_for_cas_quorum, wait_for_quorum,
+    wait_for_quorum_from_receiver,
 };
 
 #[test]
@@ -267,4 +268,206 @@ fn strong_consistency_execution_runs_write_then_waits_for_quorum() -> Result<(),
     assert_eq!(writes.load(Ordering::SeqCst), 1);
     assert!(ConsistencyMode::strong(3, Duration::from_secs(1)).write_requires_ack());
     Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// CAS-aware tally (2a-2). Accept/Reject/Fault votes; the new `Fenced` outcome.
+// Synthetic vote sources, exactly like the accept-only `wait_for_quorum` tests.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn cas_accept_majority_commits() -> Result<(), ConsistencyError> {
+    // 3-node cluster (quorum 2): local ack + one remote accept reaches quorum.
+    let outcome = wait_for_cas_quorum(
+        StrongConsistency::new(3, Duration::from_secs(1)),
+        vec![CasVote::accept("node-b")],
+    )?;
+
+    assert_eq!(outcome.required, 2);
+    assert_eq!(outcome.acknowledged, 2);
+    assert_eq!(outcome.acknowledged_nodes, vec!["node-b"]);
+    assert!(outcome.reached());
+    Ok(())
+}
+
+#[test]
+fn cas_minority_no_votes_times_out() {
+    // 5-node cluster (quorum 3): only the local ack, no remote votes → timeout.
+    let timeout = Duration::from_millis(2);
+    let result = wait_for_cas_quorum::<&str, _>(
+        StrongConsistency::new(5, timeout),
+        std::iter::empty(),
+    );
+
+    assert_eq!(
+        result,
+        Err(ConsistencyError::QuorumTimeout {
+            required: 3,
+            acknowledged: 1,
+            timeout,
+        })
+    );
+}
+
+#[test]
+fn cas_reject_majority_is_fenced_not_failed_or_timeout() {
+    // 5-node cluster (quorum 3): possible = 1 local + 4 remote = 5. Three distinct
+    // rejects drop possible_accepts to 2 < 3 → deterministic Fenced. The remote
+    // capacity is 4, so the static `possible < required` short-circuit does NOT
+    // fire (5 >= 3); the Fenced verdict is from the reject tally alone.
+    let result = wait_for_cas_quorum(
+        StrongConsistency::new(5, Duration::from_secs(1)),
+        vec![
+            CasVote::reject("node-b"),
+            CasVote::reject("node-c"),
+            CasVote::reject("node-d"),
+        ],
+    );
+
+    assert_eq!(
+        result,
+        Err(ConsistencyError::Fenced {
+            required: 3,
+            possible_accepts: 2,
+        })
+    );
+}
+
+#[test]
+fn cas_distinct_rejects_are_deduped_before_fencing() {
+    // Duplicate rejects from one node must not over-count toward fencing. With
+    // total 5 (quorum 3, possible 5) two DISTINCT rejects leave possible_accepts 3
+    // (still == required, NOT fenced); the duplicate third vote changes nothing, so
+    // the tally times out rather than fencing.
+    let timeout = Duration::from_millis(2);
+    let result = wait_for_cas_quorum(
+        StrongConsistency::new(5, timeout),
+        vec![
+            CasVote::reject("node-b"),
+            CasVote::reject("node-b"),
+            CasVote::reject("node-c"),
+        ],
+    );
+
+    assert_eq!(
+        result,
+        Err(ConsistencyError::QuorumTimeout {
+            required: 3,
+            acknowledged: 1,
+            timeout,
+        })
+    );
+}
+
+#[test]
+fn cas_mixed_accepts_and_rejects_fences_as_soon_as_provably_lost() {
+    // 5-node cluster (quorum 3, possible 5). One accept (acknowledged → 2), then
+    // rejects erode the ceiling: after 3 distinct rejects possible_accepts = 2 < 3
+    // → Fenced. Proven lost before the (still un-acked) third accept could arrive.
+    let result = wait_for_cas_quorum(
+        StrongConsistency::new(5, Duration::from_secs(1)),
+        vec![
+            CasVote::accept("node-b"),
+            CasVote::reject("node-c"),
+            CasVote::reject("node-d"),
+            CasVote::reject("node-e"),
+            // never reached: quorum is already provably unreachable.
+            CasVote::accept("node-f"),
+        ],
+    );
+
+    assert_eq!(
+        result,
+        Err(ConsistencyError::Fenced {
+            required: 3,
+            possible_accepts: 2,
+        })
+    );
+}
+
+#[test]
+fn cas_single_fault_does_not_abort_a_reachable_quorum() -> Result<(), ConsistencyError> {
+    // 3-node cluster, quorum 2 (local + 1). One remote faults, but the OTHER
+    // remote accepts → local + accept = 2 → committed. A single fault must NOT
+    // abort a write the rest of the cluster can still carry (the availability fix:
+    // a fault erodes the accept ceiling, it does not poison the whole tally).
+    let outcome = wait_for_cas_quorum(
+        StrongConsistency::new(3, Duration::from_secs(1)),
+        vec![CasVote::fault("node-b"), CasVote::accept("node-c")],
+    )?;
+
+    assert_eq!(outcome.acknowledged, 2);
+    Ok(())
+}
+
+#[test]
+fn cas_loss_to_faults_alone_is_ack_failed_not_fenced() {
+    // 3-node cluster, quorum 2, possible 3. Two DISTINCT faults erode
+    // possible_accepts to 1 < 2 with NO reject in play → AckFailed (a retryable
+    // infrastructure failure), distinct from the Fenced a CAS reject produces.
+    let result = wait_for_cas_quorum::<&str, _>(
+        StrongConsistency::new(3, Duration::from_secs(1)),
+        vec![CasVote::fault("node-b"), CasVote::fault("node-c")],
+    );
+
+    assert_eq!(result, Err(ConsistencyError::AckFailed));
+}
+
+#[test]
+fn cas_loss_with_any_reject_is_fenced_even_alongside_faults() {
+    // 5-node cluster, quorum 3, possible 5. A reject plus faults erode
+    // possible_accepts below 3; because a real CAS reject occurred (a conflicting
+    // owner out-voted us), the verdict is Fenced, not AckFailed.
+    let result = wait_for_cas_quorum::<&str, _>(
+        StrongConsistency::new(5, Duration::from_secs(1)),
+        vec![
+            CasVote::reject("node-b"),
+            CasVote::fault("node-c"),
+            CasVote::fault("node-d"),
+        ],
+    );
+
+    assert!(
+        matches!(result, Err(ConsistencyError::Fenced { required: 3, .. })),
+        "a reject in the loss set fences (conflicting owner), got {result:?}"
+    );
+}
+
+#[test]
+fn cas_static_short_circuit_still_fires_on_remote_only_two_node() {
+    // remote_only on a 2-node cluster: quorum 2, possible = 0 local + 1 remote = 1
+    // < 2 → the static QuorumUnavailable short-circuit fires before any vote, even
+    // for the CAS tally. This is the ONLY availability short-circuit (no liveness
+    // fast-fail).
+    let result = wait_for_cas_quorum::<&str, _>(
+        StrongConsistency::remote_only(2, Duration::from_millis(1)),
+        std::iter::empty(),
+    );
+
+    assert_eq!(
+        result,
+        Err(ConsistencyError::QuorumUnavailable {
+            required: 2,
+            possible: 1,
+        })
+    );
+}
+
+#[test]
+fn cas_accept_dedup_does_not_double_count() {
+    // Duplicate accepts from one node count once. 5-node cluster (quorum 3): local
+    // + node-b counted once = 2 (< 3), then node-c reaches 3 → commit.
+    let outcome = wait_for_cas_quorum(
+        StrongConsistency::new(5, Duration::from_secs(1)),
+        vec![
+            CasVote::accept("node-b"),
+            CasVote::accept("node-b"),
+            CasVote::accept("node-c"),
+        ],
+    );
+
+    assert!(matches!(
+        outcome,
+        Ok(out) if out.acknowledged == 3 && out.acknowledged_nodes == vec!["node-b", "node-c"]
+    ));
 }

@@ -149,6 +149,15 @@ pub enum ConsistencyError {
         timeout: Duration,
     },
     AckFailed,
+    /// A CAS write was deterministically out-voted: enough replicas rejected the
+    /// proposal that a quorum of accepts is no longer reachable, so the writer is
+    /// fenced. This is a clean, deterministic loss — distinct from a transport
+    /// `AckFailed` (a node could not be reached) and from a `QuorumTimeout` (acks
+    /// never arrived in time). It only ever arises from the CAS-aware tally.
+    Fenced {
+        required: usize,
+        possible_accepts: usize,
+    },
 }
 
 impl fmt::Display for ConsistencyError {
@@ -168,6 +177,13 @@ impl fmt::Display for ConsistencyError {
                 "timed out after {timeout:?} waiting for quorum: required {required}, acknowledged {acknowledged}"
             ),
             Self::AckFailed => formatter.write_str("sync acknowledgment failed"),
+            Self::Fenced {
+                required,
+                possible_accepts,
+            } => write!(
+                formatter,
+                "fenced by CAS rejects: required {required} accepts, only {possible_accepts} still possible"
+            ),
         }
     }
 }
@@ -326,6 +342,262 @@ where
                 }
             }
             Ok(Ack::Failed(_node_id)) => return Err(ConsistencyError::AckFailed),
+            Err(
+                std::sync::mpsc::RecvTimeoutError::Timeout
+                | std::sync::mpsc::RecvTimeoutError::Disconnected,
+            ) => {
+                return Err(ConsistencyError::QuorumTimeout {
+                    required,
+                    acknowledged,
+                    timeout: strong.timeout(),
+                });
+            }
+        }
+    }
+}
+
+/// A single vote in a CAS-aware quorum tally.
+///
+/// CAS writes need a third signal beyond the accept/fault distinction of [`Ack`]:
+/// a replica that is ahead of (or conflicts with) the proposal votes *against* it
+/// deterministically. The three votes are semantically distinct and must not be
+/// collapsed:
+///
+/// * [`CasVote::Accept`] — the replica conditionally + durably applied the write.
+/// * [`CasVote::Reject`] — the replica says *no* (e.g. a CAS-precondition
+///   mismatch): a legitimate deterministic vote-against, NOT a transport fault.
+/// * [`CasVote::Fault`] — the replica could not be reached / failed to apply for a
+///   transport reason; this poisons the tally exactly like [`Ack::Failed`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CasVote<NodeId> {
+    Accept(NodeId),
+    Reject(NodeId),
+    Fault(NodeId),
+}
+
+impl<NodeId> CasVote<NodeId> {
+    pub const fn accept(node_id: NodeId) -> Self {
+        Self::Accept(node_id)
+    }
+
+    pub const fn reject(node_id: NodeId) -> Self {
+        Self::Reject(node_id)
+    }
+
+    pub const fn fault(node_id: NodeId) -> Self {
+        Self::Fault(node_id)
+    }
+}
+
+/// Classify a CAS write that can no longer reach a quorum of accepts. A prior
+/// CAS reject means a conflicting owner deterministically out-voted us
+/// ([`ConsistencyError::Fenced`]); a loss to faults alone is an infrastructure
+/// failure ([`ConsistencyError::AckFailed`], retryable) — not a fence.
+const fn decline_outcome(
+    had_reject: bool,
+    required: usize,
+    possible_accepts: usize,
+) -> ConsistencyError {
+    if had_reject {
+        ConsistencyError::Fenced {
+            required,
+            possible_accepts,
+        }
+    } else {
+        ConsistencyError::AckFailed
+    }
+}
+
+/// CAS-aware quorum tally over a stream of [`CasVote`]s.
+///
+/// This is a SEPARATE primitive from [`wait_for_quorum`]: non-CAS callers keep
+/// using the accept/fault-only tally unchanged. The semantics, exactly:
+///
+/// * `required = quorum_size(total_nodes)`; `possible = local_ack + (total-1)`.
+/// * The existing static `possible < required` short-circuit is the ONLY
+///   availability short-circuit (no liveness/reachability fast-fail): a transient
+///   blip must never abort a write the majority should win.
+/// * Distinct **accepts** (deduped by node id, plus the local ack) count toward
+///   `acknowledged`; reaching `required` yields a committed [`QuorumOutcome`].
+/// * Both **rejects** and **faults** (deduped together by node id — a node that
+///   will not accept, whether by CAS-reject or by failure) shrink the reachable
+///   accept ceiling `possible_accepts = possible - declined`. A single fault does
+///   NOT abort a write the rest of the cluster can still carry; the tally only
+///   gives up when `possible_accepts < required`.
+/// * When `possible_accepts < required`, the verdict depends on WHY: if any CAS
+///   **reject** occurred, a conflicting owner deterministically out-voted us →
+///   [`ConsistencyError::Fenced`]; if the loss is to **faults alone**, it is an
+///   infrastructure failure → [`ConsistencyError::AckFailed`] (retryable), not a
+///   fence.
+/// * If neither a quorum of accepts nor a fenced verdict is reached before the
+///   deadline, return [`ConsistencyError::QuorumTimeout`].
+pub fn wait_for_cas_quorum<NodeId, Votes>(
+    strong: StrongConsistency,
+    votes: Votes,
+) -> Result<QuorumOutcome<NodeId>, ConsistencyError>
+where
+    NodeId: Clone + Eq + StdHash,
+    Votes: IntoIterator<Item = CasVote<NodeId>>,
+{
+    let required = strong.quorum()?;
+    let local_ack_count = usize::from(strong.counts_local_ack());
+    let remote_capacity = strong.total_nodes().saturating_sub(1);
+    let possible = local_ack_count.saturating_add(remote_capacity);
+    if possible < required {
+        return Err(ConsistencyError::QuorumUnavailable { required, possible });
+    }
+
+    let deadline = Instant::now() + strong.timeout();
+    let mut acknowledged_nodes = Vec::new();
+    let mut accepted = HashSet::new();
+    // Nodes that will not contribute an accept — CAS rejects AND faults unioned,
+    // so a node that both rejects and faults erodes the accept ceiling once.
+    let mut declined = HashSet::new();
+    let mut had_reject = false;
+    let mut acknowledged = local_ack_count;
+
+    if acknowledged >= required {
+        return Ok(QuorumOutcome {
+            required,
+            acknowledged,
+            acknowledged_nodes,
+        });
+    }
+
+    for vote in votes {
+        if Instant::now() > deadline {
+            return Err(ConsistencyError::QuorumTimeout {
+                required,
+                acknowledged,
+                timeout: strong.timeout(),
+            });
+        }
+
+        match vote {
+            CasVote::Accept(node_id) => {
+                if accepted.insert(node_id.clone()) {
+                    acknowledged = acknowledged.saturating_add(1);
+                    acknowledged_nodes.push(node_id);
+                    if acknowledged >= required {
+                        return Ok(QuorumOutcome {
+                            required,
+                            acknowledged,
+                            acknowledged_nodes,
+                        });
+                    }
+                }
+            }
+            CasVote::Reject(node_id) => {
+                had_reject = true;
+                if declined.insert(node_id) {
+                    let possible_accepts = possible.saturating_sub(declined.len());
+                    if possible_accepts < required {
+                        return Err(ConsistencyError::Fenced {
+                            required,
+                            possible_accepts,
+                        });
+                    }
+                }
+            }
+            CasVote::Fault(node_id) => {
+                if declined.insert(node_id) {
+                    let possible_accepts = possible.saturating_sub(declined.len());
+                    if possible_accepts < required {
+                        return Err(decline_outcome(had_reject, required, possible_accepts));
+                    }
+                }
+            }
+        }
+    }
+
+    Err(ConsistencyError::QuorumTimeout {
+        required,
+        acknowledged,
+        timeout: strong.timeout(),
+    })
+}
+
+/// CAS-aware quorum tally that blocks on a receiver of [`CasVote`]s.
+///
+/// The blocking analogue of [`wait_for_cas_quorum`], mirroring
+/// [`wait_for_quorum_from_receiver`] for the non-CAS path. The writer-side
+/// coordinator (2a-3) feeds votes from inbound `WriteAck` handlers into the
+/// sender; this is NOT wired to any live send/apply path in this increment.
+pub fn wait_for_cas_quorum_from_receiver<NodeId>(
+    strong: StrongConsistency,
+    receiver: &std::sync::mpsc::Receiver<CasVote<NodeId>>,
+) -> Result<QuorumOutcome<NodeId>, ConsistencyError>
+where
+    NodeId: Clone + Eq + StdHash,
+{
+    let required = strong.quorum()?;
+    let local_ack_count = usize::from(strong.counts_local_ack());
+    let remote_capacity = strong.total_nodes().saturating_sub(1);
+    let possible = local_ack_count.saturating_add(remote_capacity);
+    if possible < required {
+        return Err(ConsistencyError::QuorumUnavailable { required, possible });
+    }
+
+    let deadline = Instant::now() + strong.timeout();
+    let mut acknowledged_nodes = Vec::new();
+    let mut accepted = HashSet::new();
+    // Nodes that will not contribute an accept — CAS rejects AND faults unioned,
+    // so a node that both rejects and faults erodes the accept ceiling once.
+    let mut declined = HashSet::new();
+    let mut had_reject = false;
+    let mut acknowledged = local_ack_count;
+
+    if acknowledged >= required {
+        return Ok(QuorumOutcome {
+            required,
+            acknowledged,
+            acknowledged_nodes,
+        });
+    }
+
+    loop {
+        let remaining = deadline
+            .checked_duration_since(Instant::now())
+            .ok_or_else(|| ConsistencyError::QuorumTimeout {
+                required,
+                acknowledged,
+                timeout: strong.timeout(),
+            })?;
+
+        match receiver.recv_timeout(remaining) {
+            Ok(CasVote::Accept(node_id)) => {
+                if accepted.insert(node_id.clone()) {
+                    acknowledged = acknowledged.saturating_add(1);
+                    acknowledged_nodes.push(node_id);
+                    if acknowledged >= required {
+                        return Ok(QuorumOutcome {
+                            required,
+                            acknowledged,
+                            acknowledged_nodes,
+                        });
+                    }
+                }
+            }
+            Ok(CasVote::Reject(node_id)) => {
+                had_reject = true;
+                if declined.insert(node_id) {
+                    let possible_accepts = possible.saturating_sub(declined.len());
+                    if possible_accepts < required {
+                        return Err(ConsistencyError::Fenced {
+                            required,
+                            possible_accepts,
+                        });
+                    }
+                }
+            }
+            Ok(CasVote::Fault(node_id)) => {
+                if declined.insert(node_id) {
+                    let possible_accepts = possible.saturating_sub(declined.len());
+                    if possible_accepts < required {
+                        return Err(decline_outcome(had_reject, required, possible_accepts));
+                    }
+                }
+            }
             Err(
                 std::sync::mpsc::RecvTimeoutError::Timeout
                 | std::sync::mpsc::RecvTimeoutError::Disconnected,
