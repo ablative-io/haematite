@@ -10,11 +10,22 @@ use beamr::scheduler::{Scheduler, SchedulerConfig};
 
 use crate::shard::actor::{ShardError, ShardHandle};
 use crate::shard::router::ShardRouter;
+use crate::sync::scheduler::{
+    NoopSyncPullTrigger, SyncSchedulerConfig, SyncSchedulerError, SyncSchedulerHandle,
+};
 use crate::tree::Hash;
 use crate::ttl::sweep::{SweepError, SweepHandle};
 
+mod config;
+mod error;
 pub(crate) mod helpers;
 
+pub use config::{DatabaseConfig, DistributedDatabaseConfig};
+pub use error::DatabaseError;
+
+use config::{read_config, validate_database_config, write_config};
+
+pub use helpers::run_indexed_parallel;
 use helpers::{
     event_range_end, event_range_start, map_shard_error, map_spawn_error, range_on_handle,
 };
@@ -28,117 +39,13 @@ pub(crate) type DbEntry = (Vec<u8>, Vec<u8>);
 pub(crate) type DbRange = Vec<DbEntry>;
 pub(crate) type ShardCommitResult = (usize, Result<Hash, ShardError>);
 
-/// Explicit database configuration; no field has a silent default.
-#[derive(Clone, Debug, serde::Deserialize, serde::Serialize)]
-pub struct DatabaseConfig {
-    pub data_dir: PathBuf,
-    pub shard_count: usize,
-    /// Sweep interval in milliseconds. `None` disables TTL writes.
-    pub sweep_interval: Option<u64>,
-}
-
-/// Errors surfaced by the top-level database handle.
-#[derive(Debug)]
-pub enum DatabaseError {
-    DirectoryCreate(io::Error),
-    ConfigWrite(io::Error),
-    ConfigRead(io::Error),
-    ConfigParse(String),
-    InvalidShardCount,
-    ShardSpawn(String),
-    SweepSpawn(String),
-    ShardError(String),
-    SweepError(String),
-    IoError(io::Error),
-    MissingSweepInterval,
-    InvalidSweepInterval,
-    SequenceConflict {
-        expected: u64,
-        actual: u64,
-    },
-    CasMismatch {
-        expected: Option<u64>,
-        actual: Option<u64>,
-    },
-    ConsistencyError(String),
-}
-
-impl fmt::Display for DatabaseError {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::DirectoryCreate(error) => {
-                write!(formatter, "failed to create database directory: {error}")
-            }
-            Self::ConfigWrite(error) => {
-                write!(formatter, "failed to write database config: {error}")
-            }
-            Self::ConfigRead(error) => write!(formatter, "failed to read database config: {error}"),
-            Self::ConfigParse(message) => {
-                write!(formatter, "failed to parse database config: {message}")
-            }
-            Self::InvalidShardCount => write!(formatter, "database shard_count must be at least 1"),
-            Self::ShardSpawn(message) => {
-                write!(formatter, "failed to spawn shard actor: {message}")
-            }
-            Self::SweepSpawn(message) => {
-                write!(formatter, "failed to spawn sweep actor: {message}")
-            }
-            Self::ShardError(message) => write!(formatter, "shard operation failed: {message}"),
-            Self::SweepError(message) => write!(formatter, "sweep operation failed: {message}"),
-            Self::IoError(error) => write!(formatter, "database I/O error: {error}"),
-            Self::MissingSweepInterval => write!(formatter, "ttl writes require sweep_interval"),
-            Self::InvalidSweepInterval => {
-                write!(formatter, "sweep_interval must be greater than zero")
-            }
-            Self::SequenceConflict { expected, actual } => write!(
-                formatter,
-                "sequence conflict on append: expected {expected}, actual {actual}"
-            ),
-            Self::CasMismatch { expected, actual } => write!(
-                formatter,
-                "cas mismatch: expected {expected:?}, actual {actual:?}"
-            ),
-            Self::ConsistencyError(message) => {
-                write!(formatter, "consistency requirement failed: {message}")
-            }
-        }
-    }
-}
-
-impl std::error::Error for DatabaseError {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        match self {
-            Self::DirectoryCreate(error)
-            | Self::ConfigWrite(error)
-            | Self::ConfigRead(error)
-            | Self::IoError(error) => Some(error),
-            Self::ConfigParse(_)
-            | Self::InvalidShardCount
-            | Self::ShardSpawn(_)
-            | Self::SweepSpawn(_)
-            | Self::ShardError(_)
-            | Self::SweepError(_)
-            | Self::MissingSweepInterval
-            | Self::InvalidSweepInterval
-            | Self::SequenceConflict { .. }
-            | Self::CasMismatch { .. }
-            | Self::ConsistencyError(_) => None,
-        }
-    }
-}
-
-impl From<io::Error> for DatabaseError {
-    fn from(error: io::Error) -> Self {
-        Self::IoError(error)
-    }
-}
-
 /// Top-level database handle. Callers use this API instead of shard actors.
 pub struct Database {
     config: DatabaseConfig,
     scheduler: Arc<Scheduler>,
     router: ShardRouter,
     sweeps: Vec<SweepHandle>,
+    sync_schedulers: Vec<SyncSchedulerHandle>,
     timeout: Duration,
 }
 
@@ -155,7 +62,7 @@ impl fmt::Debug for Database {
 impl Database {
     /// Create a new database directory, write its config, and spawn all shards.
     pub fn create(config: DatabaseConfig) -> Result<Self, DatabaseError> {
-        validate_shard_count(config.shard_count)?;
+        validate_database_config(&config)?;
         let data_dir = config.data_dir.clone();
         let should_cleanup = !data_dir.exists();
         fs::create_dir_all(&data_dir).map_err(DatabaseError::DirectoryCreate)?;
@@ -170,8 +77,8 @@ impl Database {
     pub fn open(path: impl AsRef<Path>) -> Result<Self, DatabaseError> {
         let path = path.as_ref().to_path_buf();
         let mut config = read_config(&path)?;
-        validate_shard_count(config.shard_count)?;
         config.data_dir = path;
+        validate_database_config(&config)?;
         start_database(config, StartupMode::Open)
     }
 
@@ -322,6 +229,14 @@ impl Database {
 
 impl Drop for Database {
     fn drop(&mut self) {
+        for handle in &self.sync_schedulers {
+            if let Err(error) = handle.shutdown(self.timeout) {
+                log::debug!(
+                    "database sync scheduler shutdown skipped for supervisor pid {}: {error}",
+                    handle.supervisor_pid()
+                );
+            }
+        }
         for handle in &self.sweeps {
             if let Err(error) = handle.shutdown(self.timeout) {
                 log::debug!(
@@ -358,16 +273,24 @@ fn initialise_database(config: DatabaseConfig) -> Result<Database, DatabaseError
 }
 
 fn start_database(config: DatabaseConfig, mode: StartupMode) -> Result<Database, DatabaseError> {
-    validate_shard_count(config.shard_count)?;
-    validate_sweep_interval(config.sweep_interval)?;
+    validate_database_config(&config)?;
     let scheduler = create_scheduler()?;
     let router = spawn_router(&scheduler, &config.data_dir, config.shard_count, mode)?;
     let sweeps = spawn_sweeps(&scheduler, &config, &router)?;
+    let sync_schedulers = match spawn_sync_schedulers(&scheduler, &config) {
+        Ok(handles) => handles,
+        Err(error) => {
+            shutdown_sweeps(&sweeps);
+            shutdown_handles(router.handles_in_order());
+            return Err(error);
+        }
+    };
     Ok(Database {
         config,
         scheduler,
         router,
         sweeps,
+        sync_schedulers,
         timeout: DEFAULT_TIMEOUT,
     })
 }
@@ -429,6 +352,34 @@ fn spawn_sweeps(
         }
     }
     Ok(sweeps)
+}
+
+fn spawn_sync_schedulers(
+    scheduler: &Arc<Scheduler>,
+    config: &DatabaseConfig,
+) -> Result<Vec<SyncSchedulerHandle>, DatabaseError> {
+    let Some(distributed) = &config.distributed else {
+        return Ok(Vec::new());
+    };
+    let topology = distributed
+        .topology
+        .clone()
+        .ok_or(DatabaseError::MissingSyncTopology)?;
+    let scheduler_config = SyncSchedulerConfig::new(
+        distributed.local_node.clone(),
+        distributed.nodes.clone(),
+        topology,
+        config.shard_count,
+        Duration::from_millis(distributed.sync_interval),
+    );
+    SyncSchedulerHandle::spawn(
+        Arc::clone(scheduler),
+        scheduler_config,
+        Arc::new(NoopSyncPullTrigger),
+        DEFAULT_TIMEOUT,
+    )
+    .map(|handle| vec![handle])
+    .map_err(map_sync_scheduler_error)
 }
 
 fn spawn_one_shard(
@@ -502,30 +453,10 @@ fn map_sweep_spawn_error(error: SweepError) -> DatabaseError {
     }
 }
 
-fn write_config(config: &DatabaseConfig) -> Result<(), DatabaseError> {
-    let bytes = serde_json::to_vec_pretty(config).map_err(|error| {
-        DatabaseError::ConfigWrite(io::Error::new(io::ErrorKind::InvalidData, error))
-    })?;
-    fs::write(config.data_dir.join(CONFIG_FILE), bytes).map_err(DatabaseError::ConfigWrite)
-}
-
-fn read_config(path: &Path) -> Result<DatabaseConfig, DatabaseError> {
-    let bytes = fs::read(path.join(CONFIG_FILE)).map_err(DatabaseError::ConfigRead)?;
-    serde_json::from_slice(&bytes).map_err(|error| DatabaseError::ConfigParse(error.to_string()))
-}
-
-const fn validate_shard_count(shard_count: usize) -> Result<(), DatabaseError> {
-    if shard_count == 0 {
-        Err(DatabaseError::InvalidShardCount)
-    } else {
-        Ok(())
-    }
-}
-
-const fn validate_sweep_interval(interval: Option<u64>) -> Result<(), DatabaseError> {
-    match interval {
-        Some(0) => Err(DatabaseError::InvalidSweepInterval),
-        Some(_) | None => Ok(()),
+fn map_sync_scheduler_error(error: SyncSchedulerError) -> DatabaseError {
+    match error {
+        SyncSchedulerError::Spawn(message) => DatabaseError::SyncSchedulerSpawn(message),
+        other => DatabaseError::SyncSchedulerError(other.to_string()),
     }
 }
 
@@ -538,36 +469,6 @@ fn event_sequence_key(key: &[u8]) -> Vec<u8> {
 
 fn shard_dir(data_dir: &Path, index: usize) -> PathBuf {
     data_dir.join(format!("shard-{index}"))
-}
-
-pub(crate) fn run_indexed_parallel<Item, Output, Work>(
-    items: Vec<Item>,
-    work: Work,
-) -> Result<Vec<(usize, Output)>, DatabaseError>
-where
-    Item: Send,
-    Output: Send,
-    Work: Fn(Item) -> Output + Sync,
-{
-    std::thread::scope(|scope| {
-        let mut joins = Vec::with_capacity(items.len());
-        for (index, item) in items.into_iter().enumerate() {
-            let work = &work;
-            joins.push(scope.spawn(move || (index, work(item))));
-        }
-        let mut results = Vec::with_capacity(joins.len());
-        for join in joins {
-            match join.join() {
-                Ok(result) => results.push(result),
-                Err(_) => {
-                    return Err(DatabaseError::ShardError(
-                        "parallel worker thread panicked".to_owned(),
-                    ));
-                }
-            }
-        }
-        Ok(results)
-    })
 }
 
 #[cfg(test)]

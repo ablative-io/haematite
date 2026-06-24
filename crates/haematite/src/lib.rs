@@ -24,7 +24,7 @@ pub use api::{
     SequenceConflict, ShardRoots, StreamMeta, decode_stream_key, encode_stream_key,
 };
 
-pub use db::{Database, DatabaseConfig, DatabaseError};
+pub use db::{Database, DatabaseConfig, DatabaseError, DistributedDatabaseConfig};
 
 pub use error::Error;
 
@@ -42,7 +42,9 @@ pub use wal::{
 };
 
 pub use sync::{
-    Ack, ConsistencyError, ConsistencyMode, EventualConsistency, QuorumOutcome, StrongConsistency,
-    SyncMergeError, SyncMergeResult, SyncMergeRoots, execute_with_consistency, merge_synced_roots,
-    quorum_size, wait_for_quorum, wait_for_quorum_from_receiver,
+    Ack, ConsistencyError, ConsistencyMode, ConvergenceProperties, EventualConsistency,
+    NoopSyncPullTrigger, QuorumOutcome, StrongConsistency, SyncMergeError, SyncMergeResult,
+    SyncMergeRoots, SyncNodeId, SyncPair, SyncPullTrigger, SyncSchedulerConfig, SyncSchedulerError,
+    SyncSchedulerHandle, SyncSchedulerStats, SyncTopology, TopologyError, execute_with_consistency,
+    merge_synced_roots, quorum_size, wait_for_quorum, wait_for_quorum_from_receiver,
 };

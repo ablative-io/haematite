@@ -104,3 +104,33 @@ pub(super) fn event_range_end(key: &[u8]) -> Vec<u8> {
     encoded.push(1);
     encoded
 }
+
+pub fn run_indexed_parallel<Item, Output, Work>(
+    items: Vec<Item>,
+    work: Work,
+) -> Result<Vec<(usize, Output)>, DatabaseError>
+where
+    Item: Send,
+    Output: Send,
+    Work: Fn(Item) -> Output + Sync,
+{
+    std::thread::scope(|scope| {
+        let mut joins = Vec::with_capacity(items.len());
+        for (index, item) in items.into_iter().enumerate() {
+            let work = &work;
+            joins.push(scope.spawn(move || (index, work(item))));
+        }
+        let mut results = Vec::with_capacity(joins.len());
+        for join in joins {
+            match join.join() {
+                Ok(result) => results.push(result),
+                Err(_) => {
+                    return Err(DatabaseError::ShardError(
+                        "parallel worker thread panicked".to_owned(),
+                    ));
+                }
+            }
+        }
+        Ok(results)
+    })
+}
