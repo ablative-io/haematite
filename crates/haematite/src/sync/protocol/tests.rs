@@ -1,6 +1,7 @@
 use std::cell::Cell;
 use std::collections::{BTreeMap, BTreeSet};
 use std::convert::Infallible;
+use std::time::Duration;
 
 use super::*;
 use crate::store::MemoryStore;
@@ -293,4 +294,139 @@ fn sync_messages_round_trip_through_beamr_frame_encoding() -> Result<(), Box<dyn
         assert_eq!(decoded, message);
     }
     Ok(())
+}
+
+fn sample_hash(key: &[u8], value: &[u8]) -> Result<Hash, Box<dyn std::error::Error>> {
+    Ok(leaf(key, value)?.hash())
+}
+
+fn assert_message_round_trips(message: &SyncMessage) -> Result<(), Box<dyn std::error::Error>> {
+    let payload = encode_sync_message(message)?;
+    assert_eq!(&decode_sync_message(&payload)?, message);
+
+    let frame = encode_beamr_sync_frame(message)?;
+    assert_eq!(&decode_beamr_sync_frame(&frame)?, message);
+    Ok(())
+}
+
+#[test]
+fn write_proposal_round_trips_across_field_variations()
+-> Result<(), Box<dyn std::error::Error>> {
+    let expected = sample_hash(b"prev", b"old")?;
+    let write_id = WriteId::new("node-origin-name", 7, 42);
+
+    let proposals = vec![
+        // empty value, no precondition, no ttl
+        WriteProposal {
+            write_id: write_id.clone(),
+            key: b"k".to_vec(),
+            expected: None,
+            value: Vec::new(),
+            ttl: None,
+        },
+        // expected Some + ttl Some + multi-byte node name already in write_id
+        WriteProposal {
+            write_id: write_id.clone(),
+            key: b"another/key".to_vec(),
+            expected: Some(expected),
+            value: b"hello world".to_vec(),
+            ttl: Some(Duration::new(12, 345)),
+        },
+        // large value
+        WriteProposal {
+            write_id,
+            key: Vec::new(),
+            expected: Some(expected),
+            value: vec![0xAB; 64 * 1024],
+            ttl: Some(Duration::from_secs(3600)),
+        },
+    ];
+
+    for proposal in &proposals {
+        assert_message_round_trips(&SyncMessage::WriteProposal(proposal.clone()))?;
+    }
+    Ok(())
+}
+
+#[test]
+fn write_ack_round_trips_for_every_outcome() -> Result<(), Box<dyn std::error::Error>> {
+    let write_id = WriteId::new("origin", 1, 9);
+    let outcomes = [
+        AckOutcome::Applied,
+        AckOutcome::Rejected(RejectReason::CasMismatch),
+        AckOutcome::Rejected(RejectReason::ApplyError),
+    ];
+
+    for outcome in outcomes {
+        let ack = WriteAck {
+            write_id: write_id.clone(),
+            acker: SyncNodeId::new("multi-byte-acker-name-\u{00e9}"),
+            acker_creation: 5,
+            outcome,
+        };
+        assert_message_round_trips(&SyncMessage::WriteAck(ack))?;
+    }
+    Ok(())
+}
+
+#[test]
+fn truncated_write_messages_decode_to_clean_error() -> Result<(), Box<dyn std::error::Error>> {
+    let proposal = SyncMessage::WriteProposal(WriteProposal {
+        write_id: WriteId::new("origin", 3, 1),
+        key: b"key".to_vec(),
+        expected: None,
+        value: b"value".to_vec(),
+        ttl: Some(Duration::new(1, 1)),
+    });
+    let ack = SyncMessage::WriteAck(WriteAck {
+        write_id: WriteId::new("origin", 3, 1),
+        acker: SyncNodeId::new("acker"),
+        acker_creation: 2,
+        outcome: AckOutcome::Rejected(RejectReason::CasMismatch),
+    });
+
+    for message in [proposal, ack] {
+        let payload = encode_sync_message(&message)?;
+        // Every non-empty truncation must be a clean Err, never a panic.
+        for len in 0..payload.len() {
+            assert!(decode_sync_message(&payload[..len]).is_err());
+        }
+        // Trailing garbage must also be rejected by the finish() check.
+        let mut extended = payload.clone();
+        extended.push(0xFF);
+        assert!(decode_sync_message(&extended).is_err());
+    }
+    Ok(())
+}
+
+#[test]
+fn denormalized_duration_nanos_decode_to_error() -> Result<(), Box<dyn std::error::Error>> {
+    // origin name len(8) + "origin" + creation(4) + counter(8) =
+    // write_id; then key, expected=None, value, ttl flag=1, secs, nanos.
+    let message = SyncMessage::WriteProposal(WriteProposal {
+        write_id: WriteId::new("origin", 0, 0),
+        key: Vec::new(),
+        expected: None,
+        value: Vec::new(),
+        ttl: Some(Duration::new(0, 0)),
+    });
+    let mut payload = encode_sync_message(&message)?;
+    // The last 4 bytes are the subsec-nanos field; force them out of range.
+    let nanos_start = payload.len() - 4;
+    payload[nanos_start..].copy_from_slice(&1_000_000_000_u32.to_be_bytes());
+    assert!(matches!(
+        decode_sync_message(&payload),
+        Err(SyncError::InvalidMessage)
+    ));
+    Ok(())
+}
+
+#[test]
+fn unknown_message_tag_is_rejected() {
+    // protocol version byte (1) then an unknown message tag.
+    let payload = [1_u8, 99];
+    assert!(matches!(
+        decode_sync_message(&payload),
+        Err(SyncError::InvalidMessage)
+    ));
 }
