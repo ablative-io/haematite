@@ -422,11 +422,13 @@ impl DistributionEndpoint {
             .map_err(|_error| ConsistencyError::TransportUnavailable)?;
         let frame = Arc::new(frame);
 
-        // Fire-and-forget a proposal to each reachable send target. The send runs
-        // natively async on the endpoint runtime (NOT the sync `block_on` bridge —
-        // we are already inside the runtime here). At-least-once is a single
-        // attempt this increment; a failed send is logged-and-ignored (the tally
-        // times out or fences). Structured so a retry loop slots in here.
+        // Fire-and-forget a proposal to each reachable send target. We `spawn`
+        // onto the endpoint runtime (rather than the sync `block_on` bridge) so the
+        // sends run concurrently while this thread proceeds to block on votes.
+        // `propose_write` runs OUTSIDE the runtime (guarded above), so `handle.spawn`
+        // is the correct cross-thread hand-off onto the runtime. At-least-once is a
+        // single attempt this increment; a failed send is logged-and-ignored (the
+        // tally times out or fences). Structured so a retry loop slots in here.
         for target in &membership.send_targets {
             let manager = self.manager.clone();
             let remote = self.atom_table.intern(target.as_str());
