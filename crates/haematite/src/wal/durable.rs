@@ -169,20 +169,28 @@ impl DurableWal {
     /// file that loses both replay entries and the commit reference.
     pub fn commit(&mut self, root_hash: Hash) -> Result<(), WalError> {
         self.file.sync_all()?;
-        let marker = truncation_marker_frame(root_hash);
-        write_atomic(&self.path, &marker)?;
+        // Build the replacement file as [marker][latest promise snapshot] and
+        // install it in ONE atomic rename, so a commit truncation never drops
+        // ownership/promise durability (AA-3-0, §3 "same fsync domain").
+        //
+        // It is NOT safe to write a marker-only file and then re-append the
+        // promise as a separate step: that leaves a crash window in which the
+        // on-disk WAL is marker-only and the promise frame is gone, so recovery
+        // would regress `promised` to bottom — violating the non-regression
+        // invariant the §4 majority-intersection fence rests on (a node could
+        // then promise a ballot lower than one it already granted). Folding the
+        // promise into the atomically-renamed replacement closes that window by
+        // construction: the rename publishes marker and promise together or
+        // neither.
+        let mut replacement = truncation_marker_frame(root_hash);
+        if let Some(record) = &self.promise {
+            let bytes = record.serialise();
+            replacement.extend_from_slice(&(bytes.len() as u32).to_le_bytes());
+            replacement.extend_from_slice(&bytes);
+        }
+        write_atomic(&self.path, &replacement)?;
         self.file = open_append_file(&self.path)?;
         self.writes_since_sync = 0;
-        // Re-emit the latest promise snapshot AFTER the marker so a commit
-        // truncation — which rewrote the WAL to just the marker — never drops
-        // ownership/promise durability (AA-3-0, §3 "same fsync domain"). The
-        // re-emit is force-fsynced, matching `append_promise`.
-        if let Some(record) = self.promise.clone() {
-            let bytes = record.serialise();
-            self.write_entry_frame(&bytes)?;
-            self.file.sync_all()?;
-            self.writes_since_sync = 0;
-        }
         Ok(())
     }
 
