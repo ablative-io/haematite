@@ -90,18 +90,44 @@ impl Database {
             DatabaseError::Distribution("no distribution endpoint for replicate_write".to_owned())
         })?;
 
+        // Stamp the write with this shard's current owner epoch (§2.3). Read the
+        // owner_epoch in-slice via the shard's promise state; with no election the
+        // shard is un-owned (owner_epoch None) → epoch = Ballot::bottom(), and every
+        // node's `promised` is also bottom, so `bottom >= bottom` accepts and the
+        // fence is a no-op (2a sequential semantics preserved). With an election the
+        // owner stamps its real epoch and a stale owner's write is fenced at peers.
+        // We do NOT gate on "am I owner" — the fence at the receiver is the
+        // enforcement, and gating here would break 2a back-compat.
+        let stamp_handle = self
+            .handle_for(&key)
+            .map_err(|error| DatabaseError::LocalCommitFailed(error.to_string()))?;
+        let epoch = stamp_handle
+            .read_promise_state(self.timeout())
+            .map_err(|error| DatabaseError::LocalCommitFailed(error.to_string()))?
+            .owner_epoch
+            .unwrap_or_else(Ballot::bottom);
+
         // Step 1: drive the write to peer-quorum. Clone key/value because the local
         // durable apply in step 2 needs them again.
         let outcome = endpoint
-            .propose_write(key.clone(), expected, value.clone(), ttl, membership, timeout)
+            .propose_write(
+                key.clone(),
+                expected,
+                value.clone(),
+                ttl,
+                epoch.clone(),
+                membership,
+                timeout,
+            )
             .map_err(|error| DatabaseError::ConsistencyError(error.to_string()))?;
 
         // Step 2: quorum reached — durably persist the proposer's own committed
-        // value locally via the SAME conditional-durable apply the receiver runs.
+        // value locally via the SAME conditional-durable apply the receiver runs,
+        // stamped with the SAME epoch the cluster just accepted.
         let handle = self
             .handle_for(&key)
             .map_err(|error| DatabaseError::LocalCommitFailed(error.to_string()))?;
-        match handle.apply_durable(key, expected, value, ttl, self.timeout()) {
+        match handle.apply_durable(key, expected, value, ttl, epoch, self.timeout()) {
             Ok(()) => Ok(outcome),
             // Any failure here is surfaced loudly, never swallowed. A local CAS
             // mismatch (`ShardError::CasHashMismatch`) would mean another writer
@@ -178,6 +204,7 @@ impl Database {
             proposal.expected,
             proposal.value.clone(),
             proposal.ttl,
+            proposal.epoch.clone(),
             self.timeout(),
         ) {
             Ok(()) => AckOutcome::Applied,
@@ -186,6 +213,12 @@ impl Database {
             Err(ShardError::CasHashMismatch { .. }) => {
                 AckOutcome::Rejected(RejectReason::CasMismatch)
             }
+            // An epoch fence is ALSO a vote-against (§2.3): this replica promised a
+            // higher ballot, so the proposer is a stale/deposed owner. It must
+            // erode possible-accepts toward a fence/quorum failure exactly like a
+            // CAS mismatch — NOT a transport fault — so the deposed owner's write
+            // surfaces to its caller as a fence, never a false success.
+            Err(ShardError::Fenced { .. }) => AckOutcome::Rejected(RejectReason::Fenced),
             // Any other shard error (IO, timeout, unavailable, WAL/tree fault) is a
             // genuine apply error.
             Err(_other) => AckOutcome::Rejected(RejectReason::ApplyError),

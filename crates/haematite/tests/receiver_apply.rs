@@ -14,6 +14,7 @@
 use std::error::Error;
 use std::path::Path;
 
+use haematite::sync::ballot::Ballot;
 use haematite::sync::protocol::{AckOutcome, RejectReason, WriteId, WriteProposal};
 use haematite::sync::SyncNodeId;
 use haematite::tree::Hash;
@@ -44,6 +45,9 @@ fn proposal(key: &[u8], expected: Option<Hash>, value: &[u8]) -> WriteProposal {
         expected,
         value: value.to_vec(),
         ttl: None,
+        // No election in these 2a receiver tests: stamp bottom, which `>= promised`
+        // (also bottom) so the fence is a no-op and 2a semantics are unchanged.
+        epoch: Ballot::bottom(),
     }
 }
 

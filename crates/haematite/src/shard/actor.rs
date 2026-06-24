@@ -379,17 +379,45 @@ impl ShardActor {
     /// `CommitOnly` WAL a plain `put_with_ttl` would only reach the OS page cache;
     /// committing here is what makes an `Ok` attest stable storage, so the caller
     /// can acknowledge `Applied` only AFTER this returns.
+    ///
+    /// # Epoch fence (AA-3-3, §2.3 — THE rule)
+    ///
+    /// BEFORE the CAS read, and in this SAME actor slice, the write's `write_epoch`
+    /// is checked against the shard's actor-local `self.promised` ballot:
+    ///
+    /// * `write_epoch < self.promised` → reject [`HashCasError::Fenced`], apply
+    ///   NOTHING (no put, no commit). A stale/deposed owner is fenced — the §4
+    ///   majority-intersection safety property.
+    /// * `write_epoch >= self.promised` → run the existing CAS-compare → put →
+    ///   commit. The data write does **NOT** mutate `self.promised` (R2 — standard
+    ///   Paxos acceptor semantics: only a Prepare / [`Self::record_promise`] raises
+    ///   `promised`). Accepting `>=` without raising is what stops an un-elected
+    ///   high-epoch writer from fencing the true owner.
+    ///
+    /// Reading `self.promised` in the same `&mut self` slice as the CAS means there
+    /// is no TOCTOU between the fence and the write (R8).
     fn apply_durable<S>(
         &mut self,
         key: &[u8],
         expected: Option<Hash>,
         value: Vec<u8>,
         ttl: Option<Duration>,
+        write_epoch: Ballot,
         store: &mut S,
     ) -> Result<(), HashCasError>
     where
         S: NodeStore + ?Sized,
     {
+        // --- Epoch fence (§2.3), BEFORE the CAS read, same actor slice. ---------
+        // Reject a stale owner whose epoch is below what we have promised. We do
+        // NOT raise `self.promised` on the accept path (R2): only `record_promise`
+        // (a Prepare) advances it. `>=` is accepted as a plain Paxos acceptor.
+        if write_epoch < self.promised {
+            return Err(HashCasError::Fenced {
+                promised: self.promised.clone(),
+                attempted: write_epoch,
+            });
+        }
         let actual = self.current_value_hash(key, store)?;
         if actual != expected {
             return Err(HashCasError::HashMismatch { expected, actual });

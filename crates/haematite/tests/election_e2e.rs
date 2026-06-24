@@ -558,3 +558,83 @@ fn unique_ballot_tiebreak_is_total() {
         "counter dominates the node tiebreak"
     );
 }
+
+// ===========================================================================
+// Test 7 (AA-3-3) — Deposed owner is fenced END-TO-END through replicate_write.
+// ===========================================================================
+
+/// A is elected owner at epoch e_A, then C supersedes it at e_C > e_A (a real
+/// failover: B and C now both have `promised = e_C`). A — the DEPOSED owner —
+/// keeps writing via `replicate_write`, which stamps A's STALE `owner_epoch = e_A`.
+/// At the intersection peers (B and C) `e_A < promised = e_C`, so each FENCES the
+/// write (Rejected(Fenced) -> CasVote::Reject). The coordinator must surface a
+/// FENCE / quorum failure (a ConsistencyError), NEVER Ok, and the stale value must
+/// not land on the majority. This is the §4 single-live-owner guarantee on the
+/// real data-write path.
+#[test]
+fn deposed_owner_is_fenced_end_to_end() -> TestResult {
+    let dir_a = tempfile::tempdir()?;
+    let dir_b = tempfile::tempdir()?;
+    let dir_c = tempfile::tempdir()?;
+
+    let node_a = Node::spawn(NODE_A, dir_a.path())?;
+    let node_b = Node::spawn(NODE_B, dir_b.path())?;
+    let node_c = Node::spawn(NODE_C, dir_c.path())?;
+    link_both(&node_a, &node_b)?;
+    link_both(&node_a, &node_c)?;
+    link_both(&node_b, &node_c)?;
+
+    // A wins ownership at e_A.
+    let elect_a = node_a
+        .db
+        .acquire_shard(SHARD, &membership(3, &[NODE_B, NODE_C]), ELECT_TIMEOUT)?;
+
+    // C supersedes A at e_C > e_A: a legitimate failover. After this, B and C have
+    // promised = e_C (> e_A), so A is the deposed owner.
+    let elect_c = node_c
+        .db
+        .acquire_shard(SHARD, &membership(3, &[NODE_A, NODE_B]), ELECT_TIMEOUT)?;
+    assert!(
+        elect_c.ballot > elect_a.ballot,
+        "C's superseding ballot must strictly exceed A's: {:?} !> {:?}",
+        elect_c.ballot,
+        elect_a.ballot
+    );
+
+    // The deposed owner A keeps writing. replicate_write stamps A's STALE
+    // owner_epoch e_A; B and C fence it (e_A < their promised e_C).
+    let key = b"deposed-write".to_vec();
+    let result = node_a.db.replicate_write(
+        key.clone(),
+        None,
+        b"stale-owner-value".to_vec(),
+        None,
+        &membership(3, &[NODE_B, NODE_C]),
+        ELECT_TIMEOUT,
+    );
+
+    // It must be a fence/quorum FAILURE, never Ok. A and C both rejecting erodes
+    // possible-accepts below quorum -> ConsistencyError (the fenced shape).
+    match &result {
+        Err(DatabaseError::ConsistencyError(message)) => {
+            assert!(
+                message.contains("fenced"),
+                "deposed-owner write must fail as a FENCE, got: {message}"
+            );
+        }
+        other => panic!("deposed owner must be fenced (ConsistencyError), got {other:?}"),
+    }
+
+    // The stale value must NOT have landed on the majority peers.
+    assert_eq!(
+        node_b.db.get(&key)?,
+        None,
+        "B must not hold the deposed owner's fenced value"
+    );
+    assert_eq!(
+        node_c.db.get(&key)?,
+        None,
+        "C must not hold the deposed owner's fenced value"
+    );
+    Ok(())
+}

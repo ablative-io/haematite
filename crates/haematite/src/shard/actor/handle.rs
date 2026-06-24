@@ -76,6 +76,15 @@ pub enum ShardError {
         expected: Option<Hash>,
         actual: Option<Hash>,
     },
+    /// The epoch fence (AA-3-3, §2.3) rejected a data write whose `attempted`
+    /// epoch was strictly below this shard's actor-local `promised` ballot. A
+    /// stale/deposed owner is fenced: NOTHING was applied (no put, no commit).
+    /// Like [`Self::CasHashMismatch`] this is a vote-against, never an apply
+    /// fault.
+    Fenced {
+        promised: Ballot,
+        attempted: Ballot,
+    },
 }
 
 impl fmt::Display for ShardError {
@@ -106,6 +115,13 @@ impl fmt::Display for ShardError {
                 formatter,
                 "cas hash mismatch: expected {expected:?}, actual {actual:?}"
             ),
+            Self::Fenced {
+                promised,
+                attempted,
+            } => write!(
+                formatter,
+                "epoch fenced: attempted {attempted:?} < promised {promised:?}"
+            ),
         }
     }
 }
@@ -122,7 +138,8 @@ impl std::error::Error for ShardError {
             | Self::Spawn(_)
             | Self::SequenceConflict { .. }
             | Self::CasMismatch { .. }
-            | Self::CasHashMismatch { .. } => None,
+            | Self::CasHashMismatch { .. }
+            | Self::Fenced { .. } => None,
         }
     }
 }
@@ -209,6 +226,7 @@ pub(super) enum ShardCommandKind {
         expected: Option<Hash>,
         value: Vec<u8>,
         ttl: Option<Duration>,
+        write_epoch: Ballot,
         reply: SyncSender<Result<(), ShardError>>,
     },
     RecordPromise {
@@ -498,6 +516,13 @@ impl ShardHandle {
     /// storage all run inside ONE actor slice, so the compare and the apply cannot
     /// race against another command and the value is on disk before this returns.
     ///
+    /// Before the CAS read runs, the epoch fence (AA-3-3, §2.3) checks
+    /// `write_epoch` against this shard's actor-local `promised` ballot IN THE SAME
+    /// slice: a `write_epoch < promised` is rejected with [`ShardError::Fenced`]
+    /// (nothing applied — a stale/deposed owner's write); a `write_epoch >=
+    /// promised` proceeds to the CAS WITHOUT raising `promised` (R2 — only a
+    /// Prepare advances `promised`).
+    ///
     /// On a hash mismatch nothing is written and [`ShardError::CasHashMismatch`]
     /// is returned (a CAS vote-against). On a match the write is committed — which
     /// fsyncs the tree nodes to the [`crate::store::DiskStore`] and the WAL's
@@ -505,15 +530,17 @@ impl ShardHandle {
     /// merely a page-cache write.
     ///
     /// # Errors
-    /// Returns a [`ShardError`] as for [`Self::get`], or
+    /// Returns a [`ShardError`] as for [`Self::get`],
     /// [`ShardError::CasHashMismatch`] when the current value hash is not
-    /// `expected`.
+    /// `expected`, or [`ShardError::Fenced`] when `write_epoch` is below the
+    /// shard's `promised` ballot.
     pub fn apply_durable(
         &self,
         key: Vec<u8>,
         expected: Option<Hash>,
         value: Vec<u8>,
         ttl: Option<Duration>,
+        write_epoch: Ballot,
         timeout: Duration,
     ) -> Result<(), ShardError> {
         let (reply, response) = mpsc::sync_channel(1);
@@ -522,6 +549,7 @@ impl ShardHandle {
             expected,
             value,
             ttl,
+            write_epoch,
             reply,
         })?;
         recv(&response, self.pid, timeout)?

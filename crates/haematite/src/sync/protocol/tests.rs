@@ -317,29 +317,32 @@ fn write_proposal_round_trips_across_field_variations()
     let write_id = WriteId::new("node-origin-name", 7, 42);
 
     let proposals = vec![
-        // empty value, no precondition, no ttl
+        // empty value, no precondition, no ttl, BOTTOM epoch (un-elected 2a case)
         WriteProposal {
             write_id: write_id.clone(),
             key: b"k".to_vec(),
             expected: None,
             value: Vec::new(),
             ttl: None,
+            epoch: Ballot::bottom(),
         },
-        // expected Some + ttl Some + multi-byte node name already in write_id
+        // expected Some + ttl Some + a REAL epoch with a multi-byte node tiebreak
         WriteProposal {
             write_id: write_id.clone(),
             key: b"another/key".to_vec(),
             expected: Some(expected),
             value: b"hello world".to_vec(),
             ttl: Some(Duration::new(12, 345)),
+            epoch: Ballot::new(7, SyncNodeId::new("owner-node-\u{00e9}")),
         },
-        // large value
+        // large value + a high-counter epoch (exercises the full u64 counter)
         WriteProposal {
             write_id,
             key: Vec::new(),
             expected: Some(expected),
             value: vec![0xAB; 64 * 1024],
             ttl: Some(Duration::from_secs(3600)),
+            epoch: Ballot::new(u64::MAX, SyncNodeId::new("z")),
         },
     ];
 
@@ -378,6 +381,10 @@ fn truncated_write_messages_decode_to_clean_error() -> Result<(), Box<dyn std::e
         expected: None,
         value: b"value".to_vec(),
         ttl: Some(Duration::new(1, 1)),
+        // A real epoch so the trailing-field truncation sweep below also covers
+        // truncations INSIDE the epoch (counter bytes + node-id length prefix):
+        // every prefix shorter than the full frame must decode to a clean Err.
+        epoch: Ballot::new(9, SyncNodeId::new("owner")),
     });
     let ack = SyncMessage::WriteAck(WriteAck {
         write_id: WriteId::new("origin", 3, 1),
@@ -402,23 +409,61 @@ fn truncated_write_messages_decode_to_clean_error() -> Result<(), Box<dyn std::e
 
 #[test]
 fn denormalized_duration_nanos_decode_to_error() -> Result<(), Box<dyn std::error::Error>> {
+    // Bottom epoch trails the ttl on the wire: counter(8) + empty-node
+    // len-prefix(8) = 16 bytes. The nanos field is therefore 16+4 from the end.
+    const EPOCH_BOTTOM_WIRE_LEN: usize = 8 + 8;
     // origin name len(8) + "origin" + creation(4) + counter(8) =
-    // write_id; then key, expected=None, value, ttl flag=1, secs, nanos.
+    // write_id; then key, expected=None, value, ttl flag=1, secs, nanos, epoch.
     let message = SyncMessage::WriteProposal(WriteProposal {
         write_id: WriteId::new("origin", 0, 0),
         key: Vec::new(),
         expected: None,
         value: Vec::new(),
         ttl: Some(Duration::new(0, 0)),
+        epoch: Ballot::bottom(),
     });
     let mut payload = encode_sync_message(&message)?;
-    // The last 4 bytes are the subsec-nanos field; force them out of range.
-    let nanos_start = payload.len() - 4;
-    payload[nanos_start..].copy_from_slice(&1_000_000_000_u32.to_be_bytes());
+    // The subsec-nanos field sits just before the 16-byte trailing epoch; force it
+    // out of range to prove the decoder rejects a denormalized duration.
+    let nanos_start = payload.len() - EPOCH_BOTTOM_WIRE_LEN - 4;
+    payload[nanos_start..nanos_start + 4].copy_from_slice(&1_000_000_000_u32.to_be_bytes());
     assert!(matches!(
         decode_sync_message(&payload),
         Err(SyncError::InvalidMessage)
     ));
+    Ok(())
+}
+
+#[test]
+fn write_proposal_epoch_field_truncation_is_clean_error()
+-> Result<(), Box<dyn std::error::Error>> {
+    // AA-3-3: a WriteProposal carrying a real (non-bottom) epoch must round-trip,
+    // and any truncation that lands INSIDE the trailing epoch field — its 8-byte
+    // counter or its length-prefixed node id — must decode to a clean Err, never a
+    // panic. We construct the frame, confirm the round-trip, then sweep every
+    // truncation from the start of the epoch field to the end of the frame.
+    let proposal = WriteProposal {
+        write_id: WriteId::new("origin", 4, 11),
+        key: b"shard-key".to_vec(),
+        expected: None,
+        value: b"v".to_vec(),
+        ttl: None,
+        epoch: Ballot::new(0x0102_0304_0506_0708, SyncNodeId::new("owner-node")),
+    };
+    let message = SyncMessage::WriteProposal(proposal);
+    assert_message_round_trips(&message)?;
+
+    let full = encode_sync_message(&message)?;
+    // Wire length of the epoch field: counter(8) + len-prefix(8) + node bytes.
+    let epoch_wire_len = 8 + 8 + "owner-node".len();
+    let epoch_start = full.len() - epoch_wire_len;
+    // Every truncation that cuts into (or just before) the epoch field is an Err.
+    for len in epoch_start..full.len() {
+        assert!(
+            decode_sync_message(&full[..len]).is_err(),
+            "truncation at {len} inside the epoch field must be a clean Err"
+        );
+    }
     Ok(())
 }
 

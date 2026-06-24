@@ -262,6 +262,12 @@ pub enum RejectReason {
     CasMismatch,
     /// The replica failed to apply the write for a non-CAS reason.
     ApplyError,
+    /// The replica fenced the write: its `promised[shard]` ballot strictly
+    /// exceeds the proposal's `epoch` (§2.3), so a stale/deposed owner's write
+    /// is rejected. Like [`Self::CasMismatch`] this is a *vote-against*, not a
+    /// transport fault — it erodes possible-accepts toward a fence/quorum
+    /// failure, never a retryable infrastructure error.
+    Fenced,
 }
 
 impl RejectReason {
@@ -269,6 +275,7 @@ impl RejectReason {
         match self {
             Self::CasMismatch => 0,
             Self::ApplyError => 1,
+            Self::Fenced => 2,
         }
     }
 
@@ -276,6 +283,7 @@ impl RejectReason {
         match value {
             0 => Ok(Self::CasMismatch),
             1 => Ok(Self::ApplyError),
+            2 => Ok(Self::Fenced),
             _ => Err(SyncError::InvalidMessage),
         }
     }
@@ -299,6 +307,11 @@ pub struct WriteProposal {
     pub expected: Option<Hash>,
     pub value: KvValue,
     pub ttl: Option<Duration>,
+    /// The owner epoch this write is stamped with (§2.3). The receiver fences it
+    /// (rejects) iff `epoch < promised[shard]`. With no election the stamp is
+    /// [`Ballot::bottom`] and every node's `promised` is also bottom, so the
+    /// fence is a no-op (2a sequential semantics preserved unchanged).
+    pub epoch: Ballot,
 }
 
 /// Acknowledgement of a [`WriteProposal`] from a receiving replica.
