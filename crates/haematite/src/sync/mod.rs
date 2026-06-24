@@ -19,12 +19,13 @@ pub use endpoint::{DistributionEndpoint, InboundSync};
 pub use membership::{WriteMembership, resolve_membership};
 pub use merge::{SyncMergeError, SyncMergeResult, SyncMergeRoots, merge_synced_roots};
 pub use protocol::{
-    AckOutcome, MissingNodes, NodeTransfer, PullRequest, PushResponse, RejectReason, RootExchange,
-    RootExchangeRequest, RootExchangeResponse, SyncDecision, SyncError, SyncMessage, SyncPlan,
-    SyncStats, TargetNodeReader, TargetNodeRequest, TargetNodeResponse, TargetNodeSummary,
-    WriteAck, WriteId, WriteProposal, decode_beamr_sync_frame, decode_sync_message,
-    encode_beamr_sync_frame, encode_sync_message, find_missing_nodes, plan_sync,
-    register_beamr_sync_handler, send_pull_request_via_beamr, send_push_response_via_beamr,
+    AckOutcome, MissingNodes, Nack, NodeTransfer, Prepare, Promise, PullRequest, PushResponse,
+    RejectReason, RootExchange, RootExchangeRequest, RootExchangeResponse, SyncDecision, SyncError,
+    SyncMessage, SyncPlan, SyncStats, TargetNodeReader, TargetNodeRequest, TargetNodeResponse,
+    TargetNodeSummary, WriteAck, WriteId, WriteProposal, decode_beamr_sync_frame,
+    decode_sync_message, encode_beamr_sync_frame, encode_sync_message, find_missing_nodes,
+    plan_sync, register_beamr_sync_handler, send_nack_via_beamr, send_prepare_via_beamr,
+    send_promise_via_beamr, send_pull_request_via_beamr, send_push_response_via_beamr,
     send_root_exchange_request_via_beamr, send_root_exchange_response_via_beamr,
     send_sync_message_via_beamr, send_target_node_request_via_beamr,
     send_target_node_response_via_beamr, send_write_ack_via_beamr, send_write_proposal_via_beamr,
