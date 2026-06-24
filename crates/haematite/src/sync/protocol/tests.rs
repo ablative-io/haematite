@@ -326,6 +326,7 @@ fn write_proposal_round_trips_across_field_variations()
             ttl: None,
             epoch: Ballot::bottom(),
             seq: 0,
+            tombstone: false,
         },
         // expected Some + ttl Some + a REAL epoch with a multi-byte node tiebreak
         WriteProposal {
@@ -336,6 +337,8 @@ fn write_proposal_round_trips_across_field_variations()
             ttl: Some(Duration::new(12, 345)),
             epoch: Ballot::new(7, SyncNodeId::new("owner-node-\u{00e9}")),
             seq: 42,
+            // A replicated DELETE (tombstone) round-trips its flag too (AA-3-4b).
+            tombstone: true,
         },
         // large value + a high-counter epoch (exercises the full u64 counter) + a
         // high seq (exercises the full u64 seq field)
@@ -347,6 +350,7 @@ fn write_proposal_round_trips_across_field_variations()
             ttl: Some(Duration::from_secs(3600)),
             epoch: Ballot::new(u64::MAX, SyncNodeId::new("z")),
             seq: u64::MAX,
+            tombstone: false,
         },
     ];
 
@@ -390,6 +394,7 @@ fn truncated_write_messages_decode_to_clean_error() -> Result<(), Box<dyn std::e
         // every prefix shorter than the full frame must decode to a clean Err.
         epoch: Ballot::new(9, SyncNodeId::new("owner")),
         seq: 7,
+        tombstone: false,
     });
     let ack = SyncMessage::WriteAck(WriteAck {
         write_id: WriteId::new("origin", 3, 1),
@@ -419,6 +424,8 @@ fn denormalized_duration_nanos_decode_to_error() -> Result<(), Box<dyn std::erro
     // therefore 16+8+4 from the end.
     const EPOCH_BOTTOM_WIRE_LEN: usize = 8 + 8;
     const SEQ_WIRE_LEN: usize = 8;
+    // AA-3-4b adds a 1-byte tombstone flag trailing the seq.
+    const TOMBSTONE_WIRE_LEN: usize = 1;
     // origin name len(8) + "origin" + creation(4) + counter(8) =
     // write_id; then key, expected=None, value, ttl flag=1, secs, nanos, epoch.
     let message = SyncMessage::WriteProposal(WriteProposal {
@@ -429,12 +436,14 @@ fn denormalized_duration_nanos_decode_to_error() -> Result<(), Box<dyn std::erro
         ttl: Some(Duration::new(0, 0)),
         epoch: Ballot::bottom(),
         seq: 0,
+        tombstone: false,
     });
     let mut payload = encode_sync_message(&message)?;
-    // The subsec-nanos field sits just before the 16-byte trailing epoch and the
-    // 8-byte trailing seq; force it out of range to prove the decoder rejects a
-    // denormalized duration.
-    let nanos_start = payload.len() - EPOCH_BOTTOM_WIRE_LEN - SEQ_WIRE_LEN - 4;
+    // The subsec-nanos field sits just before the 16-byte trailing epoch, the
+    // 8-byte trailing seq, and the 1-byte tombstone flag; force it out of range to
+    // prove the decoder rejects a denormalized duration.
+    let nanos_start =
+        payload.len() - EPOCH_BOTTOM_WIRE_LEN - SEQ_WIRE_LEN - TOMBSTONE_WIRE_LEN - 4;
     payload[nanos_start..nanos_start + 4].copy_from_slice(&1_000_000_000_u32.to_be_bytes());
     assert!(matches!(
         decode_sync_message(&payload),
@@ -459,6 +468,7 @@ fn write_proposal_epoch_field_truncation_is_clean_error()
         ttl: None,
         epoch: Ballot::new(0x0102_0304_0506_0708, SyncNodeId::new("owner-node")),
         seq: 0x0a0b_0c0d_0e0f_1011,
+        tombstone: false,
     };
     let message = SyncMessage::WriteProposal(proposal);
     assert_message_round_trips(&message)?;

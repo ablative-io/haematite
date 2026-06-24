@@ -488,14 +488,17 @@ impl DistributionEndpoint {
             value,
             ttl,
             Stamp::new(epoch, 0),
+            false,
             membership,
             timeout,
         )
     }
 
     /// As [`Self::propose_write`], but carrying the full owner-assigned commit
-    /// stamp `(epoch, seq)` (AA-3-4a, R-SEQ). The `seq` is placed on the
-    /// `WriteProposal` so every replica stores the identical stamp (§2.4).
+    /// stamp `(epoch, seq)` (AA-3-4a, R-SEQ) and a `tombstone` flag (AA-3-4b). The
+    /// `seq` is placed on the `WriteProposal` so every replica stores the identical
+    /// stamp (§2.4); `tombstone` tells the receiver to apply a stamped tombstone
+    /// (a replicated delete) through the same fence + CAS path.
     #[allow(clippy::too_many_arguments)]
     pub fn propose_write_stamped(
         &self,
@@ -504,6 +507,7 @@ impl DistributionEndpoint {
         value: KvValue,
         ttl: Option<Duration>,
         stamp: Stamp,
+        tombstone: bool,
         membership: &WriteMembership,
         timeout: Duration,
     ) -> Result<QuorumOutcome<SyncNodeId>, ConsistencyError> {
@@ -543,6 +547,7 @@ impl DistributionEndpoint {
             ttl,
             epoch: stamp.epoch,
             seq: stamp.seq,
+            tombstone,
         };
 
         // Encode the proposal frame ONCE on this synchronous thread (a `SyncError`

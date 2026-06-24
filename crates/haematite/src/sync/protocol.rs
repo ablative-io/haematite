@@ -319,6 +319,12 @@ pub struct WriteProposal {
     /// bottom epoch (2a-compat). The receiver stores `(epoch, seq)` verbatim,
     /// never inventing its own.
     pub seq: u64,
+    /// AA-3-4b: when `true`, this proposal is a DELETE — the receiver applies a
+    /// stamped TOMBSTONE (not the `value`/`ttl`, which are empty) through the same
+    /// fence + CAS + stamp path. `expected` is the hash of the value being deleted
+    /// (`None` to delete an absent/tombstoned key). A delete is the one fenced,
+    /// stamped, replicated write a put is — there is no second delete path.
+    pub tombstone: bool,
 }
 
 impl WriteProposal {

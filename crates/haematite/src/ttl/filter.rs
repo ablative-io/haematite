@@ -37,11 +37,15 @@ pub fn visible_value(encoded: &[u8]) -> Result<Visibility, TtlDecodeError> {
 /// value falls back to the plain-TTL decode, and a raw value is live as-is.
 pub fn visible_value_at(encoded: &[u8], now: Timestamp) -> Result<Visibility, TtlDecodeError> {
     if let Some(stamped) = StampedEntry::decode(encoded)? {
-        return Ok(if stamped.is_expired_at(now) {
-            Visibility::Expired
-        } else {
-            Visibility::Live(stamped.into_value())
-        });
+        // A tombstone (AA-3-4b) reads as ABSENT and an expired VALUE reads as
+        // Expired — both surface as `None` to the read path (`get` → `None`,
+        // `current_value_hash` → `None`, create-if-absent matches a tombstone).
+        if stamped.is_expired_at(now) {
+            return Ok(Visibility::Expired);
+        }
+        return Ok(stamped
+            .into_value()
+            .map_or(Visibility::Expired, Visibility::Live));
     }
     let Some(entry) = TtlEntry::decode(encoded)? else {
         return Ok(Visibility::Live(encoded.to_vec()));

@@ -134,8 +134,8 @@ impl ShardState {
                 drop(reply.send(result));
                 None
             }
-            ShardCommandKind::Delete { key, reply } => {
-                let result = self.actor.delete(key).map_err(ShardError::from);
+            ShardCommandKind::Delete { key, stamp, reply } => {
+                let result = self.actor.delete(key, stamp).map_err(ShardError::from);
                 drop(reply.send(result));
                 None
             }
@@ -184,6 +184,7 @@ impl ShardState {
             }
             extra @ (ShardCommandKind::Cas { .. }
             | ShardCommandKind::ApplyDurable { .. }
+            | ShardCommandKind::ApplyDurableTombstone { .. }
             | ShardCommandKind::RecordPromise { .. }
             | ShardCommandKind::RecordOwnerEpoch { .. }
             | ShardCommandKind::ReserveMinted { .. }) => self.execute_extra(extra),
@@ -226,6 +227,18 @@ impl ShardState {
                 let result = self
                     .actor
                     .apply_durable(&key, expected, value, ttl, stamp, &mut self.store)
+                    .map_err(ShardError::from);
+                drop(reply.send(result));
+            }
+            ShardCommandKind::ApplyDurableTombstone {
+                key,
+                expected,
+                stamp,
+                reply,
+            } => {
+                let result = self
+                    .actor
+                    .apply_durable_tombstone(&key, expected, stamp, &mut self.store)
                     .map_err(ShardError::from);
                 drop(reply.send(result));
             }
@@ -478,6 +491,7 @@ mod boot_failure_tests {
                 id: 3,
                 kind: ShardCommandKind::Delete {
                     key: b"k".to_vec(),
+                    stamp: crate::sync::ballot::Stamp::bottom(),
                     reply: del_tx,
                 },
             });

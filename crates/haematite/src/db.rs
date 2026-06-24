@@ -320,6 +320,22 @@ impl Database {
             .map(|entry| entry.stamp().clone())
     }
 
+    /// Test-support (AA-3-4b): `Some(true)` if `key` is stored as a STAMPED
+    /// TOMBSTONE on this node, `Some(false)` if it is stored as a stamped value,
+    /// `None` if absent or stored without a stamp envelope. Reads the RAW stored
+    /// envelope so a test can prove a committed delete landed a tombstone (not a
+    /// removal) on a peer, and that R-TOMB kept it through a sweep.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn stored_is_tombstone_for_test(&self, key: &[u8]) -> Option<bool> {
+        let handle = self.router.handle_for(key)?;
+        let raw = handle.get_raw(key.to_vec(), self.timeout).ok()??;
+        crate::ttl::entry::StampedEntry::decode(&raw)
+            .ok()
+            .flatten()
+            .map(|entry| entry.is_tombstone())
+    }
+
     /// Test-support: read a shard's IN-MEMORY `live_epoch` (R-LE, AA-3-4a). This
     /// is `Ballot::bottom()` until a successful `acquire_shard` THIS lifetime, and
     /// is NEVER seeded from the disk-recovered `owner_epoch`.
@@ -336,6 +352,13 @@ impl Database {
     #[must_use]
     pub fn next_stamp_for_test(&self, shard_id: usize) -> crate::sync::Stamp {
         self.owner_stamps.peek_stamp(shard_id)
+    }
+
+    /// Draw the next commit stamp `(live_epoch, seq)` for a write to the shard
+    /// owning `key` (R-LE / R-SEQ). One atomic `seq` draw; `bottom` epoch until a
+    /// live election this lifetime. Used by the unified stamped write/delete paths.
+    pub(crate) fn next_stamp_for_key(&self, key: &[u8]) -> crate::sync::Stamp {
+        self.owner_stamps.next_stamp(self.shard_for(key))
     }
 
     fn require_distribution(&self) -> Result<&DistributionEndpoint, DatabaseError> {

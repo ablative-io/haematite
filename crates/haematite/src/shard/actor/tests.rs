@@ -93,7 +93,9 @@ fn put(handle: &ShardHandle, key: &[u8], value: &[u8]) -> Result<(), Box<dyn Err
 }
 
 fn delete(handle: &ShardHandle, key: &[u8]) -> Result<(), Box<dyn Error>> {
-    handle.delete(key.to_vec(), TIMEOUT)?;
+    // AA-3-4b: a delete is a stamped tombstone; this helper stamps `bottom`
+    // (single-node / un-elected), which still reads as absent.
+    handle.delete(key.to_vec(), crate::sync::ballot::Stamp::bottom(), TIMEOUT)?;
     Ok(())
 }
 
@@ -176,11 +178,15 @@ fn put_and_delete_ack_after_wal_append_without_tree_mutation() -> Result<(), Box
 
     delete(handle, b"event")?;
     assert_eq!(get(handle, b"event")?, None);
+    // ASSERTION CHANGED (AA-3-4b): a delete writes a STAMPED TOMBSTONE — a `Put` of
+    // the tombstone envelope (`bottom` stamp here), NOT a bare `WalEntry::delete`.
+    let tombstone =
+        crate::ttl::entry::encode_stamped_tombstone(crate::sync::ballot::Stamp::bottom());
     assert_eq!(
         DurableWal::read_file(&shard.wal_path)?.entries(),
         &[
             crate::wal::WalEntry::put(b"event".to_vec(), b"payload".to_vec()),
-            crate::wal::WalEntry::delete(b"event".to_vec()),
+            crate::wal::WalEntry::put(b"event".to_vec(), tombstone),
         ]
     );
     scheduler.shutdown();

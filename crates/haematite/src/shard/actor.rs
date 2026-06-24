@@ -16,7 +16,9 @@ use crate::branch::current_timestamp;
 use crate::store::NodeStore;
 use crate::sync::ballot::{Ballot, Stamp};
 use crate::tree::{Cursor, Hash, LeafNode, Node, batch_mutate};
-use crate::ttl::entry::{encode_optional_ttl, encode_stamped_optional_ttl};
+use crate::ttl::entry::{
+    StampedEntry, encode_optional_ttl, encode_stamped_optional_ttl, encode_stamped_tombstone,
+};
 use crate::ttl::filter::{Visibility, is_expired_at, visible_value};
 use crate::wal::{
     DurableWal, LookupResult, Mutation, PromiseRecord, RecoveredWal, WalBuffer, WalError,
@@ -46,6 +48,16 @@ pub struct ShardActor {
     promised: Ballot,
     owner_epoch: Option<Ballot>,
     persisted_max_minted: u64,
+}
+
+/// What a durable apply writes: a stamped value (with TTL) or a stamped tombstone
+/// (AA-3-4b). Both go through the SAME fence + CAS + commit core.
+enum ApplyKind {
+    Value {
+        value: Vec<u8>,
+        ttl: Option<Duration>,
+    },
+    Tombstone,
 }
 
 /// Outcome of [`ShardActor::record_promise`]: a Prepare promise is durably
@@ -163,27 +175,52 @@ impl ShardActor {
         Ok(())
     }
 
-    /// Append a delete to the durable WAL, then buffer it for a future tree commit.
-    pub fn delete<K>(&mut self, key: K) -> Result<(), WalError>
+    /// Append a STAMPED TOMBSTONE delete to the durable WAL, then buffer it for a
+    /// future tree commit (AA-3-4b).
+    ///
+    /// A delete is unified into the one stamped write path: instead of a bare
+    /// key-removal (`Mutation::Delete`), it stores a tombstone-kind stamped entry
+    /// (`Mutation::Put` of the tombstone envelope) carrying `stamp`. The tombstone
+    /// reads as ABSENT (`get` → `None`), so single-node read-after-delete is
+    /// unchanged, but the delete is now a comparable, mergeable, stamped entry
+    /// that PERSISTS in the tree — never a removal that the §2.4 merge could
+    /// resurrect from a lagging node.
+    pub fn delete<K>(&mut self, key: K, stamp: Stamp) -> Result<(), WalError>
     where
         K: Into<Vec<u8>>,
     {
         let key = key.into();
-        let mutation = Mutation::Delete { key: key.clone() };
-        self.wal.append_mutation(&mutation)?;
-        self.buffer.delete(key);
-        Ok(())
+        let encoded = encode_stamped_tombstone(stamp);
+        self.put_encoded(key, encoded)
     }
 
-    /// Delete `key` only if its current stored value is present and expired now,
-    /// re-checking the live buffer+tree inside the actor's single-threaded slice.
+    /// Physically reclaim `key` from this shard's TTL sweep ONLY if its current
+    /// stored value is present and expired now, re-checking the live buffer+tree
+    /// inside the actor's single-threaded slice.
     ///
     /// The sweep computes its candidate set from an independent store+WAL
     /// snapshot; re-checking here closes the window in which a concurrent refresh
     /// (a fresh `put` landing between the snapshot and this delete) would be
-    /// clobbered by an unconditional delete. Expiry is evaluated against the raw
+    /// clobbered by an unconditional removal. Expiry is evaluated against the raw
     /// stored bytes (not the read-filtered view) at the current clock. Returns
-    /// whether a delete was issued.
+    /// whether a removal was issued.
+    ///
+    /// # R-TOMB — tombstones are immortal; the sweep MUST skip them.
+    ///
+    /// A stamped tombstone (AA-3-4b) is NOT "expired data" to reclaim: removing it
+    /// would, after the §2.4 union merge, RESURRECT a committed delete by making
+    /// the deleting node indistinguishable from one that never wrote the key. This
+    /// guard returns `false` for any tombstone REGARDLESS of clock, so the sweep
+    /// can never physically remove one. (`is_expired_at` already returns `false`
+    /// for a tombstone — it has no TTL — but this explicit guard makes R-TOMB
+    /// load-bearing rather than incidental, and is asserted by a test.) Bounded
+    /// tombstone GC needs a future membership-wide low-water-mark (every node past
+    /// the tombstone's stamp) and is out of scope here.
+    ///
+    /// An actually-expired VALUE is reclaimed by a BARE buffer removal — a local
+    /// GC of deterministically-expired data, not a committed delete — so it does
+    /// not itself become a stamped tombstone (TTL expiry needs no replicated op,
+    /// §2.4).
     pub fn delete_if_expired<S>(&mut self, key: &[u8], store: &S) -> Result<bool, WalError>
     where
         S: NodeStore + ?Sized,
@@ -199,12 +236,34 @@ impl ShardActor {
         let Some(value) = current else {
             return Ok(false);
         };
+        // R-TOMB: a tombstone is never swept, at any clock. Decode the stamped
+        // envelope; if it is a tombstone, leave it (immortal). A decode error here
+        // is treated as "not a tombstone" and falls through to the expiry check.
+        if StampedEntry::decode(&value)
+            .map_err(tree_error)?
+            .is_some_and(|entry| entry.is_tombstone())
+        {
+            return Ok(false);
+        }
         if is_expired_at(&value, current_timestamp()).map_err(tree_error)? {
-            self.delete(key.to_vec())?;
+            // Local GC of an expired value: a bare removal, NOT a stamped delete.
+            self.buffer_remove(key.to_vec())?;
             Ok(true)
         } else {
             Ok(false)
         }
+    }
+
+    /// Append a bare key-removal to the WAL (first) and buffer (local TTL-sweep GC
+    /// only). This is NOT a committed delete: it carries no stamp and is used
+    /// solely to reclaim deterministically-expired values (§2.4 "physical sweep is
+    /// local GC"). User/replicated deletes go through [`Self::delete`] as
+    /// tombstones.
+    fn buffer_remove(&mut self, key: Vec<u8>) -> Result<(), WalError> {
+        let mutation = Mutation::Delete { key: key.clone() };
+        self.wal.append_mutation(&mutation)?;
+        self.buffer.delete(key);
+        Ok(())
     }
 
     /// Read through the recovered/live buffer first, then the committed tree.
@@ -440,6 +499,43 @@ impl ShardActor {
     where
         S: NodeStore + ?Sized,
     {
+        self.apply_durable_kind(key, expected, ApplyKind::Value { value, ttl }, stamp, store)
+    }
+
+    /// Conditionally + durably apply a stamped TOMBSTONE (AA-3-4b, §2.4).
+    ///
+    /// A delete travels through the SAME fence + CAS + stamp + commit machinery as
+    /// a put: the epoch fence runs first (a stale owner's delete is `Fenced`); the
+    /// CAS compares `expected` against the current LOGICAL value hash (so a delete
+    /// expecting the live value MATCHES, and a delete on an already-tombstoned key
+    /// — whose logical hash is `None` — matches only `expected = None`); on a match
+    /// a stamped tombstone is stored (a `Put` of the tombstone envelope) and
+    /// fsynced. The tombstone PERSISTS and reads as absent (R-TOMB).
+    fn apply_durable_tombstone<S>(
+        &mut self,
+        key: &[u8],
+        expected: Option<Hash>,
+        stamp: Stamp,
+        store: &mut S,
+    ) -> Result<(), HashCasError>
+    where
+        S: NodeStore + ?Sized,
+    {
+        self.apply_durable_kind(key, expected, ApplyKind::Tombstone, stamp, store)
+    }
+
+    /// Shared fence + CAS + stamped-commit core for a value or tombstone apply.
+    fn apply_durable_kind<S>(
+        &mut self,
+        key: &[u8],
+        expected: Option<Hash>,
+        kind: ApplyKind,
+        stamp: Stamp,
+        store: &mut S,
+    ) -> Result<(), HashCasError>
+    where
+        S: NodeStore + ?Sized,
+    {
         // --- Epoch fence (§2.3), BEFORE the CAS read, same actor slice. ---------
         // Reject a stale owner whose epoch is below what we have promised. We do
         // NOT raise `self.promised` on the accept path (R2): only `record_promise`
@@ -450,12 +546,20 @@ impl ShardActor {
                 attempted: stamp.epoch,
             });
         }
+        // CAS over the LOGICAL value hash (a tombstone reads as None, so this is
+        // the same identity for a put or a delete — the stamp/kind are never part
+        // of the CAS).
         let actual = self.current_value_hash(key, store)?;
         if actual != expected {
             return Err(HashCasError::HashMismatch { expected, actual });
         }
         let previous_buffer = self.buffer.clone();
-        let encoded = encode_stamped_optional_ttl(value, stamp, ttl).map_err(tree_error)?;
+        let encoded = match kind {
+            ApplyKind::Value { value, ttl } => {
+                encode_stamped_optional_ttl(value, stamp, ttl).map_err(tree_error)?
+            }
+            ApplyKind::Tombstone => encode_stamped_tombstone(stamp),
+        };
         self.buffer.put(key, encoded);
         match self.commit(store) {
             Ok(_root) => Ok(()),
@@ -707,6 +811,12 @@ mod storage_tests {
         Ok(store.put(&Node::Leaf(leaf)))
     }
 
+    fn test_stamp(counter: u64, node: &str, seq: u64) -> crate::sync::ballot::Stamp {
+        use crate::sync::ballot::{Ballot, Stamp};
+        use crate::sync::topology::SyncNodeId;
+        Stamp::new(Ballot::new(counter, SyncNodeId::new(node)), seq)
+    }
+
     #[test]
     fn put_returns_ok_only_after_entry_is_written_to_wal() -> Result<(), WalError> {
         let temp = temp_path("actor-put.wal")?;
@@ -727,20 +837,36 @@ mod storage_tests {
         Ok(())
     }
 
+    /// AA-3-4b: a delete is now a STAMPED TOMBSTONE, not a bare key-removal. The
+    /// WAL entry is a `Put` of the tombstone envelope (ASSERTION CHANGED from the
+    /// pre-3-4b `WalEntry::delete`), the buffer holds a buffered VALUE (the
+    /// tombstone bytes), and yet the key reads as absent (`get` → `None`). The
+    /// tombstone persists in the tree — that is the whole point: a delete is a
+    /// comparable, mergeable entry the §2.4 merge cannot resurrect.
     #[test]
-    fn delete_returns_ok_only_after_entry_is_written_to_wal() -> Result<(), WalError> {
+    fn delete_writes_a_stamped_tombstone_to_wal_and_reads_as_absent() -> Result<(), WalError> {
         let temp = temp_path("actor-delete.wal")?;
         let path = temp.path();
         let wal = DurableWal::new(path, FsyncPolicy::CommitOnly)?;
         let mut actor = ShardActor::new(wal);
+        let store = MemoryStore::new();
 
-        actor.delete(b"event".to_vec())?;
+        let stamp = test_stamp(2, "owner", 0);
+        actor.delete(b"event".to_vec(), stamp.clone())?;
 
-        assert_eq!(actor.buffer().get(b"event"), LookupResult::BufferedDelete);
+        // The buffered entry is the tombstone envelope (a Put), and the WAL holds
+        // that same Put — NOT a bare delete.
+        let tombstone = crate::ttl::entry::encode_stamped_tombstone(stamp);
+        assert_eq!(
+            actor.buffer().get(b"event"),
+            LookupResult::BufferedValue(tombstone.clone())
+        );
         assert_eq!(
             DurableWal::read_file(path)?.entries(),
-            &[WalEntry::delete(b"event".to_vec())]
+            &[WalEntry::put(b"event".to_vec(), tombstone)]
         );
+        // It reads as absent (read-after-delete unchanged).
+        assert_eq!(actor.get(b"event", &store)?, None);
         Ok(())
     }
 
@@ -773,6 +899,55 @@ mod storage_tests {
         Ok(())
     }
 
+    /// AA-3-4b R-TOMB GATE: the TTL sweep MUST NEVER physically remove a tombstone,
+    /// at ANY clock — a swept tombstone is indistinguishable from never-written and
+    /// would resurrect a committed delete on the next §2.4 merge. Drive the sweep
+    /// against a tombstone and assert it stays put (still a tombstone in storage,
+    /// stamp intact), while an actually-expired VALUE alongside it IS swept.
+    #[test]
+    fn r_tomb_sweep_never_removes_a_tombstone() -> Result<(), WalError> {
+        let temp = temp_path("actor-rtomb.wal")?;
+        let wal = DurableWal::new(temp.path(), FsyncPolicy::CommitOnly)?;
+        let mut actor = ShardActor::new(wal);
+        let store = MemoryStore::new();
+
+        // A committed delete: a stamped tombstone under some epoch.
+        let stamp = test_stamp(5, "owner", 9);
+        actor.delete(b"tomb".to_vec(), stamp.clone())?;
+        assert_eq!(actor.get(b"tomb", &store)?, None, "tombstone reads as None");
+
+        // Drive the sweep over the tombstone: it must NOT be removed (R-TOMB),
+        // regardless of the clock — a tombstone has no TTL and is immortal.
+        assert!(
+            !actor.delete_if_expired(b"tomb", &store)?,
+            "R-TOMB: the sweep must NEVER remove a tombstone"
+        );
+
+        // The tombstone entry is STILL PRESENT in storage with its stamp intact.
+        let raw = actor
+            .get_raw(b"tomb", &store)?
+            .ok_or_else(|| WalError::TreeError("tombstone vanished from storage".to_owned()))?;
+        let decoded = crate::ttl::entry::StampedEntry::decode(&raw)
+            .map_err(|error| WalError::TreeError(error.to_string()))?
+            .ok_or_else(|| WalError::TreeError("tombstone is not a stamped entry".to_owned()))?;
+        assert!(decoded.is_tombstone(), "the swept-over entry is still a tombstone");
+        assert_eq!(decoded.stamp(), &stamp, "the tombstone's stamp is intact after the sweep");
+        assert_eq!(actor.get(b"tomb", &store)?, None, "still reads as None");
+
+        // CONTRAST — an actually-expired VALUE alongside it IS swept (local GC).
+        actor.put_with_ttl(
+            b"expired".to_vec(),
+            b"stale".to_vec(),
+            Some(std::time::Duration::ZERO),
+        )?;
+        assert!(
+            actor.delete_if_expired(b"expired", &store)?,
+            "an actually-expired value is still swept"
+        );
+        assert_eq!(actor.get(b"expired", &store)?, None);
+        Ok(())
+    }
+
     #[test]
     fn from_recovered_accepts_put_get_delete_and_appends_after_replayed_entries()
     -> Result<(), WalError> {
@@ -791,16 +966,21 @@ mod storage_tests {
         assert_eq!(actor.committed_root(), Some(committed_root));
         assert_eq!(actor.get(b"replayed", &store)?, Some(b"before".to_vec()));
         actor.put(b"new".to_vec(), b"after".to_vec())?;
-        actor.delete(b"replayed".to_vec())?;
+        // AA-3-4b: a delete is a stamped tombstone (a Put of the tombstone
+        // envelope), so the recovered WAL shows that Put, not a bare delete. The
+        // key still reads as absent.
+        let stamp = test_stamp(1, "owner", 0);
+        actor.delete(b"replayed".to_vec(), stamp.clone())?;
 
         assert_eq!(actor.get(b"new", &store)?, Some(b"after".to_vec()));
         assert_eq!(actor.get(b"replayed", &store)?, None);
+        let tombstone = crate::ttl::entry::encode_stamped_tombstone(stamp);
         assert_eq!(
             DurableWal::read_file(temp.path())?.entries(),
             &[
                 WalEntry::put(b"replayed".to_vec(), b"before".to_vec()),
                 WalEntry::put(b"new".to_vec(), b"after".to_vec()),
-                WalEntry::delete(b"replayed".to_vec()),
+                WalEntry::put(b"replayed".to_vec(), tombstone),
             ]
         );
         Ok(())

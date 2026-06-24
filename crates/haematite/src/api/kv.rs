@@ -100,13 +100,23 @@ impl Database {
         wait_for_consistency(consistency)
     }
 
-    /// Append a single-key tombstone to the owning shard's durable WAL and live
-    /// WAL buffer.
+    /// Append a single-key STAMPED TOMBSTONE to the owning shard's durable WAL and
+    /// live WAL buffer (AA-3-4b).
+    ///
+    /// A delete is unified into the one stamped write path: it stores a tombstone
+    /// (a comparable, mergeable, stamped entry that reads as absent), NOT a bare
+    /// key-removal. Single-node read-after-delete is unchanged (the key reads as
+    /// `None`), but the delete now persists in the tree so the §2.4 union merge can
+    /// never resurrect it from a lagging node. The stamp is drawn from this shard's
+    /// in-memory serve-authority exactly like a put (R-LE / R-SEQ); with no live
+    /// election it is `(bottom, seq)` (single-node / 2a-compat). For a quorum-
+    /// replicated, fenced delete use [`Self::replicate_delete`].
     ///
     /// This does not flush to the tree; [`Self::commit`] owns that boundary.
     pub fn delete(&self, key: KvKey) -> Result<(), DatabaseError> {
+        let stamp = self.next_stamp_for_key(&key);
         self.handle_for(&key)?
-            .delete(key, self.timeout())
+            .delete(key, stamp, self.timeout())
             .map_err(map_shard_error)
     }
 
@@ -260,12 +270,14 @@ mod tests {
         assert_eq!(contents.entries()[0].operation_type(), OperationType::Put);
         assert_eq!(contents.entries()[0].key(), key.as_slice());
         assert_eq!(contents.entries()[0].value(), Some(b"live".as_slice()));
-        assert_eq!(
-            contents.entries()[1].operation_type(),
-            OperationType::Delete
-        );
+        // ASSERTION CHANGED (AA-3-4b): a delete is now a STAMPED TOMBSTONE — a
+        // `Put` of the tombstone envelope, NOT a bare `OperationType::Delete`. The
+        // tombstone is a stamped entry (magic `HMSTMP01`), reads as absent, and
+        // survives reopen as a committed delete (mergeable, never resurrected).
+        assert_eq!(contents.entries()[1].operation_type(), OperationType::Put);
         assert_eq!(contents.entries()[1].key(), key.as_slice());
-        assert_eq!(contents.entries()[1].value(), None);
+        let tombstone = contents.entries()[1].value().ok_or("tombstone is a Put")?;
+        assert!(tombstone.starts_with(b"HMSTMP01"), "delete stores a stamped tombstone");
 
         let reopened = Database::open(&data_dir)?;
         assert_eq!(reopened.get(&key)?, None);
