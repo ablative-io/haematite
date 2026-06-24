@@ -15,7 +15,9 @@ pub use consistency::{
     StrongConsistency, execute_with_consistency, quorum_size, wait_for_cas_quorum,
     wait_for_cas_quorum_from_receiver, wait_for_quorum, wait_for_quorum_from_receiver,
 };
-pub use endpoint::{DistributionEndpoint, InboundSync};
+pub use endpoint::{
+    DistributionEndpoint, ElectionError, ElectionOutcome, ElectionVote, InboundSync,
+};
 pub use membership::{WriteMembership, resolve_membership};
 pub use merge::{SyncMergeError, SyncMergeResult, SyncMergeRoots, merge_synced_roots};
 pub use protocol::{

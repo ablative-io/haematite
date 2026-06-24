@@ -27,7 +27,7 @@ use crate::tree::{Hash, TreeError};
 use crate::wal::WalError;
 
 use super::native::{self, ShardNativeHandler};
-use super::RecordPromiseOutcome;
+use super::{PromiseState, RecordPromiseOutcome};
 
 /// Name of the wake atom pushed into the shard process mailbox. The handler
 /// never inspects it — one mailbox token corresponds to one queued command — so
@@ -222,6 +222,9 @@ pub(super) enum ShardCommandKind {
     ReserveMinted {
         counter: u64,
         reply: SyncSender<Result<u64, ShardError>>,
+    },
+    ReadPromiseState {
+        reply: SyncSender<Result<PromiseState, ShardError>>,
     },
     ScanSequences {
         reply: ScanReply,
@@ -561,6 +564,19 @@ impl ShardHandle {
     pub fn reserve_minted(&self, counter: u64, timeout: Duration) -> Result<u64, ShardError> {
         let (reply, response) = mpsc::sync_channel(1);
         self.enqueue(ShardCommandKind::ReserveMinted { counter, reply })?;
+        recv(&response, self.pid, timeout)?
+    }
+
+    /// Snapshot this shard's election-relevant state in one in-slice read
+    /// (AA-3-2): `(promised, owner_epoch, persisted_max_minted, committed_root)`.
+    /// The candidate reads this to compute its mint floor (§2.2 step 1); the
+    /// acceptor reads it to populate a Promise's `accepted_epoch`/`committed_root`.
+    ///
+    /// # Errors
+    /// Returns a [`ShardError`] as for [`Self::get`].
+    pub fn read_promise_state(&self, timeout: Duration) -> Result<PromiseState, ShardError> {
+        let (reply, response) = mpsc::sync_channel(1);
+        self.enqueue(ShardCommandKind::ReadPromiseState { reply })?;
         recv(&response, self.pid, timeout)?
     }
 

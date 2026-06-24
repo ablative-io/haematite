@@ -41,6 +41,16 @@ pub enum DatabaseError {
     /// local CAS can never mismatch, so this only ever surfaces a genuine local
     /// storage/IO fault.
     LocalCommitFailed(String),
+    /// An [`crate::db::Database::acquire_shard`] election lost: a strictly higher
+    /// ballot was promised elsewhere on every attempt. The candidate is NOT the
+    /// owner and recorded no `owner_epoch`. Carries the highest competing counter
+    /// seen so a caller could retry above it later. This is a clean, safe loss —
+    /// the unique-ballot / majority invariants were never relaxed.
+    ElectionLost { highest_seen: u64 },
+    /// An [`crate::db::Database::acquire_shard`] election could not collect a
+    /// majority of promises within the timeout on any attempt (e.g. a minority of
+    /// nodes was reachable). The candidate is NOT the owner — never a false win.
+    ElectionTimeout { attempts: u32 },
 }
 
 impl fmt::Display for DatabaseError {
@@ -100,6 +110,14 @@ impl fmt::Display for DatabaseError {
                 formatter,
                 "replicated write reached quorum but local durable commit failed: {message}"
             ),
+            Self::ElectionLost { highest_seen } => write!(
+                formatter,
+                "shard election lost: a higher ballot (counter {highest_seen}) was promised elsewhere"
+            ),
+            Self::ElectionTimeout { attempts } => write!(
+                formatter,
+                "shard election timed out without a majority after {attempts} attempts"
+            ),
         }
     }
 }
@@ -127,7 +145,9 @@ impl std::error::Error for DatabaseError {
             | Self::CasMismatch { .. }
             | Self::ConsistencyError(_)
             | Self::Distribution(_)
-            | Self::LocalCommitFailed(_) => None,
+            | Self::LocalCommitFailed(_)
+            | Self::ElectionLost { .. }
+            | Self::ElectionTimeout { .. } => None,
         }
     }
 }

@@ -282,6 +282,21 @@ impl Database {
         }
     }
 
+    /// Test-support: read a shard's current durably-`promised` ballot (AA-3-2).
+    ///
+    /// Used by the election e2e tests to assert the swing voter's monotonic
+    /// `promised` reflects the MAX winner (the single-live-owner invariant). Not
+    /// part of the production API.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn promised_ballot_for_test(&self, shard_id: usize) -> Option<crate::sync::Ballot> {
+        let handle = self.router.handle_for_shard(shard_id)?;
+        handle
+            .read_promise_state(self.timeout)
+            .ok()
+            .map(|state| state.promised)
+    }
+
     fn require_distribution(&self) -> Result<&DistributionEndpoint, DatabaseError> {
         self.distribution
             .as_ref()
@@ -321,6 +336,17 @@ impl Database {
     pub(crate) fn handle_for(&self, key: &[u8]) -> Result<&ShardHandle, DatabaseError> {
         self.router
             .handle_for(key)
+            .ok_or(DatabaseError::InvalidShardCount)
+    }
+
+    /// Route to a shard by its index (AA-3-2 election routing). A `Prepare`/
+    /// `acquire_shard` names the shard directly, so it bypasses key-hash routing.
+    pub(crate) fn handle_for_shard(
+        &self,
+        shard_id: usize,
+    ) -> Result<&ShardHandle, DatabaseError> {
+        self.router
+            .handle_for_shard(shard_id)
             .ok_or(DatabaseError::InvalidShardCount)
     }
 

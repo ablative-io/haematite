@@ -10,7 +10,7 @@ use std::sync::mpsc::SyncSender;
 use crate::tree::Hash;
 
 use super::handle::{RangeItem, ScanReply, ShardCommand, ShardCommandKind, ShardError};
-use super::RecordPromiseOutcome;
+use super::{PromiseState, RecordPromiseOutcome};
 
 /// Reply to a queued command with a startup error so its caller fails fast.
 pub(super) fn reply_startup_error(command: ShardCommand, message: &str) {
@@ -30,6 +30,7 @@ pub(super) fn reply_startup_error(command: ShardCommand, message: &str) {
         ShardCommandKind::ReadValue { reply, .. } => send_read_value(&reply, error),
         ShardCommandKind::RecordPromise { reply, .. } => send_promise(&reply, error),
         ShardCommandKind::ReserveMinted { reply, .. } => send_reserved(&reply, error),
+        ShardCommandKind::ReadPromiseState { reply } => send_promise_state(&reply, error),
         ShardCommandKind::ScanSequences { reply } => send_scan(&reply, error),
     }
 }
@@ -74,5 +75,9 @@ fn send_promise(
 }
 
 fn send_reserved(reply: &SyncSender<Result<u64, ShardError>>, error: ShardError) {
+    drop(reply.send(Err(error)));
+}
+
+fn send_promise_state(reply: &SyncSender<Result<PromiseState, ShardError>>, error: ShardError) {
     drop(reply.send(Err(error)));
 }

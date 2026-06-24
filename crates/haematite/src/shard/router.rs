@@ -31,6 +31,13 @@ impl ShardRouter {
         self.handles.get(self.shard_for(key))
     }
 
+    /// Route directly to a shard by its index (AA-3-2 election: a `Prepare`
+    /// carries the target shard index, not a key, so the acceptor must select the
+    /// owning shard by id rather than by hashing a key).
+    pub(crate) fn handle_for_shard(&self, shard_id: usize) -> Option<&ShardHandle> {
+        self.handles.get(shard_id)
+    }
+
     pub(crate) fn handles_in_order(&self) -> &[ShardHandle] {
         &self.handles
     }

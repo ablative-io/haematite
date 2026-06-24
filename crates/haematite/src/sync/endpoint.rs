@@ -47,16 +47,20 @@ use dashmap::DashMap;
 use tokio::runtime::{Builder, Handle, Runtime};
 
 use crate::api::kv::{KvKey, KvValue};
+use crate::branch::ShardId;
 use crate::sync::SyncNodeId;
+use crate::sync::ballot::Ballot;
 use crate::sync::consistency::{
-    CasVote, ConsistencyError, QuorumOutcome, StrongConsistency, wait_for_cas_quorum_from_receiver,
+    CasVote, ConsistencyError, QuorumOutcome, StrongConsistency, quorum_size,
+    wait_for_cas_quorum_from_receiver,
 };
 use crate::sync::membership::WriteMembership;
 use crate::tree::Hash;
 
 use super::protocol::{
-    AckOutcome, RejectReason, SyncError, SyncMessage, WriteAck, WriteId, WriteProposal,
-    encode_beamr_sync_frame, register_beamr_sync_handler, send_sync_message_via_beamr,
+    AckOutcome, Nack, Prepare, Promise, RejectReason, SyncError, SyncMessage, WriteAck, WriteId,
+    WriteProposal, encode_beamr_sync_frame, register_beamr_sync_handler,
+    send_sync_message_via_beamr,
 };
 
 /// Writer-side correlation registry: in-flight `WriteId` → the channel that the
@@ -72,6 +76,84 @@ use super::protocol::{
 /// recovery dance. The value channel is an `mpsc::Sender<CasVote<SyncNodeId>>`
 /// (the blocking primitive `wait_for_cas_quorum_from_receiver` consumes).
 type WriteRegistry = Arc<DashMap<WriteId, Sender<CasVote<SyncNodeId>>>>;
+
+/// Election-side correlation registry: an in-flight `AcquireShard` keyed by the
+/// shard under election → the channel its blocked coordinator collects votes on.
+///
+/// Keyed by `ShardId` alone (NOT by ballot): a single endpoint runs at most ONE
+/// `acquire_shard` for a given shard at a time (the coordinator blocks), so the
+/// shard id uniquely identifies the in-flight election. This is what lets a `Nack`
+/// — which carries only the promiser's `promised` ballot, never the candidate's —
+/// be routed back to the right coordinator. The coordinator re-checks each
+/// `Promise.ballot == my_ballot` itself (a stale Promise for a prior attempt is
+/// ignored), so keying by shard id never misattributes a vote. Mirrors
+/// [`WriteRegistry`]: a `DashMap` for poison-free concurrent access between the
+/// async read loop (routing votes) and the blocking coordinator (registering).
+type ElectionRegistry = Arc<DashMap<ShardId, Sender<ElectionVote>>>;
+
+/// One inbound reply to a `Prepare` round, routed to the waiting coordinator.
+#[derive(Debug, Clone)]
+pub enum ElectionVote {
+    /// A node promised the candidate's ballot (carries its accepted epoch +
+    /// committed root for handoff state-sync, §2.4).
+    Promised(Promise),
+    /// A node refused, surfacing the higher ballot it has already `promised`.
+    Nacked(Nack),
+}
+
+/// The result of a won `AcquireShard` election (§2.2 step 4).
+///
+/// Carries the won `ballot` (= the owner epoch) and the majority of `Promise`s
+/// that elected it. The promises are retained so increment 3-4 can pick the
+/// most-advanced `committed_root` among them and state-sync before serving.
+#[derive(Debug, Clone)]
+pub struct ElectionOutcome {
+    /// The ballot the candidate won under; this IS the per-shard owner epoch.
+    pub ballot: Ballot,
+    /// The collected majority of promises (including the candidate's self-promise,
+    /// recorded as a synthetic `Promise` from the local node). At least
+    /// `quorum_size(total_nodes)` entries.
+    pub promises: Vec<Promise>,
+}
+
+/// Why an `AcquireShard` election did not win (§2.2 step 4 loss arms).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ElectionError {
+    /// A node Nack'd with a strictly higher `promised` ballot, OR the timeout
+    /// elapsed before a majority of promises arrived, on EVERY retry attempt. This
+    /// is a clean liveness loss (the safety invariants were never relaxed to get
+    /// here); the highest competing ballot seen is surfaced so a caller can choose
+    /// to retry above it later.
+    Lost { highest_seen: Ballot },
+    /// The election could not reach a majority before the deadline and saw no
+    /// higher competing ballot (e.g. a minority of nodes was reachable).
+    Timeout { required: usize, promised_votes: usize },
+    /// A local precondition failed (no transport, blocking call from inside the
+    /// runtime, or a quorum-size computation error). Distinct from a clean
+    /// election loss — nothing about the cluster's ballots was learned.
+    Transport(String),
+}
+
+impl std::fmt::Display for ElectionError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Lost { highest_seen } => write!(
+                formatter,
+                "election lost: a higher ballot {highest_seen:?} was promised elsewhere"
+            ),
+            Self::Timeout {
+                required,
+                promised_votes,
+            } => write!(
+                formatter,
+                "election timed out: required {required} promises, collected {promised_votes}"
+            ),
+            Self::Transport(message) => write!(formatter, "election transport error: {message}"),
+        }
+    }
+}
+
+impl std::error::Error for ElectionError {}
 
 /// Default authentication cookie shared across a haematite cluster's links.
 ///
@@ -158,6 +240,9 @@ pub struct DistributionEndpoint {
     write_counter: AtomicU64,
     /// Writer-side correlation registry shared with the inbound `WriteAck` router.
     registry: WriteRegistry,
+    /// Election-side correlation registry shared with the inbound `Promise`/`Nack`
+    /// router (AA-3-2).
+    elections: ElectionRegistry,
 }
 
 impl std::fmt::Debug for DistributionEndpoint {
@@ -218,7 +303,14 @@ impl DistributionEndpoint {
 
         let (tx, inbound) = mpsc::channel::<InboundSync>();
         let registry: WriteRegistry = Arc::new(DashMap::new());
-        register_inbound_drain(&manager, tx, Arc::clone(&registry), local_creation);
+        let elections: ElectionRegistry = Arc::new(DashMap::new());
+        register_inbound_drain(
+            &manager,
+            tx,
+            Arc::clone(&registry),
+            Arc::clone(&elections),
+            local_creation,
+        );
 
         Ok(Self {
             atom_table,
@@ -232,6 +324,7 @@ impl DistributionEndpoint {
             local_creation,
             write_counter: AtomicU64::new(0),
             registry,
+            elections,
         })
     }
 
@@ -449,6 +542,98 @@ impl DistributionEndpoint {
         wait_for_cas_quorum_from_receiver(strong, &vote_rx)
     }
 
+    /// Run ONE Phase-1 Prepare round for `shard_id` at `ballot` and collect
+    /// promises to a strict majority of `membership.total_nodes` (§2.2 steps 2-4).
+    ///
+    /// This is the transport half of `AcquireShard`: the caller
+    /// ([`Database::acquire_shard`](crate::db::Database::acquire_shard)) has ALREADY
+    /// minted+fsync'd the ballot and recorded its own local self-promise (§2.2
+    /// steps 1-2); it passes that self-promise in as `self_promise`, counted as the
+    /// FIRST vote. We then:
+    ///
+    /// 1. register `shard_id → Sender<ElectionVote>` so the inbound `Promise`/`Nack`
+    ///    router feeds replies back (deregistered on EVERY exit by a drop guard);
+    /// 2. fire a `Prepare{shard_id, ballot}` at each reachable `send_target`
+    ///    (spawned onto the endpoint runtime, fire-and-forget — exactly like
+    ///    `propose_write`'s proposal sends);
+    /// 3. block collecting votes until a strict majority of promises (including the
+    ///    self-promise) is reached → win; or a deadline / higher-ballot loss.
+    ///
+    /// A `Promise` whose `ballot != ballot` (a stale reply for a different attempt)
+    /// is ignored. A `Nack` carrying a strictly higher `promised` records the
+    /// highest competing ballot so the caller can re-mint above it on retry. The
+    /// required majority is `quorum_size(total_nodes) = total/2 + 1` — the SAME
+    /// strict-majority denominator the write path uses, the load-bearing §4
+    /// intersection property.
+    ///
+    /// # Threading contract
+    /// BLOCKS the calling thread on the vote receiver, so it must run OUTSIDE any
+    /// tokio runtime (same guard as [`Self::propose_write`]); from within a runtime
+    /// it returns [`ElectionError::Transport`] rather than parking a worker.
+    pub fn run_prepare_round(
+        &self,
+        shard_id: ShardId,
+        ballot: &Ballot,
+        self_promise: Promise,
+        membership: &WriteMembership,
+        timeout: Duration,
+    ) -> Result<Vec<Promise>, ElectionError> {
+        // The coordinator BLOCKS; it must not run on a runtime worker.
+        if Handle::try_current().is_ok() {
+            return Err(ElectionError::Transport(
+                "acquire_shard blocked from inside the distribution runtime".to_owned(),
+            ));
+        }
+
+        let required = quorum_size(membership.total_nodes)
+            .map_err(|error| ElectionError::Transport(error.to_string()))?;
+
+        let (vote_tx, vote_rx) = mpsc::channel::<ElectionVote>();
+        // Only one election per shard per endpoint at a time; replace any stale
+        // entry. Deregister on EVERY exit so a late vote after return is dropped.
+        self.elections.insert(shard_id, vote_tx);
+        let _guard = ElectionGuard {
+            elections: &self.elections,
+            shard_id,
+        };
+
+        let handle = self
+            .runtime()
+            .map_err(|error| ElectionError::Transport(error.to_string()))?
+            .handle()
+            .clone();
+
+        // Frame the Prepare ONCE on this synchronous thread; a framing failure
+        // means the Prepare is unsendable — fail closed rather than self-elect.
+        let frame = encode_beamr_sync_frame(&SyncMessage::Prepare(Prepare {
+            shard_id,
+            ballot: ballot.clone(),
+        }))
+        .map_err(|error| ElectionError::Transport(error.to_string()))?;
+        let frame = Arc::new(frame);
+
+        // Step 3: fire a Prepare at every reachable peer (fire-and-forget onto the
+        // runtime, exactly like propose_write). A failed send is logged-and-ignored;
+        // the tally times out or loses if too few promises return.
+        for target in &membership.send_targets {
+            let manager = self.manager.clone();
+            let remote = self.atom_table.intern(target.as_str());
+            let frame = Arc::clone(&frame);
+            handle.spawn(async move {
+                match manager.get_connection(remote) {
+                    Some(connection) => {
+                        if let Err(error) = connection.write_raw(frame.as_slice()).await {
+                            log::warn!("prepare send failed: {error}");
+                        }
+                    }
+                    None => log::warn!("prepare send target unreachable"),
+                }
+            });
+        }
+
+        collect_prepare_votes(ballot, required, self_promise, &vote_rx, timeout)
+    }
+
     /// Block until an inbound sync message arrives or `timeout` elapses.
     ///
     /// Returns `Ok(Some(_))` with the decoded message (or a decode error),
@@ -538,6 +723,115 @@ impl Drop for RegistryGuard<'_> {
     }
 }
 
+/// Deregisters an in-flight election (by shard id) from the election registry on
+/// drop. Held by [`DistributionEndpoint::run_prepare_round`] so EVERY exit path —
+/// win, loss, timeout, early return, or panic — removes the entry; a late vote
+/// arriving after the coordinator returned is then dropped by the inbound router.
+struct ElectionGuard<'registry> {
+    elections: &'registry ElectionRegistry,
+    shard_id: ShardId,
+}
+
+impl Drop for ElectionGuard<'_> {
+    fn drop(&mut self) {
+        self.elections.remove(&self.shard_id);
+    }
+}
+
+/// Tally Prepare-round votes until a strict majority of promises is reached, the
+/// deadline elapses, or a higher competing ballot is learned (§2.2 step 4).
+///
+/// Counting rules, exactly:
+/// * `self_promise` is the candidate's own durably-recorded promise (§2.2 step 2),
+///   counted as the FIRST promise — it is part of full membership and one of the
+///   quorum. So `promises` starts at `[self_promise]` and `granted` at 1.
+/// * A `Promise` is counted ONLY if `promise.ballot == ballot` (a stale Promise
+///   for a prior attempt is ignored) AND its `promiser` has not already promised
+///   (dedup by the GRANTING node id so a duplicate frame cannot double-count). The
+///   `ballot` echoes the candidate's ballot, so `promiser` — not `ballot.node` —
+///   identifies who voted.
+/// * Reaching `required` distinct promises wins immediately.
+/// * A `Nack` with `nack.promised > ballot` (or any promise/nack carrying a higher
+///   ballot) updates `highest_seen`; it never decreases the promise count, but on
+///   timeout it turns the loss into [`ElectionError::Lost`] rather than
+///   [`ElectionError::Timeout`], so the caller knows to re-mint strictly above it.
+fn collect_prepare_votes(
+    ballot: &Ballot,
+    required: usize,
+    self_promise: Promise,
+    receiver: &Receiver<ElectionVote>,
+    timeout: Duration,
+) -> Result<Vec<Promise>, ElectionError> {
+    use std::collections::HashSet;
+    use std::time::Instant;
+
+    let mut promised_nodes: HashSet<SyncNodeId> = HashSet::new();
+    // Seed the dedup set with the self-promise's PROMISER (the local node), so the
+    // candidate's own vote is counted exactly once and a peer that happens to share
+    // no id with it is counted separately.
+    promised_nodes.insert(self_promise.promiser.clone());
+    let mut promises = vec![self_promise];
+    let mut highest_seen = ballot.clone();
+
+    if promises.len() >= required {
+        return Ok(promises);
+    }
+
+    let deadline = Instant::now() + timeout;
+    loop {
+        let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
+            return Err(finish_loss(required, promises.len(), ballot, &highest_seen));
+        };
+
+        match receiver.recv_timeout(remaining) {
+            Ok(ElectionVote::Promised(promise)) => {
+                // Ignore a stale Promise for a different (prior) ballot attempt.
+                if &promise.ballot != ballot {
+                    if promise.ballot > highest_seen {
+                        highest_seen = promise.ballot.clone();
+                    }
+                    continue;
+                }
+                if promised_nodes.insert(promise.promiser.clone()) {
+                    promises.push(promise);
+                    if promises.len() >= required {
+                        return Ok(promises);
+                    }
+                }
+            }
+            Ok(ElectionVote::Nacked(nack)) => {
+                if nack.promised > highest_seen {
+                    highest_seen = nack.promised;
+                }
+            }
+            Err(RecvTimeoutError::Timeout | RecvTimeoutError::Disconnected) => {
+                return Err(finish_loss(required, promises.len(), ballot, &highest_seen));
+            }
+        }
+    }
+}
+
+/// Classify a Prepare-round loss: if a strictly higher ballot was seen, this is a
+/// [`ElectionError::Lost`] (re-mint above `highest_seen`); otherwise a plain
+/// [`ElectionError::Timeout`] (too few nodes promised in time).
+fn finish_loss(
+    required: usize,
+    promised_votes: usize,
+    own_ballot: &Ballot,
+    highest_seen: &Ballot,
+) -> ElectionError {
+    if highest_seen > own_ballot {
+        ElectionError::Lost {
+            highest_seen: highest_seen.clone(),
+        }
+    } else {
+        ElectionError::Timeout {
+            required,
+            promised_votes,
+        }
+    }
+}
+
 /// Register the beamr control-frame handler that drains decoded sync messages.
 ///
 /// Inbound [`SyncMessage::WriteAck`] is ROUTED to the writer-side correlation
@@ -548,6 +842,7 @@ fn register_inbound_drain(
     manager: &ConnectionManager,
     sender: Sender<InboundSync>,
     registry: WriteRegistry,
+    elections: ElectionRegistry,
     local_creation: u32,
 ) {
     register_beamr_sync_handler(manager, move |decoded| {
@@ -555,13 +850,34 @@ fn register_inbound_drain(
         // non-blocking and safe to call from there.
         match decoded {
             Ok(SyncMessage::WriteAck(ack)) => route_write_ack(&registry, local_creation, &ack),
-            // Every OTHER variant (and decode errors) -> generic drain. A send
-            // error means the receiver was dropped (endpoint torn down).
+            // Promise/Nack are REPLIES to a local in-flight `acquire_shard`, routed
+            // to the election registry (not the generic drain). A `Prepare`, by
+            // contrast, is a REQUEST to act as an acceptor — it flows to the generic
+            // drain so the responder loop applies it via `handle_inbound_prepare`.
+            Ok(SyncMessage::Promise(promise)) => {
+                route_election_vote(&elections, promise.shard_id, ElectionVote::Promised(promise));
+            }
+            Ok(SyncMessage::Nack(nack)) => {
+                route_election_vote(&elections, nack.shard_id, ElectionVote::Nacked(nack));
+            }
+            // Every OTHER variant (Prepare, sync traffic, decode errors) -> generic
+            // drain. A send error means the receiver was dropped (endpoint torn down).
             other => {
                 let _ = sender.send(other);
             }
         }
     });
+}
+
+/// Route an inbound election reply (`Promise`/`Nack`) to the coordinator waiting
+/// on its shard. An unknown/expired shard key (the election already returned and
+/// deregistered) and a send onto a disconnected receiver are both dropped
+/// quietly — mirrors [`route_write_ack`]'s unknown-id handling.
+fn route_election_vote(elections: &ElectionRegistry, shard_id: ShardId, vote: ElectionVote) {
+    let Some(sender) = elections.get(&shard_id) else {
+        return;
+    };
+    let _ = sender.send(vote);
 }
 
 /// Route an inbound `WriteAck` to the coordinator waiting on its `write_id`.
