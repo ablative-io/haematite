@@ -32,6 +32,15 @@ pub enum DatabaseError {
     /// A live distribution-endpoint operation failed (no endpoint attached, a
     /// transport send/connect failure, or a disconnected inbound drain).
     Distribution(String),
+    /// A replicated write reached peer-quorum but the proposer could not durably
+    /// apply its OWN committed value locally (see [`crate::db::Database::replicate_write`]).
+    ///
+    /// This is reported, never swallowed: a committed write that is absent on its
+    /// own writer is a correctness hazard (it reopens the heal-mid-write
+    /// split-brain hole). Under single-owner-per-key (the step-3 epoch fence) the
+    /// local CAS can never mismatch, so this only ever surfaces a genuine local
+    /// storage/IO fault.
+    LocalCommitFailed(String),
 }
 
 impl fmt::Display for DatabaseError {
@@ -87,6 +96,10 @@ impl fmt::Display for DatabaseError {
             Self::Distribution(message) => {
                 write!(formatter, "distribution endpoint error: {message}")
             }
+            Self::LocalCommitFailed(message) => write!(
+                formatter,
+                "replicated write reached quorum but local durable commit failed: {message}"
+            ),
         }
     }
 }
@@ -113,7 +126,8 @@ impl std::error::Error for DatabaseError {
             | Self::SequenceConflict { .. }
             | Self::CasMismatch { .. }
             | Self::ConsistencyError(_)
-            | Self::Distribution(_) => None,
+            | Self::Distribution(_)
+            | Self::LocalCommitFailed(_) => None,
         }
     }
 }
