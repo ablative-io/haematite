@@ -243,49 +243,75 @@ bytes do not encode their CAS predecessor, so `v1` and `v2` are indistinguishabl
 `stamp = (epoch: Ballot, seq: u64)`:
 - `epoch` — the owner's ballot under which the write was made (already threaded on the write path by
   §2.3 / increment 3-3). Globally unique and monotonic across owners.
-- `seq` — the owner's **monotonic per-shard write counter**, durably persisted (same fsync discipline
-  as `persisted_max_minted`, §3) and advanced once per committed write. Orders writes *within* one
-  epoch (needed: two sequential same-key writes by one owner share an epoch and must still be
-  ordered).
+- `seq` — the owner's monotonic write counter for **its current serving epoch**, advanced once per
+  committed write. Orders writes *within* one epoch (needed: two sequential same-key writes by one
+  owner share an epoch and must still be ordered).
 
-`(epoch, seq)` is therefore **globally unique and totally ordered**, and — because the fence forces
-same-key commits into a CAS chain — the higher stamp on a key is always the chain *descendant*. The
-stamp is the minimal thing a replicated log would have given us (a total order on writes) **without**
-rebuilding haematite's state/CAS replication as a log.
+**`seq` is IN-MEMORY, reset to 0 per won election — it is NOT persisted (and must not be).** Persisting
+`seq` would mean an fsync on the hot write path; it is unnecessary because of the **serve-authority
+invariant**: a node may serve (write as owner) ONLY under an epoch it won via a *live* election in its
+current process lifetime. A recovered `owner_epoch` from disk does **not** authorize serving — a
+crashed/restarted owner must **re-acquire** (§2.2) before serving again, and re-acquisition yields a
+ballot strictly greater than any it ever minted (guaranteed by the already-durable
+`persisted_max_minted`, R4/§3). Therefore the new serving epoch `e''` strictly exceeds the pre-crash
+`e'`, so `(e'', 0)` cannot collide with any pre-crash `(e', k)` even though `seq` restarts at 0.
+Epoch-first ordering also means a fresh owner's very first write `(e'', 0)` dominates *every* prior
+write to a key — correct, since it CAS-derives from (caught up to) the prior tip. Net: `(epoch, seq)`
+is globally unique and totally ordered **with `seq` purely in-memory**, and — because the fence forces
+same-key commits into a CAS chain — the higher stamp on a key is always the chain *descendant*. This
+is the total order a replicated log would give, without rebuilding replication as a log.
+
+**Deletes and TTL are UNIFIED into the one fenced/stamped path (no second write path).** A `delete`
+is modelled as a **stamped tombstone** written through `replicate_write` exactly like a put: fenced
+(carries the owner epoch), CAS'd (`expected` = hash of the value being deleted), quorum-replicated,
+and **persisted in the tree as a stamped entry that reads as absent**. The CAS/`current_value_hash`
+stays over the *logical value* (a tombstone reads as `None`, so create-if-absent still matches) — so
+3-3's fence semantics are unchanged; the stamp + tombstone-kind are merge metadata stored alongside,
+NOT part of the CAS identity. The old local-only `delete` path (unfenced, unreplicated, bare
+key-removal) is **removed**. TTL-expiry needs no replicated op: expiry is deterministic and an expired
+entry reads as `None` everywhere; the merge operates on *stored stamped entries* (visibility applied
+at read), so a refresh-before-expiry (a higher-`seq` put) always wins over a stale value via the
+stamp, and physical sweep is local GC. This closes the review's delete/sweep gap at the root:
+**exactly one write path, every committed mutation stamped + fenced + replicated.**
 
 **Handoff = union + per-key max-stamp merge.** The new owner, after winning (§2.2) and before
 serving:
 
 1. Fetches the committed state of each promiser in its majority (reuse the existing pull/transfer
-   primitive — `find_missing_nodes` + the content-addressed apply path; this plumbing is sound, only
+   primitive — `find_missing_nodes` + the content-addressed apply path; that plumbing is sound, only
    the *adoption* logic changes).
-2. **Merges** them on the existing prolly-tree merge engine (`branch::merge`), with a **stamp-aware
-   resolver**: different keys **union**; the same key resolves to the entry with the **max
-   `(epoch, seq)`** (the chain tip). Adopts the merged root as its committed baseline, fsync'd.
-3. Recovers its own `seq` floor as `max(seq)` over the merged state, so its first writes continue the
-   counter monotonically. Only THEN begins serving ("elected but not live" until merge completes).
+2. **Merges** them with a **purpose-built, ancestor-free, 2-way union merge** (NOT
+   `branch::merge_with_report`, which is a *three-way* merge whose resolver only fires on mutual
+   divergence from a common ancestor and sees only value bytes — it cannot host this). The merge
+   reuses the lower-level prolly-tree node/range-iteration primitives but its own resolver: a key
+   present on one side only is **kept** (union); a key on both sides resolves to the entry with the
+   **max `(epoch, seq)`** (the chain tip), tombstones included (a tombstone can be the winning tip).
+   `max` over the total order `(epoch, seq)` is a commutative, associative, idempotent semilattice
+   join, so iterating the merge over >2 promisers is **order-independent** (no order-dependent root —
+   the trap haematite's prolly history was once bitten by). Adopt the merged root as the committed
+   baseline, fsync'd.
+3. Begin serving only AFTER the merge completes ("elected but not live" until then). `seq` starts at
+   0 for the new epoch (per the serve-authority invariant above — no recovery from merged data).
 
-**Why this loses no committed write (R5).** Each committed write is durable on a quorum; the promise
-majority intersects every such quorum; so for every committed key the chain-tip value is present on
-at least one promiser. Per-key max-stamp selects exactly that tip, and cross-key union keeps every
-key — so the merged state dominates **every** committed write across the majority, forks included.
-The argument quantifies over **committed** writes (§2.0); it never depends on roots being totally
-ordered.
+**Why this loses no committed write (R5).** Each committed write (put OR delete) is durable on a
+quorum; the promise majority intersects every such quorum; so for every committed key the chain-tip
+entry — value or tombstone — is present on at least one promiser. Per-key max-stamp selects exactly
+that tip, and cross-key union keeps every key, so the merged state dominates **every** committed
+mutation across the majority, forks and deletes included. Quantifies over **committed** writes (§2.0);
+never depends on roots being totally ordered.
 
 **In-doubt tails.** In-doubt writes (un-acked, §2.0) live in the WAL buffer *beyond* the committed
-root, so they are **not** part of any promiser's committed state and never enter the merge. They are
-not separately reconciled here; they converge via the new owner's subsequent epoch-stamped writes
-(the CAS+fence makes the majority uniform) and ordinary anti-entropy. Since no client was told they
-succeeded, this is correct — losing or converging an in-doubt write is always permitted.
+root, so they are not part of any promiser's committed state and never enter the merge. They converge
+via the new owner's subsequent epoch-stamped writes (CAS+fence make the majority uniform) and ordinary
+anti-entropy. Since no client was told they succeeded, losing or converging them is always permitted.
 
-**Reused vs. discarded from the first 3-4 attempt.** The pull/transport plumbing (the
-`ShardSyncRequest`/`PushResponse` round, `export_reachable`, the catch-up coordinator) is correct and
-kept. The **single-root `import_synced`/`become_live` adoption is discarded** and replaced by the
-stamp-aware union merge above.
+**Reused vs. discarded from the first 3-4 attempt.** The pull/transport plumbing
+(`ShardSyncRequest`/`PushResponse`, `export_reachable`, the catch-up coordinator) is correct and kept.
+The **single-root `import_synced`/`become_live` adoption is discarded** for the union merge above.
 
-**2b lands cleanly on top.** The "don't clobber run-history events" requirement (2b) becomes a
-*per-keyspace resolver swap*: for the run-history keyspace the merge **unions the values** instead of
-taking max-stamp. Same machinery; the general kv path stays max-stamp-correct regardless.
+**2b lands cleanly on top.** "Don't clobber run-history events" (2b) becomes a *per-keyspace resolver
+swap*: for the run-history keyspace the merge **unions the values** instead of taking max-stamp. Same
+machinery; the general kv path stays max-stamp-correct regardless.
 
 ### 2.5 Epoch-key exemption (avoid regress)
 
@@ -400,12 +426,20 @@ Same discipline as 2a. NEVER trust a green without my own adversarial read + re-
   of Promises with unique-ballot logic, Nack-driven retry/backoff. Reuse the 2a quorum tally shape.
 - **3-3 — Epoch fence in `apply_durable`**: the `< promised → Fenced` / `≥ → adopt+CAS` rule at
   `shard/actor.rs:331`, plumb `epoch` through `WriteProposal` and `replicate_write`.
-- **3-4 — Handoff reconciliation (REVISED, §2.4):** a **causal commit stamp** `(epoch, seq)` on every
-  committed write (durable `seq`, fsync-discipline of §3), and a **union + per-key max-stamp merge**
-  of the promise-majority committed states on `branch::merge` before serving. Keep the pull/transport
-  plumbing from the first attempt; **discard** single-root adoption. *Gate: a FORKED-committed-state
-  failover test — owner commits k2 to {A,C} and k3 to {A,B}, then a new owner over {B,C} must serve
-  BOTH (single-root adoption fails this).*
+- **3-4 — Unified stamped write path + handoff merge (REVISED, §2.4).** Sub-increments:
+  - **3-4a — Commit stamp.** `(epoch, seq)` on every committed write; `seq` in-memory per won epoch
+    (NOT persisted — serve-authority invariant: re-acquire to serve after crash). Stamp stored in the
+    value envelope; CAS stays over the logical value (stamp is NOT in the CAS hash). 3-3 fence
+    unchanged.
+  - **3-4b — Deletes as stamped tombstones through `replicate_write`** (fenced + quorum-replicated +
+    persisted as read-as-absent stamped entries). Remove the local-only `delete` path.
+  - **3-4c — Ancestor-free 2-way union + max-stamp merge** (own resolver over prolly-tree iteration
+    primitives; NOT `merge_with_report`). Property test: ≥3 forked states, permuted merge order →
+    identical root (commutative/associative).
+  - **3-4d — Handoff wiring:** `become_live` merges the promise-majority committed states before
+    serving (keep the pull plumbing). *Gates: (i) FORKED-committed-state failover — owner commits k2
+    to {A,C}, k3 to {A,B}; new owner over {B,C} must serve BOTH (single-root adoption fails this);
+    (ii) committed DELETE survives failover — a tombstone is not resurrected.*
 - **3-5 — End-to-end concurrent-proposer proof.** The adversarial counterpart to 2a-5: spin a
   cluster, drive **two nodes to acquire the same shard concurrently**, assert **exactly one** wins,
   the loser is `Fenced` (explicitly, not `QuorumTimeout`), and a deposed owner that keeps writing is
