@@ -170,6 +170,27 @@ impl ShardState {
                 drop(reply.send(result));
                 None
             }
+            extra @ (ShardCommandKind::Cas { .. }
+            | ShardCommandKind::ApplyDurable { .. }
+            | ShardCommandKind::RecordPromise { .. }
+            | ShardCommandKind::RecordOwnerEpoch { .. }
+            | ShardCommandKind::ReserveMinted { .. }) => self.execute_extra(extra),
+            ShardCommandKind::ScanSequences { reply } => {
+                drop(reply.send(self.scan_sequences()));
+                None
+            }
+            ShardCommandKind::Shutdown { reply } => {
+                drop(reply.send(Ok(())));
+                Some(NativeOutcome::Stop(ExitReason::Normal))
+            }
+        }
+    }
+
+    /// Run one CAS / durable-apply / AA-3-0 promise-state command against the
+    /// actor (the promise mutators fsync before their reply). Split out of
+    /// [`Self::execute`] to keep that dispatch under the line budget.
+    fn execute_extra(&mut self, command: ShardCommandKind) -> Option<NativeOutcome> {
+        match command {
             ShardCommandKind::Cas {
                 key,
                 expected,
@@ -181,7 +202,6 @@ impl ShardState {
                     .cas(&key, expected, new, &mut self.store)
                     .map_err(ShardError::from);
                 drop(reply.send(result));
-                None
             }
             ShardCommandKind::ApplyDurable {
                 key,
@@ -195,17 +215,25 @@ impl ShardState {
                     .apply_durable(&key, expected, value, ttl, &mut self.store)
                     .map_err(ShardError::from);
                 drop(reply.send(result));
-                None
             }
-            ShardCommandKind::ScanSequences { reply } => {
-                drop(reply.send(self.scan_sequences()));
-                None
+            ShardCommandKind::RecordPromise { ballot, reply } => {
+                let result = self.actor.record_promise(ballot).map_err(ShardError::from);
+                drop(reply.send(result));
             }
-            ShardCommandKind::Shutdown { reply } => {
-                drop(reply.send(Ok(())));
-                Some(NativeOutcome::Stop(ExitReason::Normal))
+            ShardCommandKind::RecordOwnerEpoch { ballot, reply } => {
+                let result = self
+                    .actor
+                    .record_owner_epoch(ballot)
+                    .map_err(ShardError::from);
+                drop(reply.send(result));
             }
+            ShardCommandKind::ReserveMinted { counter, reply } => {
+                let result = self.actor.reserve_minted(counter).map_err(ShardError::from);
+                drop(reply.send(result));
+            }
+            _ => {}
         }
+        None
     }
 
     /// Walk the whole shard and decode every stream's sequence metadata; see

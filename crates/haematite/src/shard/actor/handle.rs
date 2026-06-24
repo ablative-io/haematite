@@ -22,10 +22,12 @@ use beamr::atom::{Atom, AtomTable};
 use beamr::scheduler::Scheduler;
 
 use crate::store::StoreError;
+use crate::sync::ballot::Ballot;
 use crate::tree::{Hash, TreeError};
 use crate::wal::WalError;
 
 use super::native::{self, ShardNativeHandler};
+use super::RecordPromiseOutcome;
 
 /// Name of the wake atom pushed into the shard process mailbox. The handler
 /// never inspects it — one mailbox token corresponds to one queued command — so
@@ -208,6 +210,18 @@ pub(super) enum ShardCommandKind {
         value: Vec<u8>,
         ttl: Option<Duration>,
         reply: SyncSender<Result<(), ShardError>>,
+    },
+    RecordPromise {
+        ballot: Ballot,
+        reply: SyncSender<Result<RecordPromiseOutcome, ShardError>>,
+    },
+    RecordOwnerEpoch {
+        ballot: Ballot,
+        reply: SyncSender<Result<(), ShardError>>,
+    },
+    ReserveMinted {
+        counter: u64,
+        reply: SyncSender<Result<u64, ShardError>>,
     },
     ScanSequences {
         reply: ScanReply,
@@ -507,6 +521,46 @@ impl ShardHandle {
             ttl,
             reply,
         })?;
+        recv(&response, self.pid, timeout)?
+    }
+
+    /// Durably record a Prepare promise for this shard (AA-3-0, §2.2). The
+    /// ballot is fsync'd before the reply ONLY if it strictly exceeds the
+    /// persisted `promised`; otherwise the call is a no-op and reports the
+    /// current `promised` (monotonic, never regresses — even across restart).
+    ///
+    /// # Errors
+    /// Returns a [`ShardError`] as for [`Self::get`].
+    pub fn record_promise(
+        &self,
+        ballot: Ballot,
+        timeout: Duration,
+    ) -> Result<RecordPromiseOutcome, ShardError> {
+        let (reply, response) = mpsc::sync_channel(1);
+        self.enqueue(ShardCommandKind::RecordPromise { ballot, reply })?;
+        recv(&response, self.pid, timeout)?
+    }
+
+    /// Durably record the ballot under which this node was elected owner of this
+    /// shard (AA-3-0, §2.2). Fsync'd before the reply.
+    ///
+    /// # Errors
+    /// Returns a [`ShardError`] as for [`Self::get`].
+    pub fn record_owner_epoch(&self, ballot: Ballot, timeout: Duration) -> Result<(), ShardError> {
+        let (reply, response) = mpsc::sync_channel(1);
+        self.enqueue(ShardCommandKind::RecordOwnerEpoch { ballot, reply })?;
+        recv(&response, self.pid, timeout)?
+    }
+
+    /// Durably reserve a minted ballot counter for this shard (AA-3-0 R4, §2.2),
+    /// fsync'd before the reply. Returns `max(persisted, counter)` so the next
+    /// minted ballot strictly exceeds every ballot ever minted, across restart.
+    ///
+    /// # Errors
+    /// Returns a [`ShardError`] as for [`Self::get`].
+    pub fn reserve_minted(&self, counter: u64, timeout: Duration) -> Result<u64, ShardError> {
+        let (reply, response) = mpsc::sync_channel(1);
+        self.enqueue(ShardCommandKind::ReserveMinted { counter, reply })?;
         recv(&response, self.pid, timeout)?
     }
 

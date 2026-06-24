@@ -70,6 +70,10 @@ pub struct DurableWal {
     file: File,
     policy: FsyncPolicy,
     writes_since_sync: usize,
+    /// Latest durable promise-state snapshot (AA-3-0). Held so a `commit`
+    /// truncation — which rewrites the WAL to just the committed-root marker —
+    /// can re-emit it and never drop ownership/promise durability.
+    promise: Option<super::promise::PromiseRecord>,
 }
 
 impl DurableWal {
@@ -94,7 +98,16 @@ impl DurableWal {
             file,
             policy,
             writes_since_sync: 0,
+            promise: None,
         })
+    }
+
+    /// Seed the latest promise snapshot recovered from disk so a later `commit`
+    /// truncation re-emits it (AA-3-0). Startup calls this when recovery found a
+    /// persisted [`super::promise::PromiseRecord`]; without it, the first commit
+    /// after a restart-without-new-promise would drop the recovered promise frame.
+    pub fn seed_promise(&mut self, record: super::promise::PromiseRecord) {
+        self.promise = Some(record);
     }
 
     /// Append one WAL entry to the end of the file.
@@ -122,6 +135,28 @@ impl DurableWal {
         self.append(&WalEntry::from(mutation))
     }
 
+    /// Append a step-3 promise-state frame and FORCE an fsync before returning,
+    /// regardless of the configured [`FsyncPolicy`] (AA-3-0, design §3).
+    ///
+    /// Promise state must be durable BEFORE the caller acts on it (reply Promise,
+    /// serve as owner, send Prepare), so this never defers the sync the way a
+    /// `CommitOnly`/`Batched` data append would — it always `sync_all`s the file
+    /// (contents + metadata) before `Ok`. The frame shares the WAL's outer
+    /// `[frame_len: u32 LE]` framing and CRC discipline, so it co-exists with
+    /// data entries and the committed-root marker in one fsync domain.
+    pub fn append_promise(&mut self, record: &super::promise::PromiseRecord) -> Result<(), WalError> {
+        let bytes = record.serialise();
+        self.write_entry_frame(&bytes)?;
+        self.file.sync_all()?;
+        // The forced sync clears any pending batched writes too: the file is now
+        // fully durable, so the batched-policy counter must reset.
+        self.writes_since_sync = 0;
+        // Remember the snapshot so a later `commit` truncation re-emits it and
+        // never drops promise durability when it rewrites the WAL to the marker.
+        self.promise = Some(record.clone());
+        Ok(())
+    }
+
     /// Atomically truncate the WAL to a committed-root marker.
     ///
     /// The replacement file contains exactly one marker frame with the committed
@@ -134,8 +169,26 @@ impl DurableWal {
     /// file that loses both replay entries and the commit reference.
     pub fn commit(&mut self, root_hash: Hash) -> Result<(), WalError> {
         self.file.sync_all()?;
-        let marker = truncation_marker_frame(root_hash);
-        write_atomic(&self.path, &marker)?;
+        // Build the replacement file as [marker][latest promise snapshot] and
+        // install it in ONE atomic rename, so a commit truncation never drops
+        // ownership/promise durability (AA-3-0, §3 "same fsync domain").
+        //
+        // It is NOT safe to write a marker-only file and then re-append the
+        // promise as a separate step: that leaves a crash window in which the
+        // on-disk WAL is marker-only and the promise frame is gone, so recovery
+        // would regress `promised` to bottom — violating the non-regression
+        // invariant the §4 majority-intersection fence rests on (a node could
+        // then promise a ballot lower than one it already granted). Folding the
+        // promise into the atomically-renamed replacement closes that window by
+        // construction: the rename publishes marker and promise together or
+        // neither.
+        let mut replacement = truncation_marker_frame(root_hash);
+        if let Some(record) = &self.promise {
+            let bytes = record.serialise();
+            replacement.extend_from_slice(&(bytes.len() as u32).to_le_bytes());
+            replacement.extend_from_slice(&bytes);
+        }
+        write_atomic(&self.path, &replacement)?;
         self.file = open_append_file(&self.path)?;
         self.writes_since_sync = 0;
         Ok(())
@@ -199,6 +252,11 @@ fn parse_wal_file(bytes: &[u8]) -> Result<WalFileContents, WalError> {
         let frame = cursor.read_frame()?;
         if is_truncation_marker(frame) {
             committed_root = Some(parse_truncation_marker(frame)?);
+        } else if super::promise::is_promise_payload(frame) {
+            // Promise-state frames (AA-3-0) are coordination metadata, not data
+            // entries or commit markers. This low-level file summary only reports
+            // replayable data entries and the committed root, so skip them here;
+            // promise recovery is handled by `WalRecovery`.
         } else {
             entries.push(WalEntry::deserialise(frame)?);
         }

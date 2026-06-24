@@ -14,10 +14,13 @@ pub use handle::{RangeItem, ShardError, ShardHandle};
 
 use crate::branch::current_timestamp;
 use crate::store::NodeStore;
+use crate::sync::ballot::Ballot;
 use crate::tree::{Cursor, Hash, LeafNode, Node, batch_mutate};
 use crate::ttl::entry::encode_optional_ttl;
 use crate::ttl::filter::{Visibility, is_expired_at, visible_value};
-use crate::wal::{DurableWal, LookupResult, Mutation, RecoveredWal, WalBuffer, WalError};
+use crate::wal::{
+    DurableWal, LookupResult, Mutation, PromiseRecord, RecoveredWal, WalBuffer, WalError,
+};
 
 /// Minimal shard write boundary used by the durable WAL layer.
 ///
@@ -32,6 +35,28 @@ pub struct ShardActor {
     wal: DurableWal,
     buffer: WalBuffer,
     committed_root: Option<Hash>,
+    /// AA-3-0 actor-local durable promise state (design §3, R8). These are owned
+    /// by THIS shard actor — never a `DashMap` consulted outside the slice — so
+    /// the (future) epoch fence reads `promised` in the same slice that a Prepare
+    /// mutates it, with no TOCTOU. Seeded from the recovered WAL on boot.
+    ///
+    /// `promised`: highest ballot promised in a Prepare; monotonic, never regresses.
+    /// `owner_epoch`: ballot under which this node was elected owner, if any.
+    /// `persisted_max_minted`: highest ballot counter ever minted (R4).
+    promised: Ballot,
+    owner_epoch: Option<Ballot>,
+    persisted_max_minted: u64,
+}
+
+/// Outcome of [`ShardActor::record_promise`]: a Prepare promise is durably
+/// accepted only if it strictly exceeds the persisted `promised` ballot.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum RecordPromiseOutcome {
+    /// `promised` was advanced to (and fsync'd as) the new ballot.
+    Promised,
+    /// The ballot did not exceed the persisted `promised`; nothing was written.
+    /// Carries the current `promised` so the caller can Nack with it (§2.2).
+    Rejected { promised: Ballot },
 }
 
 impl ShardActor {
@@ -43,17 +68,35 @@ impl ShardActor {
             wal,
             buffer: WalBuffer::new(),
             committed_root: None,
+            promised: Ballot::bottom(),
+            owner_epoch: None,
+            persisted_max_minted: 0,
         }
     }
 
     /// Build a normal shard actor from crash-recovered WAL state.
+    ///
+    /// Promise state (AA-3-0) is seeded from the recovered WAL: the latest
+    /// persisted [`PromiseRecord`] if one exists, else the bottom defaults
+    /// `(0,"")` / `None` / `0`. The WAL is also seeded with the recovered promise
+    /// snapshot so the next commit truncation re-emits it (design §3).
     #[must_use]
-    pub fn from_recovered(wal: DurableWal, recovered: RecoveredWal) -> Self {
+    pub fn from_recovered(mut wal: DurableWal, recovered: RecoveredWal) -> Self {
         let committed_root = recovered.committed_root();
+        let promise = recovered.promise().cloned().unwrap_or_else(PromiseRecord::initial);
+        wal.seed_promise(promise.clone());
+        let PromiseRecord {
+            promised,
+            owner_epoch,
+            persisted_max_minted,
+        } = promise;
         Self {
             wal,
             buffer: recovered.into_buffer(),
             committed_root,
+            promised,
+            owner_epoch,
+            persisted_max_minted,
         }
     }
 
@@ -342,6 +385,91 @@ impl ShardActor {
                 Err(HashCasError::from(error))
             }
         }
+    }
+
+    /// Read this shard's current actor-local promise ballot (AA-3-0).
+    #[must_use]
+    pub const fn promised(&self) -> &Ballot {
+        &self.promised
+    }
+
+    /// Read this shard's current owner epoch, if elected (AA-3-0).
+    #[must_use]
+    pub const fn owner_epoch(&self) -> Option<&Ballot> {
+        self.owner_epoch.as_ref()
+    }
+
+    /// Read this shard's highest persisted minted-ballot counter (R4).
+    #[must_use]
+    pub const fn persisted_max_minted(&self) -> u64 {
+        self.persisted_max_minted
+    }
+
+    /// Snapshot the three promise values into a [`PromiseRecord`] for fsync.
+    fn promise_snapshot(&self) -> PromiseRecord {
+        PromiseRecord {
+            promised: self.promised.clone(),
+            owner_epoch: self.owner_epoch.clone(),
+            persisted_max_minted: self.persisted_max_minted,
+        }
+    }
+
+    /// Durably record a Prepare promise (design §2.2 / §3, used by 3-2's Promise
+    /// reply). Monotonic: the promise is accepted ONLY if `b > promised`; an
+    /// equal-or-lower ballot is a no-op that returns the current `promised` so the
+    /// caller can Nack with it. `promised` is NEVER regressed — that invariant is
+    /// what the §4 majority-intersection fence rests on, and it survives restart
+    /// because the persisted value is reloaded into `promised` on boot.
+    ///
+    /// On accept the new snapshot is FSYNC'd (forced, via `append_promise`)
+    /// BEFORE the in-memory `promised` is advanced and BEFORE return, so a crash
+    /// can never leave a node having replied Promise without the ballot durable.
+    pub fn record_promise(&mut self, ballot: Ballot) -> Result<RecordPromiseOutcome, WalError> {
+        if ballot <= self.promised {
+            return Ok(RecordPromiseOutcome::Rejected {
+                promised: self.promised.clone(),
+            });
+        }
+        let snapshot = PromiseRecord {
+            promised: ballot.clone(),
+            owner_epoch: self.owner_epoch.clone(),
+            persisted_max_minted: self.persisted_max_minted,
+        };
+        self.wal.append_promise(&snapshot)?;
+        self.promised = ballot;
+        Ok(RecordPromiseOutcome::Promised)
+    }
+
+    /// Durably record the ballot under which this node was elected owner (design
+    /// §2.2 / §3). FSYNC'd before the owner's first served write and before
+    /// return, so a crash between election win and persist leaves the node NOT
+    /// owning, never silently double-owning.
+    pub fn record_owner_epoch(&mut self, ballot: Ballot) -> Result<(), WalError> {
+        let mut snapshot = self.promise_snapshot();
+        snapshot.owner_epoch = Some(ballot.clone());
+        self.wal.append_promise(&snapshot)?;
+        self.owner_epoch = Some(ballot);
+        Ok(())
+    }
+
+    /// Durably reserve a minted ballot counter (R4, design §2.2 / §3, used by 3-2
+    /// before sending Prepare). Persists `persisted_max_minted = max(self,
+    /// counter)`, FSYNC before return, and returns the reserved (post-max) value.
+    /// Guarantees a restarted candidate's next ballot strictly exceeds every
+    /// ballot it ever minted — the persisted value is reloaded on boot, so the
+    /// counter never regresses or is reused across a crash.
+    pub fn reserve_minted(&mut self, counter: u64) -> Result<u64, WalError> {
+        let reserved = self.persisted_max_minted.max(counter);
+        if reserved == self.persisted_max_minted {
+            // No advance needed; the persisted floor already dominates. Still a
+            // durable value (it was fsync'd when first reserved), so just report it.
+            return Ok(reserved);
+        }
+        let mut snapshot = self.promise_snapshot();
+        snapshot.persisted_max_minted = reserved;
+        self.wal.append_promise(&snapshot)?;
+        self.persisted_max_minted = reserved;
+        Ok(reserved)
     }
 
     /// Hash of the current visible value for `key`, or `None` if it is absent or
@@ -647,6 +775,221 @@ mod storage_tests {
         );
         assert_eq!(committed_uncrashed_root, uncrashed_root);
         assert_eq!(recovered_root, committed_uncrashed_root);
+        Ok(())
+    }
+}
+
+/// AA-3-0 GATE: durable promise-state crash-injection / recovery tests.
+///
+/// These are the falsifiable proof for increment 3-0. Each test persists promise
+/// state through a real on-disk WAL, then SIMULATES A CRASH by dropping the WAL
+/// and actor WITHOUT a clean shutdown and re-opening from the SAME on-disk path
+/// via `WalRecovery::recover_path` + `ShardActor::from_recovered`. Recovery reads
+/// the value back FROM DISK (not from retained in-memory state), so a regression
+/// that only updated memory — never fsync'd the frame — fails here.
+///
+/// What is and is NOT exercised: this drives the lowest-level reopen-from-disk
+/// path (WAL file + recovery + actor seed). It does NOT go through the beamr
+/// process / `ShardHandle` queue, because the `shard` module is `pub(crate)` and
+/// the actor is the durability boundary anyway — the mutators fsync inside the
+/// actor slice, which the `ShardHandle`/native dispatch only forwards to. The
+/// crash is a process-less `drop` of the WAL handle (closing the OS file) plus a
+/// fresh `recover_path`, which is exactly the durability question: did the bytes
+/// reach stable storage before the mutator returned?
+#[cfg(test)]
+mod promise_recovery_tests {
+    use super::{Ballot, RecordPromiseOutcome, ShardActor};
+    use crate::store::MemoryStore;
+    use crate::sync::topology::SyncNodeId;
+    use crate::wal::{DurableWal, FsyncPolicy, WalError, WalRecovery};
+    use std::path::{Path, PathBuf};
+
+    struct TempWal {
+        _dir: tempfile::TempDir,
+        path: PathBuf,
+    }
+
+    fn temp_wal() -> Result<TempWal, WalError> {
+        let dir = tempfile::tempdir()?;
+        let path = dir.path().join("shard.wal");
+        Ok(TempWal { _dir: dir, path })
+    }
+
+    fn ballot(counter: u64, node: &str) -> Ballot {
+        Ballot::new(counter, SyncNodeId::from(node))
+    }
+
+    /// Re-open the actor from the SAME on-disk WAL, simulating a crash recovery.
+    /// A FRESH `MemoryStore` is used so no committed-tree state can leak across
+    /// the "crash"; these tests never commit data, so the store is only consulted
+    /// (and finds nothing) for the absent committed-root verification.
+    fn reopen(path: &Path) -> Result<ShardActor, WalError> {
+        let store = MemoryStore::new();
+        let recovered = WalRecovery::recover_path(path, &store)?;
+        let wal = DurableWal::new(path, FsyncPolicy::CommitOnly)?;
+        Ok(ShardActor::from_recovered(wal, recovered))
+    }
+
+    /// (a) A persisted promise survives a crash, and (b) a lower ballot is
+    /// rejected after restart — monotonicity survives the crash.
+    #[test]
+    fn promise_is_durable_and_monotonic_across_crash() -> Result<(), WalError> {
+        let temp = temp_wal()?;
+
+        // record_promise((5,X)) returns -> the ballot must be on stable storage.
+        {
+            let wal = DurableWal::new(&temp.path, FsyncPolicy::CommitOnly)?;
+            let mut actor = ShardActor::new(wal);
+            assert_eq!(
+                actor.record_promise(ballot(5, "X"))?,
+                RecordPromiseOutcome::Promised
+            );
+            // SIMULATE CRASH: drop the WAL handle + actor with no clean shutdown.
+            drop(actor);
+        }
+
+        // (a) Recovery yields promised == (5,X) — read back FROM DISK.
+        let mut recovered = reopen(&temp.path)?;
+        assert_eq!(
+            recovered.promised(),
+            &ballot(5, "X"),
+            "a returned record_promise must survive a crash"
+        );
+
+        // (b) A lower ballot (3,Y) is rejected/no-op and never regresses promised.
+        let outcome = recovered.record_promise(ballot(3, "Y"))?;
+        assert_eq!(
+            outcome,
+            RecordPromiseOutcome::Rejected {
+                promised: ballot(5, "X")
+            },
+            "promised must never regress below a persisted ballot after restart"
+        );
+        assert_eq!(recovered.promised(), &ballot(5, "X"), "promised unchanged");
+
+        // And a STRICTLY higher ballot is still accepted post-restart.
+        assert_eq!(
+            recovered.record_promise(ballot(6, "A"))?,
+            RecordPromiseOutcome::Promised
+        );
+        drop(recovered);
+        let again = reopen(&temp.path)?;
+        assert_eq!(again.promised(), &ballot(6, "A"), "higher ballot persisted");
+        Ok(())
+    }
+
+    /// (c) `reserve_minted(7)` survives a crash and the next reserved counter
+    /// strictly exceeds it — no ballot regress across restart (R4).
+    #[test]
+    fn reserved_minted_counter_never_regresses_across_crash() -> Result<(), WalError> {
+        let temp = temp_wal()?;
+
+        {
+            let wal = DurableWal::new(&temp.path, FsyncPolicy::CommitOnly)?;
+            let mut actor = ShardActor::new(wal);
+            assert_eq!(actor.reserve_minted(7)?, 7);
+            // SIMULATE CRASH.
+            drop(actor);
+        }
+
+        // Reopen FROM DISK: persisted_max_minted >= 7.
+        let mut recovered = reopen(&temp.path)?;
+        assert!(
+            recovered.persisted_max_minted() >= 7,
+            "reserved minted counter must survive a crash"
+        );
+
+        // A lower request never lowers the floor (idempotent max).
+        assert_eq!(recovered.reserve_minted(4)?, 7, "lower request keeps the floor");
+        assert_eq!(recovered.persisted_max_minted(), 7);
+
+        // The NEXT mint floor strictly exceeds the persisted value: minting
+        // (persisted+1) reserves 8 > 7, so no ballot it minted can be reused.
+        let next = recovered.persisted_max_minted() + 1;
+        assert_eq!(recovered.reserve_minted(next)?, 8);
+        assert!(
+            recovered.persisted_max_minted() >= next,
+            "next reserved counter must strictly exceed the prior persisted floor"
+        );
+        drop(recovered);
+        let again = reopen(&temp.path)?;
+        assert_eq!(again.persisted_max_minted(), 8, "advance persisted across crash");
+        Ok(())
+    }
+
+    /// `owner_epoch` is durable across a crash too (design §3 value 2).
+    #[test]
+    fn owner_epoch_is_durable_across_crash() -> Result<(), WalError> {
+        let temp = temp_wal()?;
+        {
+            let wal = DurableWal::new(&temp.path, FsyncPolicy::CommitOnly)?;
+            let mut actor = ShardActor::new(wal);
+            actor.record_owner_epoch(ballot(4, "owner"))?;
+            drop(actor);
+        }
+        let recovered = reopen(&temp.path)?;
+        assert_eq!(recovered.owner_epoch(), Some(&ballot(4, "owner")));
+        Ok(())
+    }
+
+    /// All three values co-persist in one snapshot and survive together: a
+    /// promise, then an owner epoch, then a mint reservation, then crash → all
+    /// three recover. Proves the full-snapshot frame reconstructs the latest of
+    /// each field (not just the last-written one).
+    #[test]
+    fn all_three_values_co_persist_across_crash() -> Result<(), WalError> {
+        let temp = temp_wal()?;
+        {
+            let wal = DurableWal::new(&temp.path, FsyncPolicy::CommitOnly)?;
+            let mut actor = ShardActor::new(wal);
+            assert_eq!(
+                actor.record_promise(ballot(2, "P"))?,
+                RecordPromiseOutcome::Promised
+            );
+            actor.record_owner_epoch(ballot(2, "P"))?;
+            assert_eq!(actor.reserve_minted(5)?, 5);
+            drop(actor);
+        }
+        let recovered = reopen(&temp.path)?;
+        assert_eq!(recovered.promised(), &ballot(2, "P"));
+        assert_eq!(recovered.owner_epoch(), Some(&ballot(2, "P")));
+        assert_eq!(recovered.persisted_max_minted(), 5);
+        Ok(())
+    }
+
+    /// A promise frame survives a commit truncation (the §3 fsync-domain hazard):
+    /// after promise state is persisted, a data commit rewrites the WAL to just
+    /// the marker — the writer must re-emit the promise snapshot so a later crash
+    /// still recovers it. The same `store` carries the committed tree across the
+    /// "crash" (in production this is the on-disk `DiskStore`), so committed-root
+    /// verification passes and the only question is whether the promise re-emit
+    /// survived.
+    #[test]
+    fn promise_survives_commit_truncation_and_crash() -> Result<(), WalError> {
+        let temp = temp_wal()?;
+        let mut store = MemoryStore::new();
+        {
+            let wal = DurableWal::new(&temp.path, FsyncPolicy::CommitOnly)?;
+            let mut actor = ShardActor::new(wal);
+            assert_eq!(
+                actor.record_promise(ballot(9, "Z"))?,
+                RecordPromiseOutcome::Promised
+            );
+            // A data write + commit truncates the WAL to the committed-root marker.
+            actor.put(b"k".to_vec(), b"v".to_vec())?;
+            let _root = actor.commit(&mut store)?;
+            // SIMULATE CRASH: drop the WAL + actor with no clean shutdown.
+            drop(actor);
+        }
+        // Reopen FROM DISK against the store holding the committed tree.
+        let recovered = WalRecovery::recover_path(&temp.path, &store)?;
+        let wal = DurableWal::new(&temp.path, FsyncPolicy::CommitOnly)?;
+        let actor = ShardActor::from_recovered(wal, recovered);
+        assert_eq!(
+            actor.promised(),
+            &ballot(9, "Z"),
+            "promise must survive a commit truncation + crash (re-emit after marker)"
+        );
         Ok(())
     }
 }
