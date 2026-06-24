@@ -90,32 +90,30 @@ impl Database {
             DatabaseError::Distribution("no distribution endpoint for replicate_write".to_owned())
         })?;
 
-        // Stamp the write with this shard's current owner epoch (§2.3). Read the
-        // owner_epoch in-slice via the shard's promise state; with no election the
-        // shard is un-owned (owner_epoch None) → epoch = Ballot::bottom(), and every
+        // R-LE + R-SEQ (AA-3-4a, §2.4): draw the commit stamp `(live_epoch, seq)`
+        // from this shard's IN-MEMORY serve-authority. `live_epoch` is set ONLY by
+        // a successful `acquire_shard` THIS process lifetime — NOT the disk
+        // `owner_epoch` — so a node that recovered `owner_epoch = e'` from disk but
+        // did not re-acquire stamps `bottom`, never `e'` (the duplicate-stamp bug
+        // R-LE prevents). With no live election the stamp is `(bottom, seq)`: every
         // node's `promised` is also bottom, so `bottom >= bottom` accepts and the
-        // fence is a no-op (2a sequential semantics preserved). With an election the
-        // owner stamps its real epoch and a stale owner's write is fenced at peers.
-        // We do NOT gate on "am I owner" — the fence at the receiver is the
+        // fence is a no-op (2a sequential semantics preserved). `seq` is one atomic
+        // fetch_add — no TOCTOU (R-SEQ). The SAME stamp goes to the peers (on the
+        // WriteProposal) and to the local apply, so every replica stores it
+        // identically. We do NOT gate on "am I owner"; the receiver fence is the
         // enforcement, and gating here would break 2a back-compat.
-        let stamp_handle = self
-            .handle_for(&key)
-            .map_err(|error| DatabaseError::LocalCommitFailed(error.to_string()))?;
-        let epoch = stamp_handle
-            .read_promise_state(self.timeout())
-            .map_err(|error| DatabaseError::LocalCommitFailed(error.to_string()))?
-            .owner_epoch
-            .unwrap_or_else(Ballot::bottom);
+        let shard = self.shard_for(&key);
+        let stamp = self.owner_stamps.next_stamp(shard);
 
         // Step 1: drive the write to peer-quorum. Clone key/value because the local
         // durable apply in step 2 needs them again.
         let outcome = endpoint
-            .propose_write(
+            .propose_write_stamped(
                 key.clone(),
                 expected,
                 value.clone(),
                 ttl,
-                epoch.clone(),
+                stamp.clone(),
                 membership,
                 timeout,
             )
@@ -127,7 +125,9 @@ impl Database {
         let handle = self
             .handle_for(&key)
             .map_err(|error| DatabaseError::LocalCommitFailed(error.to_string()))?;
-        match handle.apply_durable(key, expected, value, ttl, epoch, self.timeout()) {
+        // The proposer applies the IDENTICAL stamp it put on the WriteProposal, so
+        // its local copy matches every peer's (§2.4).
+        match handle.apply_durable(key, expected, value, ttl, stamp, self.timeout()) {
             Ok(()) => Ok(outcome),
             // Any failure here is surfaced loudly, never swallowed. A local CAS
             // mismatch (`ShardError::CasHashMismatch`) would mean another writer
@@ -204,7 +204,10 @@ impl Database {
             proposal.expected,
             proposal.value.clone(),
             proposal.ttl,
-            proposal.epoch.clone(),
+            // R-SEQ: store the OWNER-ASSIGNED stamp `(epoch, seq)` verbatim — this
+            // replica never invents its own seq, so every replica's stored stamp
+            // for this write is byte-identical (§2.4 merge precondition).
+            proposal.stamp(),
             self.timeout(),
         ) {
             Ok(()) => AckOutcome::Applied,
@@ -399,6 +402,14 @@ impl Database {
                     handle
                         .record_owner_epoch(ballot.clone(), self.timeout())
                         .map_err(map_shard_error)?;
+                    // R-LE (AA-3-4a, §2.4): set the IN-MEMORY `live_epoch` for this
+                    // shard to the won ballot. This is the ONLY writer of
+                    // `live_epoch` and the ONLY thing that authorizes serving
+                    // (stamping) writes under this epoch. It resets the per-epoch
+                    // `seq` to 0. A crash-recovered `owner_epoch` never reaches
+                    // here, so it can never re-authorize a stamp without a fresh
+                    // (strictly-higher) win.
+                    self.owner_stamps.record_won(shard_id, ballot.clone());
                     return Ok(ElectionOutcome { ballot, promises });
                 }
                 // --- Step 6: lost to a higher ballot — re-mint strictly above it. --

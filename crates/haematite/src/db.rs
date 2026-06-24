@@ -23,6 +23,7 @@ use crate::ttl::sweep::{SweepError, SweepHandle};
 mod config;
 mod error;
 pub(crate) mod helpers;
+mod owner_stamp;
 mod receiver;
 
 pub use config::{DatabaseConfig, DistributedDatabaseConfig};
@@ -59,6 +60,12 @@ pub struct Database {
     /// yet drive the merge/pull protocol (the sync trigger is still a no-op); it
     /// only exposes the transport primitives later increments build on.
     distribution: Option<DistributionEndpoint>,
+    /// AA-3-4a R-LE / R-SEQ: per-shard IN-MEMORY serve-authority. `live_epoch` is
+    /// set ONLY by a successful `acquire_shard` THIS lifetime (never recovered
+    /// from disk), and the atomic `seq` is drawn once per committed write. The
+    /// commit stamp `(live_epoch, seq)` is stamped here on the owner and carried
+    /// on the `WriteProposal` so every replica stores the identical stamp.
+    owner_stamps: owner_stamp::OwnerStamps,
     timeout: Duration,
 }
 
@@ -297,6 +304,40 @@ impl Database {
             .map(|state| state.promised)
     }
 
+    /// Test-support: decode the committed commit-stamp `(epoch, seq)` a node
+    /// stored for `key` (AA-3-4a). Reads the RAW stored envelope (stamp NOT
+    /// stripped) and decodes its stamp, so a test can prove every replica stored
+    /// the IDENTICAL owner-assigned stamp. Returns `None` if the key is absent or
+    /// was stored without a stamp envelope.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn stored_stamp_for_test(&self, key: &[u8]) -> Option<crate::sync::Stamp> {
+        let handle = self.router.handle_for(key)?;
+        let raw = handle.get_raw(key.to_vec(), self.timeout).ok()??;
+        crate::ttl::entry::StampedEntry::decode(&raw)
+            .ok()
+            .flatten()
+            .map(|entry| entry.stamp().clone())
+    }
+
+    /// Test-support: read a shard's IN-MEMORY `live_epoch` (R-LE, AA-3-4a). This
+    /// is `Ballot::bottom()` until a successful `acquire_shard` THIS lifetime, and
+    /// is NEVER seeded from the disk-recovered `owner_epoch`.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn live_epoch_for_test(&self, shard_id: usize) -> crate::sync::Ballot {
+        self.owner_stamps.live_epoch(shard_id)
+    }
+
+    /// Test-support: the commit stamp the NEXT write to `shard_id` would draw,
+    /// WITHOUT advancing the counter (R-LE / R-SEQ peek). Used by the crash gate
+    /// to prove a recovered owner would stamp `bottom`, never the recovered `e'`.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn next_stamp_for_test(&self, shard_id: usize) -> crate::sync::Stamp {
+        self.owner_stamps.peek_stamp(shard_id)
+    }
+
     fn require_distribution(&self) -> Result<&DistributionEndpoint, DatabaseError> {
         self.distribution
             .as_ref()
@@ -426,6 +467,7 @@ fn start_database(config: DatabaseConfig, mode: StartupMode) -> Result<Database,
         sweeps,
         sync_schedulers,
         distribution: None,
+        owner_stamps: owner_stamp::OwnerStamps::default(),
         timeout: DEFAULT_TIMEOUT,
     })
 }

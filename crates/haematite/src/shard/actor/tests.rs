@@ -19,7 +19,7 @@ use beamr::scheduler::{Scheduler, SchedulerConfig};
 use super::handle::{RangeItem, ShardError, ShardHandle};
 use super::RecordPromiseOutcome;
 use crate::store::DiskStore;
-use crate::sync::ballot::Ballot;
+use crate::sync::ballot::{Ballot, Stamp};
 use crate::sync::SyncNodeId;
 use crate::tree::{Hash, LeafNode, Node};
 use crate::wal::DurableWal;
@@ -370,7 +370,7 @@ fn fence_rejects_stale_epoch_write_applying_nothing() -> Result<(), Box<dyn Erro
         None,
         b"stale".to_vec(),
         None,
-        ballot(3, "Y"),
+        Stamp::new(ballot(3, "Y"), 0),
         TIMEOUT,
     );
     assert!(
@@ -418,7 +418,7 @@ fn fence_admits_ge_without_ever_raising_promised() -> Result<(), Box<dyn Error>>
         None,
         b"at-five".to_vec(),
         None,
-        ballot(5, "X"),
+        Stamp::new(ballot(5, "X"), 0),
         TIMEOUT,
     )?;
     assert_eq!(get(handle, b"k")?, Some(b"at-five".to_vec()));
@@ -437,7 +437,7 @@ fn fence_admits_ge_without_ever_raising_promised() -> Result<(), Box<dyn Error>>
         Some(current),
         b"at-seven".to_vec(),
         None,
-        ballot(7, "Z"),
+        Stamp::new(ballot(7, "Z"), 0),
         TIMEOUT,
     )?;
     assert_eq!(get(handle, b"k")?, Some(b"at-seven".to_vec()));

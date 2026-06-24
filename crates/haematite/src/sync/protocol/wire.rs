@@ -92,6 +92,7 @@ pub fn encode_sync_message(message: &SyncMessage) -> Result<Vec<u8>, SyncError> 
             append_len_prefixed_bytes(&mut bytes, &proposal.value);
             append_optional_duration(&mut bytes, proposal.ttl);
             append_ballot(&mut bytes, &proposal.epoch);
+            bytes.extend_from_slice(&proposal.seq.to_be_bytes());
         }
         SyncMessage::WriteAck(ack) => {
             bytes.push(MESSAGE_WRITE_ACK);
@@ -162,6 +163,7 @@ pub fn decode_sync_message(bytes: &[u8]) -> Result<SyncMessage, SyncError> {
             value: cursor.read_len_prefixed_bytes()?,
             ttl: cursor.read_optional_duration()?,
             epoch: cursor.read_ballot()?,
+            seq: cursor.read_u64()?,
         }),
         MESSAGE_WRITE_ACK => SyncMessage::WriteAck(WriteAck {
             write_id: cursor.read_write_id()?,

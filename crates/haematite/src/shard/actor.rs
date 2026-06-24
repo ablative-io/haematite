@@ -14,9 +14,9 @@ pub use handle::{RangeItem, ShardError, ShardHandle};
 
 use crate::branch::current_timestamp;
 use crate::store::NodeStore;
-use crate::sync::ballot::Ballot;
+use crate::sync::ballot::{Ballot, Stamp};
 use crate::tree::{Cursor, Hash, LeafNode, Node, batch_mutate};
-use crate::ttl::entry::encode_optional_ttl;
+use crate::ttl::entry::{encode_optional_ttl, encode_stamped_optional_ttl};
 use crate::ttl::filter::{Visibility, is_expired_at, visible_value};
 use crate::wal::{
     DurableWal, LookupResult, Mutation, PromiseRecord, RecoveredWal, WalBuffer, WalError,
@@ -228,6 +228,28 @@ impl ShardActor {
         }
     }
 
+    /// Read the RAW stored envelope bytes for `key` (stamp + TTL header NOT
+    /// stripped), or `None` if absent. Test-support for AA-3-4a: lets a test
+    /// decode the committed stamp a replica stored, to prove every replica stored
+    /// the IDENTICAL owner-assigned stamp. Unlike [`Self::get`] this does NOT apply
+    /// the visibility filter, so the stamped envelope is returned verbatim.
+    #[doc(hidden)]
+    pub fn get_raw<K, S>(&self, key: K, store: &S) -> Result<Option<Vec<u8>>, WalError>
+    where
+        K: AsRef<[u8]>,
+        S: NodeStore + ?Sized,
+    {
+        let key = key.as_ref();
+        match self.buffer.get(key) {
+            LookupResult::BufferedValue(value) => Ok(Some(value)),
+            LookupResult::BufferedDelete => Ok(None),
+            LookupResult::NotBuffered => self.committed_root.map_or_else(
+                || Ok(None),
+                |root| Cursor::new(store, root).get(key).map_err(tree_error),
+            ),
+        }
+    }
+
     /// Flush buffered mutations to the tree, then atomically truncate the WAL.
     ///
     /// The in-memory buffer is cleared only after the new committed-root marker
@@ -382,13 +404,14 @@ impl ShardActor {
     ///
     /// # Epoch fence (AA-3-3, §2.3 — THE rule)
     ///
-    /// BEFORE the CAS read, and in this SAME actor slice, the write's `write_epoch`
-    /// is checked against the shard's actor-local `self.promised` ballot:
+    /// BEFORE the CAS read, and in this SAME actor slice, the write's epoch
+    /// (`stamp.epoch`) is checked against the shard's actor-local `self.promised`
+    /// ballot:
     ///
-    /// * `write_epoch < self.promised` → reject [`HashCasError::Fenced`], apply
+    /// * `stamp.epoch < self.promised` → reject [`HashCasError::Fenced`], apply
     ///   NOTHING (no put, no commit). A stale/deposed owner is fenced — the §4
     ///   majority-intersection safety property.
-    /// * `write_epoch >= self.promised` → run the existing CAS-compare → put →
+    /// * `stamp.epoch >= self.promised` → run the existing CAS-compare → put →
     ///   commit. The data write does **NOT** mutate `self.promised` (R2 — standard
     ///   Paxos acceptor semantics: only a Prepare / [`Self::record_promise`] raises
     ///   `promised`). Accepting `>=` without raising is what stops an un-elected
@@ -396,13 +419,22 @@ impl ShardActor {
     ///
     /// Reading `self.promised` in the same `&mut self` slice as the CAS means there
     /// is no TOCTOU between the fence and the write (R8).
+    ///
+    /// # Commit stamp (AA-3-4a, §2.4)
+    ///
+    /// On a MATCH the value is stored in the STAMPED envelope carrying `stamp` —
+    /// the IDENTICAL stamp the owner assigned (receiver: `(proposal.epoch,
+    /// proposal.seq)`; proposer: its own `(live_epoch, seq)`), never one this
+    /// replica invents (R-SEQ). The stamp is stored ALONGSIDE the value+ttl; the
+    /// CAS hash (`current_value_hash`) is taken over the logical value bytes
+    /// (stamp- and TTL-stripped), so the stamp does NOT enter the CAS identity.
     fn apply_durable<S>(
         &mut self,
         key: &[u8],
         expected: Option<Hash>,
         value: Vec<u8>,
         ttl: Option<Duration>,
-        write_epoch: Ballot,
+        stamp: Stamp,
         store: &mut S,
     ) -> Result<(), HashCasError>
     where
@@ -412,10 +444,10 @@ impl ShardActor {
         // Reject a stale owner whose epoch is below what we have promised. We do
         // NOT raise `self.promised` on the accept path (R2): only `record_promise`
         // (a Prepare) advances it. `>=` is accepted as a plain Paxos acceptor.
-        if write_epoch < self.promised {
+        if stamp.epoch < self.promised {
             return Err(HashCasError::Fenced {
                 promised: self.promised.clone(),
-                attempted: write_epoch,
+                attempted: stamp.epoch,
             });
         }
         let actual = self.current_value_hash(key, store)?;
@@ -423,7 +455,7 @@ impl ShardActor {
             return Err(HashCasError::HashMismatch { expected, actual });
         }
         let previous_buffer = self.buffer.clone();
-        let encoded = encode_ttl_value(value, ttl)?;
+        let encoded = encode_stamped_optional_ttl(value, stamp, ttl).map_err(tree_error)?;
         self.buffer.put(key, encoded);
         match self.commit(store) {
             Ok(_root) => Ok(()),

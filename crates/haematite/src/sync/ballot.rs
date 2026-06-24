@@ -51,6 +51,46 @@ impl Ballot {
     }
 }
 
+/// A causal commit stamp `(epoch, seq)` carried by every committed write (§2.4).
+///
+/// The total order is lexicographic by `(epoch, seq)`:
+///
+/// - `epoch` — the owner's ballot the write was made under. Globally unique and
+///   monotonic ACROSS owners (a re-acquired owner's ballot strictly exceeds the
+///   prior one), so it dominates ordering.
+/// - `seq` — the owner's monotonic per-(shard, live-epoch) write counter, advanced
+///   once per committed write, ordering writes WITHIN one epoch.
+///
+/// `max` over this total order is the commutative/associative/idempotent
+/// semilattice join the §2.4 handoff merge (3-4c) uses; the per-key chain tip is
+/// always the higher stamp. The derived [`Ord`]/[`PartialOrd`] follow
+/// field-declaration order (epoch first, seq second); [`tests`] pins it.
+#[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct Stamp {
+    /// The owner ballot the write was made under; dominates ordering.
+    pub epoch: Ballot,
+    /// The owner's monotonic per-epoch write counter; orders within one epoch.
+    pub seq: u64,
+}
+
+impl Stamp {
+    /// Build a commit stamp from an epoch ballot and a per-epoch sequence number.
+    #[must_use]
+    pub const fn new(epoch: Ballot, seq: u64) -> Self {
+        Self { epoch, seq }
+    }
+
+    /// The bottom stamp `((0,""), 0)` — below every real stamp. The stamp a
+    /// 2a-compatible (un-elected, `live_epoch = bottom`) write carries.
+    #[must_use]
+    pub fn bottom() -> Self {
+        Self {
+            epoch: Ballot::bottom(),
+            seq: 0,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::Ballot;
@@ -79,6 +119,30 @@ mod tests {
         assert!(Ballot::bottom() < ballot(1, "a"));
         assert!(Ballot::bottom() < ballot(0, "a"));
         assert_eq!(Ballot::bottom(), ballot(0, ""));
+    }
+
+    #[test]
+    fn stamp_epoch_dominates_seq_in_ordering() {
+        use super::Stamp;
+        // A higher epoch wins even with a lower seq: epoch is compared FIRST.
+        let lower_epoch_high_seq = Stamp::new(ballot(1, "z"), u64::MAX);
+        let higher_epoch_zero_seq = Stamp::new(ballot(2, "a"), 0);
+        assert!(lower_epoch_high_seq < higher_epoch_zero_seq);
+    }
+
+    #[test]
+    fn stamp_seq_breaks_ties_at_equal_epoch() {
+        use super::Stamp;
+        // Equal epoch falls back to seq order (orders two writes by one owner).
+        assert!(Stamp::new(ballot(3, "a"), 4) < Stamp::new(ballot(3, "a"), 5));
+    }
+
+    #[test]
+    fn stamp_bottom_is_below_every_real_stamp() {
+        use super::Stamp;
+        assert!(Stamp::bottom() < Stamp::new(ballot(1, "a"), 0));
+        assert!(Stamp::bottom() < Stamp::new(Ballot::bottom(), 1));
+        assert_eq!(Stamp::bottom(), Stamp::new(Ballot::bottom(), 0));
     }
 
     #[test]

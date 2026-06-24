@@ -48,6 +48,7 @@ fn proposal(key: &[u8], expected: Option<Hash>, value: &[u8]) -> WriteProposal {
         // No election in these 2a receiver tests: stamp bottom, which `>= promised`
         // (also bottom) so the fence is a no-op and 2a semantics are unchanged.
         epoch: Ballot::bottom(),
+        seq: 0,
     }
 }
 

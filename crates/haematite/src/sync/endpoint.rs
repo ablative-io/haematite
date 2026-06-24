@@ -49,7 +49,7 @@ use tokio::runtime::{Builder, Handle, Runtime};
 use crate::api::kv::{KvKey, KvValue};
 use crate::branch::ShardId;
 use crate::sync::SyncNodeId;
-use crate::sync::ballot::Ballot;
+use crate::sync::ballot::{Ballot, Stamp};
 use crate::sync::consistency::{
     CasVote, ConsistencyError, QuorumOutcome, StrongConsistency, quorum_size,
     wait_for_cas_quorum_from_receiver,
@@ -479,6 +479,34 @@ impl DistributionEndpoint {
         membership: &WriteMembership,
         timeout: Duration,
     ) -> Result<QuorumOutcome<SyncNodeId>, ConsistencyError> {
+        // The bare-epoch entry point (2a / 3-3 direct callers) stamps `seq = 0`.
+        // The owner-driven path (`Database::replicate_write`) uses
+        // `propose_write_stamped` with the atomic per-epoch `seq` (R-SEQ).
+        self.propose_write_stamped(
+            key,
+            expected,
+            value,
+            ttl,
+            Stamp::new(epoch, 0),
+            membership,
+            timeout,
+        )
+    }
+
+    /// As [`Self::propose_write`], but carrying the full owner-assigned commit
+    /// stamp `(epoch, seq)` (AA-3-4a, R-SEQ). The `seq` is placed on the
+    /// `WriteProposal` so every replica stores the identical stamp (§2.4).
+    #[allow(clippy::too_many_arguments)]
+    pub fn propose_write_stamped(
+        &self,
+        key: KvKey,
+        expected: Option<Hash>,
+        value: KvValue,
+        ttl: Option<Duration>,
+        stamp: Stamp,
+        membership: &WriteMembership,
+        timeout: Duration,
+    ) -> Result<QuorumOutcome<SyncNodeId>, ConsistencyError> {
         // The coordinator BLOCKS; it must not run on a runtime worker (it would
         // park a beamr worker and can deadlock the single-worker runtime).
         if Handle::try_current().is_ok() {
@@ -513,7 +541,8 @@ impl DistributionEndpoint {
             expected,
             value,
             ttl,
-            epoch,
+            epoch: stamp.epoch,
+            seq: stamp.seq,
         };
 
         // Encode the proposal frame ONCE on this synchronous thread (a `SyncError`
