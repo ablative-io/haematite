@@ -1,15 +1,18 @@
 use std::sync::Arc;
+use std::time::Duration;
 
 use beamr::atom::Atom;
 use beamr::distribution::ConnectionManager;
 use beamr::distribution::connection::DistConnection;
 
 use crate::branch::ShardId;
+use crate::sync::SyncNodeId;
 use crate::tree::{Hash, Node};
 
 use super::{
-    NodeTransfer, PullRequest, PushResponse, RootExchangeRequest, RootExchangeResponse,
-    SyncDecision, SyncError, SyncStats, TargetNodeRequest, TargetNodeResponse, TargetNodeSummary,
+    AckOutcome, NodeTransfer, PullRequest, PushResponse, RejectReason, RootExchangeRequest,
+    RootExchangeResponse, SyncDecision, SyncError, SyncStats, TargetNodeRequest, TargetNodeResponse,
+    TargetNodeSummary, WriteAck, WriteId, WriteProposal,
 };
 
 const SYNC_CONTROL_FRAME: &[u8] = b"haematite.sync.v1";
@@ -21,6 +24,11 @@ const MESSAGE_PULL_REQUEST: u8 = 3;
 const MESSAGE_PUSH_RESPONSE: u8 = 4;
 const MESSAGE_TARGET_NODE_REQUEST: u8 = 5;
 const MESSAGE_TARGET_NODE_RESPONSE: u8 = 6;
+const MESSAGE_WRITE_PROPOSAL: u8 = 7;
+const MESSAGE_WRITE_ACK: u8 = 8;
+
+const ACK_OUTCOME_APPLIED: u8 = 0;
+const ACK_OUTCOME_REJECTED: u8 = 1;
 
 /// Sync protocol messages that can be framed over beamr distribution links.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -31,6 +39,8 @@ pub enum SyncMessage {
     PushResponse(PushResponse),
     TargetNodeRequest(TargetNodeRequest),
     TargetNodeResponse(TargetNodeResponse),
+    WriteProposal(WriteProposal),
+    WriteAck(WriteAck),
 }
 
 /// Encode a sync message payload.
@@ -66,6 +76,21 @@ pub fn encode_sync_message(message: &SyncMessage) -> Result<Vec<u8>, SyncError> 
             append_shard_id(&mut bytes, response.shard_id);
             bytes.extend_from_slice(response.hash.as_bytes());
             append_optional_target_summary(&mut bytes, response.summary.as_ref());
+        }
+        SyncMessage::WriteProposal(proposal) => {
+            bytes.push(MESSAGE_WRITE_PROPOSAL);
+            append_write_id(&mut bytes, &proposal.write_id);
+            append_len_prefixed_bytes(&mut bytes, &proposal.key);
+            append_optional_hash(&mut bytes, proposal.expected);
+            append_len_prefixed_bytes(&mut bytes, &proposal.value);
+            append_optional_duration(&mut bytes, proposal.ttl);
+        }
+        SyncMessage::WriteAck(ack) => {
+            bytes.push(MESSAGE_WRITE_ACK);
+            append_write_id(&mut bytes, &ack.write_id);
+            append_len_prefixed_bytes(&mut bytes, ack.acker.as_str().as_bytes());
+            bytes.extend_from_slice(&ack.acker_creation.to_be_bytes());
+            append_ack_outcome(&mut bytes, ack.outcome);
         }
     }
     Ok(bytes)
@@ -103,6 +128,19 @@ pub fn decode_sync_message(bytes: &[u8]) -> Result<SyncMessage, SyncError> {
             shard_id: cursor.read_shard_id()?,
             hash: cursor.read_hash()?,
             summary: cursor.read_optional_target_summary()?,
+        }),
+        MESSAGE_WRITE_PROPOSAL => SyncMessage::WriteProposal(WriteProposal {
+            write_id: cursor.read_write_id()?,
+            key: cursor.read_len_prefixed_bytes()?,
+            expected: cursor.read_optional_hash()?,
+            value: cursor.read_len_prefixed_bytes()?,
+            ttl: cursor.read_optional_duration()?,
+        }),
+        MESSAGE_WRITE_ACK => SyncMessage::WriteAck(WriteAck {
+            write_id: cursor.read_write_id()?,
+            acker: cursor.read_sync_node_id()?,
+            acker_creation: cursor.read_u32()?,
+            outcome: cursor.read_ack_outcome()?,
         }),
         _ => return Err(SyncError::InvalidMessage),
     };
@@ -269,6 +307,40 @@ where
     )
 }
 
+pub fn send_write_proposal_via_beamr<F>(
+    manager: &ConnectionManager,
+    remote: Atom,
+    proposal: &WriteProposal,
+    write_frame: F,
+) -> Result<(), SyncError>
+where
+    F: FnOnce(Arc<DistConnection>, Vec<u8>) -> Result<(), SyncError>,
+{
+    send_sync_message_via_beamr(
+        manager,
+        remote,
+        &SyncMessage::WriteProposal(proposal.clone()),
+        write_frame,
+    )
+}
+
+pub fn send_write_ack_via_beamr<F>(
+    manager: &ConnectionManager,
+    remote: Atom,
+    ack: &WriteAck,
+    write_frame: F,
+) -> Result<(), SyncError>
+where
+    F: FnOnce(Arc<DistConnection>, Vec<u8>) -> Result<(), SyncError>,
+{
+    send_sync_message_via_beamr(
+        manager,
+        remote,
+        &SyncMessage::WriteAck(ack.clone()),
+        write_frame,
+    )
+}
+
 /// Register a beamr control-frame handler for haematite sync messages.
 pub fn register_beamr_sync_handler<F>(manager: &ConnectionManager, handler: F)
 where
@@ -360,6 +432,33 @@ fn append_optional_hash(bytes: &mut Vec<u8>, hash: Option<Hash>) {
     }
 }
 
+fn append_write_id(bytes: &mut Vec<u8>, write_id: &WriteId) {
+    append_len_prefixed_bytes(bytes, write_id.origin.as_str().as_bytes());
+    bytes.extend_from_slice(&write_id.origin_creation.to_be_bytes());
+    bytes.extend_from_slice(&write_id.counter.to_be_bytes());
+}
+
+fn append_optional_duration(bytes: &mut Vec<u8>, ttl: Option<Duration>) {
+    match ttl {
+        Some(duration) => {
+            bytes.push(1);
+            bytes.extend_from_slice(&duration.as_secs().to_be_bytes());
+            bytes.extend_from_slice(&duration.subsec_nanos().to_be_bytes());
+        }
+        None => bytes.push(0),
+    }
+}
+
+fn append_ack_outcome(bytes: &mut Vec<u8>, outcome: AckOutcome) {
+    match outcome {
+        AckOutcome::Applied => bytes.push(ACK_OUTCOME_APPLIED),
+        AckOutcome::Rejected(reason) => {
+            bytes.push(ACK_OUTCOME_REJECTED);
+            bytes.push(reason.to_wire());
+        }
+    }
+}
+
 struct MessageCursor<'a> {
     bytes: &'a [u8],
     position: usize,
@@ -380,6 +479,20 @@ impl<'a> MessageCursor<'a> {
         let mut value = [0_u8; 4];
         value.copy_from_slice(bytes);
         usize::try_from(u32::from_be_bytes(value)).map_err(|_error| SyncError::InvalidMessage)
+    }
+
+    fn read_u32(&mut self) -> Result<u32, SyncError> {
+        let bytes = self.read_exact(4)?;
+        let mut value = [0_u8; 4];
+        value.copy_from_slice(bytes);
+        Ok(u32::from_be_bytes(value))
+    }
+
+    fn read_u64(&mut self) -> Result<u64, SyncError> {
+        let bytes = self.read_exact(8)?;
+        let mut value = [0_u8; 8];
+        value.copy_from_slice(bytes);
+        Ok(u64::from_be_bytes(value))
     }
 
     fn read_usize(&mut self) -> Result<usize, SyncError> {
@@ -422,6 +535,51 @@ impl<'a> MessageCursor<'a> {
     fn read_len_prefixed_bytes(&mut self) -> Result<Vec<u8>, SyncError> {
         let len = self.read_usize()?;
         self.read_exact(len).map(<[u8]>::to_vec)
+    }
+
+    fn read_sync_node_id(&mut self) -> Result<SyncNodeId, SyncError> {
+        let bytes = self.read_len_prefixed_bytes()?;
+        let name = String::from_utf8(bytes).map_err(|_error| SyncError::InvalidMessage)?;
+        Ok(SyncNodeId::new(name))
+    }
+
+    fn read_write_id(&mut self) -> Result<WriteId, SyncError> {
+        let origin = self.read_sync_node_id()?;
+        let origin_creation = self.read_u32()?;
+        let counter = self.read_u64()?;
+        Ok(WriteId {
+            origin,
+            origin_creation,
+            counter,
+        })
+    }
+
+    fn read_optional_duration(&mut self) -> Result<Option<Duration>, SyncError> {
+        match self.read_u8()? {
+            0 => Ok(None),
+            1 => {
+                let secs = self.read_u64()?;
+                let nanos = self.read_u32()?;
+                // Reject denormalized sub-second nanos so the `Duration::new`
+                // carry can never overflow `secs` and panic on a hostile buffer.
+                if nanos >= 1_000_000_000 {
+                    return Err(SyncError::InvalidMessage);
+                }
+                Ok(Some(Duration::new(secs, nanos)))
+            }
+            _ => Err(SyncError::InvalidMessage),
+        }
+    }
+
+    fn read_ack_outcome(&mut self) -> Result<AckOutcome, SyncError> {
+        match self.read_u8()? {
+            ACK_OUTCOME_APPLIED => Ok(AckOutcome::Applied),
+            ACK_OUTCOME_REJECTED => {
+                let reason = RejectReason::from_wire(self.read_u8()?)?;
+                Ok(AckOutcome::Rejected(reason))
+            }
+            _ => Err(SyncError::InvalidMessage),
+        }
     }
 
     fn read_hash(&mut self) -> Result<Hash, SyncError> {

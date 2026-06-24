@@ -1,7 +1,10 @@
 use std::collections::BTreeSet;
+use std::time::Duration;
 
+use crate::api::kv::{KvKey, KvValue};
 use crate::branch::ShardId;
 use crate::store::NodeStore;
+use crate::sync::SyncNodeId;
 use crate::tree::{Hash, Node};
 
 #[path = "protocol/wire.rs"]
@@ -25,6 +28,7 @@ pub use wire::{
     send_push_response_via_beamr, send_root_exchange_request_via_beamr,
     send_root_exchange_response_via_beamr, send_sync_message_via_beamr,
     send_target_node_request_via_beamr, send_target_node_response_via_beamr,
+    send_write_ack_via_beamr, send_write_proposal_via_beamr,
 };
 
 /// Decision made by the root-hash exchange for one shard.
@@ -224,6 +228,85 @@ impl PullRequest {
     pub const fn root_exchange_request(self) -> RootExchangeRequest {
         RootExchangeRequest::new(self.shard_id, self.target_root)
     }
+}
+
+/// Incarnation-safe correlation id for a single active-active write.
+///
+/// The id embeds the originating node's restart incarnation (`origin_creation`)
+/// so that a slow acknowledgement for a *prior* writer incarnation cannot
+/// satisfy a *post-restart* write that happened to reuse the same in-memory
+/// `counter`.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct WriteId {
+    pub origin: SyncNodeId,
+    pub origin_creation: u32,
+    pub counter: u64,
+}
+
+impl WriteId {
+    #[must_use]
+    pub fn new(origin: impl Into<SyncNodeId>, origin_creation: u32, counter: u64) -> Self {
+        Self {
+            origin: origin.into(),
+            origin_creation,
+            counter,
+        }
+    }
+}
+
+/// Reason a [`WriteProposal`] was rejected by a receiving replica.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RejectReason {
+    /// The CAS precondition did not match the replica's current value hash.
+    CasMismatch,
+    /// The replica failed to apply the write for a non-CAS reason.
+    ApplyError,
+}
+
+impl RejectReason {
+    const fn to_wire(self) -> u8 {
+        match self {
+            Self::CasMismatch => 0,
+            Self::ApplyError => 1,
+        }
+    }
+
+    const fn from_wire(value: u8) -> Result<Self, SyncError> {
+        match value {
+            0 => Ok(Self::CasMismatch),
+            1 => Ok(Self::ApplyError),
+            _ => Err(SyncError::InvalidMessage),
+        }
+    }
+}
+
+/// Outcome of a receiving replica's conditional apply of a [`WriteProposal`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AckOutcome {
+    /// The replica conditionally and durably applied the write.
+    Applied,
+    /// The replica did not apply the write; the reason is a vote-against.
+    Rejected(RejectReason),
+}
+
+/// Active-active proposal: a CAS-conditioned write replicated to a peer.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WriteProposal {
+    pub write_id: WriteId,
+    pub key: KvKey,
+    /// CAS precondition: the prior value hash (`None` means create-if-absent).
+    pub expected: Option<Hash>,
+    pub value: KvValue,
+    pub ttl: Option<Duration>,
+}
+
+/// Acknowledgement of a [`WriteProposal`] from a receiving replica.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WriteAck {
+    pub write_id: WriteId,
+    pub acker: SyncNodeId,
+    pub acker_creation: u32,
+    pub outcome: AckOutcome,
 }
 
 /// One content-addressed node to transfer from source to target.
