@@ -183,6 +183,20 @@ impl ShardState {
                 drop(reply.send(result));
                 None
             }
+            ShardCommandKind::ApplyDurable {
+                key,
+                expected,
+                value,
+                ttl,
+                reply,
+            } => {
+                let result = self
+                    .actor
+                    .apply_durable(&key, expected, value, ttl, &mut self.store)
+                    .map_err(ShardError::from);
+                drop(reply.send(result));
+                None
+            }
             ShardCommandKind::ScanSequences { reply } => {
                 drop(reply.send(self.scan_sequences()));
                 None

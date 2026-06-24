@@ -14,6 +14,16 @@ impl Hash {
         Self(bytes)
     }
 
+    /// `blake3` digest of arbitrary bytes.
+    ///
+    /// Used by the active-active receiver apply (2a-4) to hash a key's current
+    /// value for the CAS-precondition compare. This is a content hash of the
+    /// *value bytes*, distinct from a node's structural [`LeafNode::hash`].
+    #[must_use]
+    pub fn of(bytes: &[u8]) -> Self {
+        Self(*blake3::hash(bytes).as_bytes())
+    }
+
     pub const fn as_bytes(&self) -> &[u8; HASH_SIZE] {
         &self.0
     }

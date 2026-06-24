@@ -67,6 +67,13 @@ pub enum ShardError {
         expected: Option<u64>,
         actual: Option<u64>,
     },
+    /// A receiver-side conditional-durable apply (active-active 2a-4) saw a tree
+    /// value hash other than the one the proposing writer expected. This is a CAS
+    /// vote-against, NOT an apply fault: the replica is ahead and applies nothing.
+    CasHashMismatch {
+        expected: Option<Hash>,
+        actual: Option<Hash>,
+    },
 }
 
 impl fmt::Display for ShardError {
@@ -93,6 +100,10 @@ impl fmt::Display for ShardError {
                 formatter,
                 "cas mismatch: expected {expected:?}, actual {actual:?}"
             ),
+            Self::CasHashMismatch { expected, actual } => write!(
+                formatter,
+                "cas hash mismatch: expected {expected:?}, actual {actual:?}"
+            ),
         }
     }
 }
@@ -108,7 +119,8 @@ impl std::error::Error for ShardError {
             | Self::ReplyTimeout { .. }
             | Self::Spawn(_)
             | Self::SequenceConflict { .. }
-            | Self::CasMismatch { .. } => None,
+            | Self::CasMismatch { .. }
+            | Self::CasHashMismatch { .. } => None,
         }
     }
 }
@@ -188,6 +200,13 @@ pub(super) enum ShardCommandKind {
         key: Vec<u8>,
         expected: Option<u64>,
         new: u64,
+        reply: SyncSender<Result<(), ShardError>>,
+    },
+    ApplyDurable {
+        key: Vec<u8>,
+        expected: Option<Hash>,
+        value: Vec<u8>,
+        ttl: Option<Duration>,
         reply: SyncSender<Result<(), ShardError>>,
     },
     ScanSequences {
@@ -449,6 +468,43 @@ impl ShardHandle {
             key,
             expected,
             new,
+            reply,
+        })?;
+        recv(&response, self.pid, timeout)?
+    }
+
+    /// Conditionally and DURABLY apply a replicated write (active-active 2a-4).
+    ///
+    /// The read of the current tree value hash, the comparison against
+    /// `expected` (the proposing writer's CAS precondition; `None` =
+    /// expect-absent), the write of `value` (with `ttl`), and the fsync to stable
+    /// storage all run inside ONE actor slice, so the compare and the apply cannot
+    /// race against another command and the value is on disk before this returns.
+    ///
+    /// On a hash mismatch nothing is written and [`ShardError::CasHashMismatch`]
+    /// is returned (a CAS vote-against). On a match the write is committed — which
+    /// fsyncs the tree nodes to the [`crate::store::DiskStore`] and the WAL's
+    /// committed-root marker — BEFORE the reply, so an `Ok` attests durability, not
+    /// merely a page-cache write.
+    ///
+    /// # Errors
+    /// Returns a [`ShardError`] as for [`Self::get`], or
+    /// [`ShardError::CasHashMismatch`] when the current value hash is not
+    /// `expected`.
+    pub fn apply_durable(
+        &self,
+        key: Vec<u8>,
+        expected: Option<Hash>,
+        value: Vec<u8>,
+        ttl: Option<Duration>,
+        timeout: Duration,
+    ) -> Result<(), ShardError> {
+        let (reply, response) = mpsc::sync_channel(1);
+        self.enqueue(ShardCommandKind::ApplyDurable {
+            key,
+            expected,
+            value,
+            ttl,
             reply,
         })?;
         recv(&response, self.pid, timeout)?
