@@ -34,6 +34,7 @@
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -42,11 +43,35 @@ use std::time::Duration;
 use beamr::atom::{Atom, AtomTable};
 use beamr::distribution::ConnectionManager;
 use beamr::distribution::resolver::{NodeResolver, ResolveError, ResolveFuture};
+use dashmap::DashMap;
 use tokio::runtime::{Builder, Handle, Runtime};
 
-use super::protocol::{
-    SyncError, SyncMessage, register_beamr_sync_handler, send_sync_message_via_beamr,
+use crate::api::kv::{KvKey, KvValue};
+use crate::sync::SyncNodeId;
+use crate::sync::consistency::{
+    CasVote, ConsistencyError, QuorumOutcome, StrongConsistency, wait_for_cas_quorum_from_receiver,
 };
+use crate::sync::membership::WriteMembership;
+use crate::tree::Hash;
+
+use super::protocol::{
+    AckOutcome, RejectReason, SyncError, SyncMessage, WriteAck, WriteId, WriteProposal,
+    encode_beamr_sync_frame, register_beamr_sync_handler, send_sync_message_via_beamr,
+};
+
+/// Writer-side correlation registry: in-flight `WriteId` → the channel that the
+/// blocked coordinator is tallying votes on.
+///
+/// Owned by the [`DistributionEndpoint`] so the inbound `WriteAck` handler (which
+/// runs on a beamr read-loop task) and the synchronous [`DistributionEndpoint::propose_write`]
+/// coordinator share exactly one map. `DashMap` is used (rather than a
+/// `Mutex<HashMap<…>>`) because the two access sites run concurrently on
+/// different thread classes — the async read loop inserting/looking-up votes
+/// while a blocking writer registers/deregisters — and `DashMap` gives sharded,
+/// poison-free concurrent access without wrapping every touch in a poisoned-lock
+/// recovery dance. The value channel is an `mpsc::Sender<CasVote<SyncNodeId>>`
+/// (the blocking primitive `wait_for_cas_quorum_from_receiver` consumes).
+type WriteRegistry = Arc<DashMap<WriteId, Sender<CasVote<SyncNodeId>>>>;
 
 /// Default authentication cookie shared across a haematite cluster's links.
 ///
@@ -122,6 +147,17 @@ pub struct DistributionEndpoint {
     local_name: String,
     /// Bound listen address (with the OS-assigned port resolved).
     local_addr: SocketAddr,
+    /// This endpoint's per-restart OTP incarnation.
+    ///
+    /// The inbound `WriteAck` router gates acks on
+    /// `write_id.origin_creation == local_creation` (design Fix D) so a stale ack
+    /// for a *prior* writer incarnation cannot satisfy a post-restart write that
+    /// reused the same in-memory `counter`.
+    local_creation: u32,
+    /// Monotonic source for the `counter` field of locally-originated `WriteId`s.
+    write_counter: AtomicU64,
+    /// Writer-side correlation registry shared with the inbound `WriteAck` router.
+    registry: WriteRegistry,
 }
 
 impl std::fmt::Debug for DistributionEndpoint {
@@ -181,7 +217,8 @@ impl DistributionEndpoint {
         resolver.insert(&local_name, local_addr);
 
         let (tx, inbound) = mpsc::channel::<InboundSync>();
-        register_inbound_drain(&manager, tx);
+        let registry: WriteRegistry = Arc::new(DashMap::new());
+        register_inbound_drain(&manager, tx, Arc::clone(&registry), local_creation);
 
         Ok(Self {
             atom_table,
@@ -192,6 +229,9 @@ impl DistributionEndpoint {
             inbound: Mutex::new(inbound),
             local_name,
             local_addr,
+            local_creation,
+            write_counter: AtomicU64::new(0),
+            registry,
         })
     }
 
@@ -205,6 +245,13 @@ impl DistributionEndpoint {
     #[must_use]
     pub const fn local_addr(&self) -> SocketAddr {
         self.local_addr
+    }
+
+    /// This endpoint's per-restart OTP incarnation (the `creation` advertised in
+    /// the handshake and embedded in locally-originated `WriteId`s).
+    #[must_use]
+    pub const fn local_creation(&self) -> u32 {
+        self.local_creation
     }
 
     /// Register a peer's name → address mapping so it can be dialed by name.
@@ -294,6 +341,112 @@ impl DistributionEndpoint {
         self.send(self.atom_table.intern(peer_name), message)
     }
 
+    /// Coordinate one Strong CAS write to quorum across the cluster.
+    ///
+    /// This is the active-active "2a-3" writer-side coordinator and the sync/async
+    /// bridge. It:
+    ///
+    /// 1. allocates an incarnation-safe [`WriteId`] (`origin = local_name`,
+    ///    `origin_creation = local_creation`, `counter` from a monotonic field);
+    /// 2. registers `write_id → Sender` in the shared correlation registry so the
+    ///    inbound `WriteAck` router can feed votes back;
+    /// 3. spawns a [`WriteProposal`] send to each `send_target` onto the endpoint
+    ///    runtime (fire-and-forget; a failed send is logged-and-ignored — the tally
+    ///    times out or fences. Robust at-least-once retry/backoff is a follow-up;
+    ///    the structure leaves room for a retry loop here);
+    /// 4. blocks the calling thread on [`wait_for_cas_quorum_from_receiver`]. The
+    ///    LOCAL node self-accepts implicitly via the tally's `count_local_ack`; no
+    ///    local [`CasVote`] is sent (that would double-count the local ack).
+    ///
+    /// The `write_id` is ALWAYS deregistered before returning (commit, fence, or
+    /// timeout) by a drop-guard, so neither an early return nor a panic can leak a
+    /// registry entry; a late ack arriving after deregistration is dropped by the
+    /// inbound router's unknown-`write_id` path.
+    ///
+    /// # Threading contract
+    ///
+    /// This call BLOCKS the calling thread on the quorum receiver, so it must run
+    /// on a synchronous (non-async) thread. If invoked from within ANY tokio
+    /// runtime context it returns [`ConsistencyError::TransportUnavailable`] rather
+    /// than parking a beamr worker (which could wedge the single-worker runtime
+    /// under load).
+    pub fn propose_write(
+        &self,
+        key: KvKey,
+        expected: Option<Hash>,
+        value: KvValue,
+        ttl: Option<Duration>,
+        membership: &WriteMembership,
+        timeout: Duration,
+    ) -> Result<QuorumOutcome<SyncNodeId>, ConsistencyError> {
+        // The coordinator BLOCKS; it must not run on a runtime worker (it would
+        // park a beamr worker and can deadlock the single-worker runtime).
+        if Handle::try_current().is_ok() {
+            return Err(ConsistencyError::TransportUnavailable);
+        }
+
+        let write_id = WriteId {
+            origin: SyncNodeId::new(self.local_name.clone()),
+            origin_creation: self.local_creation,
+            counter: self.write_counter.fetch_add(1, Ordering::Relaxed),
+        };
+
+        let (vote_tx, vote_rx) = mpsc::channel::<CasVote<SyncNodeId>>();
+        self.registry.insert(write_id.clone(), vote_tx);
+
+        // Deregister on EVERY exit path (commit, fence, timeout, early return, or
+        // panic) so the registry can never leak an entry. A late ack that arrives
+        // after this guard fires is dropped by the inbound router (unknown id).
+        let _guard = RegistryGuard {
+            registry: &self.registry,
+            write_id: write_id.clone(),
+        };
+
+        let handle = self
+            .runtime()
+            .map_err(|_error| ConsistencyError::TransportUnavailable)?
+            .handle()
+            .clone();
+        let proposal = WriteProposal {
+            write_id,
+            key,
+            expected,
+            value,
+            ttl,
+        };
+
+        // Encode the proposal frame ONCE on this synchronous thread (a `SyncError`
+        // here means the proposal could not be framed at all — fail closed rather
+        // than self-quorum on an unsendable write).
+        let frame = encode_beamr_sync_frame(&SyncMessage::WriteProposal(proposal))
+            .map_err(|_error| ConsistencyError::TransportUnavailable)?;
+        let frame = Arc::new(frame);
+
+        // Fire-and-forget a proposal to each reachable send target. The send runs
+        // natively async on the endpoint runtime (NOT the sync `block_on` bridge —
+        // we are already inside the runtime here). At-least-once is a single
+        // attempt this increment; a failed send is logged-and-ignored (the tally
+        // times out or fences). Structured so a retry loop slots in here.
+        for target in &membership.send_targets {
+            let manager = self.manager.clone();
+            let remote = self.atom_table.intern(target.as_str());
+            let frame = Arc::clone(&frame);
+            handle.spawn(async move {
+                match manager.get_connection(remote) {
+                    Some(connection) => {
+                        if let Err(error) = connection.write_raw(frame.as_slice()).await {
+                            log::warn!("write proposal send failed: {error}");
+                        }
+                    }
+                    None => log::warn!("write proposal send target unreachable"),
+                }
+            });
+        }
+
+        let strong = StrongConsistency::new(membership.total_nodes, timeout);
+        wait_for_cas_quorum_from_receiver(strong, &vote_rx)
+    }
+
     /// Block until an inbound sync message arrives or `timeout` elapses.
     ///
     /// Returns `Ok(Some(_))` with the decoded message (or a decode error),
@@ -366,12 +519,75 @@ impl AcceptGuard {
     }
 }
 
+/// Deregisters a `write_id` from the correlation registry on drop.
+///
+/// Held by [`DistributionEndpoint::propose_write`] so EVERY exit path — commit,
+/// fence, timeout, early return, or panic — removes the entry. This is the
+/// "registry leak" mitigation from the design risk register: a registered
+/// `write_id` is bounded by the lifetime of the in-flight write.
+struct RegistryGuard<'registry> {
+    registry: &'registry WriteRegistry,
+    write_id: WriteId,
+}
+
+impl Drop for RegistryGuard<'_> {
+    fn drop(&mut self) {
+        self.registry.remove(&self.write_id);
+    }
+}
+
 /// Register the beamr control-frame handler that drains decoded sync messages.
-fn register_inbound_drain(manager: &ConnectionManager, sender: Sender<InboundSync>) {
+///
+/// Inbound [`SyncMessage::WriteAck`] is ROUTED to the writer-side correlation
+/// registry instead of the generic drain (it is a reply to a local in-flight
+/// write, not a request to apply). Every other variant flows to the generic
+/// drain unchanged.
+fn register_inbound_drain(
+    manager: &ConnectionManager,
+    sender: Sender<InboundSync>,
+    registry: WriteRegistry,
+    local_creation: u32,
+) {
     register_beamr_sync_handler(manager, move |decoded| {
         // The read loop runs on a beamr lifecycle task; `Sender::send` is
-        // non-blocking and safe to call from there. A send error means the
-        // receiver was dropped (endpoint torn down) — nothing to do.
-        let _ = sender.send(decoded);
+        // non-blocking and safe to call from there.
+        match decoded {
+            Ok(SyncMessage::WriteAck(ack)) => route_write_ack(&registry, local_creation, &ack),
+            // Every OTHER variant (and decode errors) -> generic drain. A send
+            // error means the receiver was dropped (endpoint torn down).
+            other => {
+                let _ = sender.send(other);
+            }
+        }
     });
+}
+
+/// Route an inbound `WriteAck` to the coordinator waiting on its `write_id`.
+///
+/// Applies the incarnation gate (design Fix D): an ack is dropped unless
+/// `write_id.origin_creation == local_creation`, so a stale ack from a prior
+/// writer incarnation can never satisfy a reused `write_id`. An unknown/expired
+/// `write_id` (already deregistered) and a send onto a disconnected receiver are
+/// both dropped quietly — no panic.
+fn route_write_ack(registry: &WriteRegistry, local_creation: u32, ack: &WriteAck) {
+    // Fix D incarnation gate: discard an ack minted for a prior incarnation of
+    // this writer, even if it names a counter we have since reused.
+    if ack.write_id.origin_creation != local_creation {
+        return;
+    }
+
+    // Unknown / already-deregistered write_id -> drop quietly.
+    let Some(sender) = registry.get(&ack.write_id) else {
+        return;
+    };
+
+    let vote = match ack.outcome {
+        AckOutcome::Applied => CasVote::Accept(ack.acker.clone()),
+        AckOutcome::Rejected(RejectReason::CasMismatch) => CasVote::Reject(ack.acker.clone()),
+        AckOutcome::Rejected(RejectReason::ApplyError) => CasVote::Fault(ack.acker.clone()),
+    };
+
+    // Send-on-disconnected (coordinator already returned + dropped the receiver)
+    // -> drop quietly.
+    let _ = sender.send(vote);
 }
