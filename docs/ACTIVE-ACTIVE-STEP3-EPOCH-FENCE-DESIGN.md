@@ -274,6 +274,27 @@ at read), so a refresh-before-expiry (a higher-`seq` put) always wins over a sta
 stamp, and physical sweep is local GC. This closes the review's delete/sweep gap at the root:
 **exactly one write path, every committed mutation stamped + fenced + replicated.**
 
+**Enforcement invariants (second-review findings — these are PRECONDITIONS, not prose).** The
+no-duplicate-stamp and no-resurrection arguments above are only true if the build enforces:
+
+- **R-LE (live-epoch serve authority).** A node stamps writes from an **in-memory `live_epoch`** set
+  ONLY by a successful `acquire_shard` *in this process lifetime* — NEVER from the disk-recovered
+  `owner_epoch` (which exists only for the fence/promise logic). A crashed owner must re-acquire (⟹
+  strictly higher epoch) before serving. With no live election, stamp `Ballot::bottom()` (2a-compat
+  mode, where handoff-merge is not used). Without R-LE a recovered `owner_epoch` would let a restarted
+  node stamp `(e', 0)` again, colliding with pre-crash `(e', k)`.
+- **R-SEQ (owner-assigned, wire-carried, atomic).** The `seq` is assigned by the **owner** from an
+  **atomic per-(shard, live_epoch) counter**, once per write, and **carried in the `WriteProposal`**
+  so every replica stores the *identical* stamp for a given write (else the merge cannot treat it as
+  one entry). `seq` resets to 0 when `live_epoch` changes; gaps from fenced/timed-out writes are fine.
+  Never a per-node in-slice assignment, never a non-atomic read-increment at the call site (TOCTOU,
+  cf. R8).
+- **R-TOMB (immortal tombstones).** Tombstones are **never** GC'd or TTL-swept in the step-3 safety
+  core; the existing `delete_if_expired`/sweep path MUST skip tombstones. A swept tombstone is
+  indistinguishable from never-written and silently **resurrects a committed delete** on the next
+  merge with a lagging node. Bounded-tombstone GC requires a future membership-wide low-water-mark
+  (every node past the tombstone's stamp); explicitly out of scope here.
+
 **Handoff = union + per-key max-stamp merge.** The new owner, after winning (§2.2) and before
 serving:
 
@@ -427,12 +448,16 @@ Same discipline as 2a. NEVER trust a green without my own adversarial read + re-
 - **3-3 — Epoch fence in `apply_durable`**: the `< promised → Fenced` / `≥ → adopt+CAS` rule at
   `shard/actor.rs:331`, plumb `epoch` through `WriteProposal` and `replicate_write`.
 - **3-4 — Unified stamped write path + handoff merge (REVISED, §2.4).** Sub-increments:
-  - **3-4a — Commit stamp.** `(epoch, seq)` on every committed write; `seq` in-memory per won epoch
-    (NOT persisted — serve-authority invariant: re-acquire to serve after crash). Stamp stored in the
-    value envelope; CAS stays over the logical value (stamp is NOT in the CAS hash). 3-3 fence
-    unchanged.
+  - **3-4a — Commit stamp.** `(epoch, seq)` on every committed write. Enforce **R-LE** (in-memory
+    `live_epoch`, separate from durable `owner_epoch`; stamp from `live_epoch` or `bottom`) and
+    **R-SEQ** (owner-assigned atomic per-(shard,live_epoch) `seq`, carried in `WriteProposal`, stored
+    identically on every replica). Stamp stored in the value envelope; CAS stays over the logical
+    value (stamp NOT in the CAS hash). 3-3 fence unchanged. *Gate: a crash test proving a recovered
+    `owner_epoch` cannot stamp without re-acquisition (no duplicate `(epoch,seq)`).*
   - **3-4b — Deletes as stamped tombstones through `replicate_write`** (fenced + quorum-replicated +
-    persisted as read-as-absent stamped entries). Remove the local-only `delete` path.
+    persisted as read-as-absent stamped entries). Remove the local-only `delete` path. Enforce
+    **R-TOMB**: the TTL sweep path MUST skip tombstones. *Gate: a tombstone is not removed by sweep
+    and is not resurrected by a merge with a node holding the old value.*
   - **3-4c — Ancestor-free 2-way union + max-stamp merge** (own resolver over prolly-tree iteration
     primitives; NOT `merge_with_report`). Property test: ≥3 forked states, permuted merge order →
     identical root (commutative/associative).
