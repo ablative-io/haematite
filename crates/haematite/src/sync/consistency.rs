@@ -149,6 +149,14 @@ pub enum ConsistencyError {
         timeout: Duration,
     },
     AckFailed,
+    /// The writer-side coordinator could not use the distribution transport to
+    /// drive the write to quorum. This covers two cases the coordinator must fail
+    /// closed on rather than silently self-quorum: the dedicated distribution
+    /// runtime is gone, or the BLOCKING coordinator was invoked from within an
+    /// async runtime context (where parking a worker can deadlock the runtime).
+    /// Distinct from [`Self::AckFailed`] (a peer could not be reached) — this is a
+    /// local precondition failure, not a remote vote.
+    TransportUnavailable,
     /// A CAS write was deterministically out-voted: enough replicas rejected the
     /// proposal that a quorum of accepts is no longer reachable, so the writer is
     /// fenced. This is a clean, deterministic loss — distinct from a transport
@@ -177,6 +185,9 @@ impl fmt::Display for ConsistencyError {
                 "timed out after {timeout:?} waiting for quorum: required {required}, acknowledged {acknowledged}"
             ),
             Self::AckFailed => formatter.write_str("sync acknowledgment failed"),
+            Self::TransportUnavailable => {
+                formatter.write_str("distribution transport unavailable for quorum write")
+            }
             Self::Fenced {
                 required,
                 possible_accepts,
