@@ -312,6 +312,22 @@ pub struct WriteProposal {
     /// [`Ballot::bottom`] and every node's `promised` is also bottom, so the
     /// fence is a no-op (2a sequential semantics preserved unchanged).
     pub epoch: Ballot,
+    /// The owner-assigned per-(shard, live-epoch) sequence number (AA-3-4a,
+    /// R-SEQ). Drawn ONCE by the owner from an atomic counter and carried here so
+    /// EVERY replica stores the identical commit stamp `(epoch, seq)` for this
+    /// write (§2.4). With no live election the owner stamps `seq = 0` over the
+    /// bottom epoch (2a-compat). The receiver stores `(epoch, seq)` verbatim,
+    /// never inventing its own.
+    pub seq: u64,
+}
+
+impl WriteProposal {
+    /// The commit stamp `(epoch, seq)` this write carries (AA-3-4a). The receiver
+    /// stores THIS stamp verbatim so every replica's copy is byte-identical.
+    #[must_use]
+    pub fn stamp(&self) -> crate::sync::ballot::Stamp {
+        crate::sync::ballot::Stamp::new(self.epoch.clone(), self.seq)
+    }
 }
 
 /// Acknowledgement of a [`WriteProposal`] from a receiving replica.

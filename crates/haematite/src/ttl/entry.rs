@@ -4,11 +4,21 @@ use std::fmt;
 use std::time::Duration;
 
 use crate::branch::{Timestamp, current_timestamp};
+use crate::sync::ballot::{Ballot, Stamp};
+use crate::sync::topology::SyncNodeId;
 
 const MAGIC: &[u8; 8] = b"HMTTL001";
 const HEADER_LEN: usize = MAGIC.len() + EXPIRY_WIDTH;
 const EXPIRY_WIDTH: usize = 8;
 const NEVER_EXPIRES: u64 = u64::MAX;
+
+/// Magic of the AA-3-4a STAMPED value envelope. Distinct from [`MAGIC`] (the
+/// plain TTL envelope) so `decode`/visibility can tell the two apart, and so a
+/// stamped value never collides with a legacy/raw value or a TTL-only envelope.
+const STAMP_MAGIC: &[u8; 8] = b"HMSTMP01";
+const COUNTER_WIDTH: usize = 8;
+const SEQ_WIDTH: usize = 8;
+const NODE_LEN_WIDTH: usize = 4;
 
 /// Absolute expiry timestamp in nanoseconds since the Unix epoch.
 pub type ExpiryTimestamp = Timestamp;
@@ -97,6 +107,163 @@ impl TtlEntry {
     }
 }
 
+/// Stored value envelope carrying the causal commit stamp ALONGSIDE the existing
+/// TTL metadata and user bytes (AA-3-4a, §2.4). The envelope now holds
+/// `{ stamp, ttl, value }`.
+///
+/// CRITICAL — the stamp is NOT part of the CAS identity. The CAS hash
+/// (`ShardActor::current_value_hash`) is taken over the LOGICAL value bytes that
+/// the read path returns, which strip BOTH the stamp and the TTL. So two writes
+/// with identical `value` bytes but different stamps decode to the same logical
+/// value and therefore hash identically — the 3-3 fence/CAS semantics are
+/// unchanged and the stamp is pure merge metadata (3-4c).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct StampedEntry {
+    stamp: Stamp,
+    expires_at: Option<ExpiryTimestamp>,
+    value: Vec<u8>,
+}
+
+impl StampedEntry {
+    /// Build a stamped entry over an optional absolute expiry and user bytes.
+    #[must_use]
+    pub const fn new(stamp: Stamp, expires_at: Option<ExpiryTimestamp>, value: Vec<u8>) -> Self {
+        Self {
+            stamp,
+            expires_at,
+            value,
+        }
+    }
+
+    /// The commit stamp `(epoch, seq)`.
+    #[must_use]
+    pub const fn stamp(&self) -> &Stamp {
+        &self.stamp
+    }
+
+    /// Optional absolute expiry timestamp (TTL semantics identical to
+    /// [`TtlEntry`]).
+    #[must_use]
+    pub const fn expires_at(&self) -> Option<ExpiryTimestamp> {
+        self.expires_at
+    }
+
+    /// The LOGICAL user value bytes (stamp- AND TTL-stripped). This is what the
+    /// read path returns and what the CAS hash is taken over.
+    #[must_use]
+    pub fn value(&self) -> &[u8] {
+        &self.value
+    }
+
+    /// Consume the envelope and return the logical user value bytes.
+    #[must_use]
+    pub fn into_value(self) -> Vec<u8> {
+        self.value
+    }
+
+    /// True when the entry has an expiry at or before `now`.
+    #[must_use]
+    pub fn is_expired_at(&self, now: ExpiryTimestamp) -> bool {
+        self.expires_at.is_some_and(|expires_at| expires_at <= now)
+    }
+
+    /// Deterministically encode this stamped envelope.
+    ///
+    /// Layout: `STAMP_MAGIC || epoch.counter.be || node_len.be || node_bytes ||
+    /// seq.be || expiry_or_u64_max.be || value`.
+    #[must_use]
+    pub fn encode(&self) -> Vec<u8> {
+        let node = self.stamp.epoch.node.as_str().as_bytes();
+        let header = STAMP_MAGIC.len()
+            + COUNTER_WIDTH
+            + NODE_LEN_WIDTH
+            + node.len()
+            + SEQ_WIDTH
+            + EXPIRY_WIDTH;
+        let mut encoded = Vec::with_capacity(header.saturating_add(self.value.len()));
+        encoded.extend_from_slice(STAMP_MAGIC);
+        encoded.extend_from_slice(&self.stamp.epoch.counter.to_be_bytes());
+        // node id length is bounded; a name longer than u32::MAX is not
+        // representable on the wire either, so the cast is sound (saturating).
+        let node_len = u32::try_from(node.len()).unwrap_or(u32::MAX);
+        encoded.extend_from_slice(&node_len.to_be_bytes());
+        encoded.extend_from_slice(node);
+        encoded.extend_from_slice(&self.stamp.seq.to_be_bytes());
+        encoded.extend_from_slice(&self.expires_at.unwrap_or(NEVER_EXPIRES).to_be_bytes());
+        encoded.extend_from_slice(&self.value);
+        encoded
+    }
+
+    /// Decode a stamped envelope.
+    ///
+    /// Returns `Ok(None)` when `bytes` does not carry [`STAMP_MAGIC`], so callers
+    /// can fall back to the plain-TTL / raw decode paths.
+    pub fn decode(bytes: &[u8]) -> Result<Option<Self>, TtlDecodeError> {
+        if !bytes.starts_with(STAMP_MAGIC) {
+            return Ok(None);
+        }
+        let mut cursor = STAMP_MAGIC.len();
+        let counter = read_u64(bytes, &mut cursor)?;
+        let node_len = read_u32(bytes, &mut cursor)? as usize;
+        let node_bytes = read_slice(bytes, &mut cursor, node_len)?;
+        let node = String::from_utf8(node_bytes.to_vec())
+            .map_err(|_error| TtlDecodeError::TruncatedEnvelope { len: bytes.len() })?;
+        let seq = read_u64(bytes, &mut cursor)?;
+        let expiry_raw = read_u64(bytes, &mut cursor)?;
+        let value = bytes
+            .get(cursor..)
+            .ok_or(TtlDecodeError::TruncatedEnvelope { len: bytes.len() })?
+            .to_vec();
+        Ok(Some(Self {
+            stamp: Stamp::new(Ballot::new(counter, SyncNodeId::new(node)), seq),
+            expires_at: (expiry_raw != NEVER_EXPIRES).then_some(expiry_raw),
+            value,
+        }))
+    }
+}
+
+/// Encode a value with a causal commit stamp and optional TTL.
+///
+/// EVERY committed write goes through this, so — unlike the plain-TTL path —
+/// there is no raw/unenveloped variant: the stamp must always travel with the
+/// value. The logical `value` bytes are stored verbatim, so the read path
+/// recovers them exactly and the CAS hash is unchanged.
+#[must_use]
+pub fn encode_stamped(value: Vec<u8>, stamp: Stamp, expires_at: Option<ExpiryTimestamp>) -> Vec<u8> {
+    StampedEntry::new(stamp, expires_at, value).encode()
+}
+
+fn read_u64(bytes: &[u8], cursor: &mut usize) -> Result<u64, TtlDecodeError> {
+    let slice = read_slice(bytes, cursor, 8)?;
+    let array: [u8; 8] = slice
+        .try_into()
+        .map_err(|_error| TtlDecodeError::TruncatedEnvelope { len: bytes.len() })?;
+    Ok(u64::from_be_bytes(array))
+}
+
+fn read_u32(bytes: &[u8], cursor: &mut usize) -> Result<u32, TtlDecodeError> {
+    let slice = read_slice(bytes, cursor, 4)?;
+    let array: [u8; 4] = slice
+        .try_into()
+        .map_err(|_error| TtlDecodeError::TruncatedEnvelope { len: bytes.len() })?;
+    Ok(u32::from_be_bytes(array))
+}
+
+fn read_slice<'a>(
+    bytes: &'a [u8],
+    cursor: &mut usize,
+    len: usize,
+) -> Result<&'a [u8], TtlDecodeError> {
+    let end = cursor
+        .checked_add(len)
+        .ok_or(TtlDecodeError::TruncatedEnvelope { len: bytes.len() })?;
+    let slice = bytes
+        .get(*cursor..end)
+        .ok_or(TtlDecodeError::TruncatedEnvelope { len: bytes.len() })?;
+    *cursor = end;
+    Ok(slice)
+}
+
 /// Compute an absolute expiry timestamp as `current_timestamp() + ttl`.
 pub fn expires_at_from_ttl(ttl: Duration) -> Result<ExpiryTimestamp, TtlError> {
     let ttl_nanos = duration_nanos(ttl)?;
@@ -118,9 +285,32 @@ pub fn expires_at_from_ttl(ttl: Duration) -> Result<ExpiryTimestamp, TtlError> {
 pub fn encode_optional_ttl(value: Vec<u8>, ttl: Option<Duration>) -> Result<Vec<u8>, TtlError> {
     match ttl {
         Some(ttl) => TtlEntry::with_ttl(value, ttl).map(|entry| entry.encode()),
-        None if value.starts_with(MAGIC) => Ok(TtlEntry::never(value).encode()),
+        // A raw value beginning with EITHER envelope magic must be wrapped
+        // (never-expiring) so the read path cannot misparse it as a TTL or
+        // stamped header.
+        None if value.starts_with(MAGIC) || value.starts_with(STAMP_MAGIC) => {
+            Ok(TtlEntry::never(value).encode())
+        }
         None => Ok(value),
     }
+}
+
+/// Encode `value` with a causal commit stamp (AA-3-4a) and optional TTL.
+///
+/// Computes the absolute expiry from `ttl` and the current clock. This is the
+/// stamped counterpart of [`encode_optional_ttl`]: it always produces a stamped
+/// envelope (the stamp must travel with every committed write), so there is no
+/// raw variant.
+pub fn encode_stamped_optional_ttl(
+    value: Vec<u8>,
+    stamp: Stamp,
+    ttl: Option<Duration>,
+) -> Result<Vec<u8>, TtlError> {
+    let expires_at = match ttl {
+        Some(ttl) => Some(expires_at_from_ttl(ttl)?),
+        None => None,
+    };
+    Ok(encode_stamped(value, stamp, expires_at))
 }
 
 fn duration_nanos(ttl: Duration) -> Result<u64, TtlError> {
@@ -174,11 +364,94 @@ impl std::error::Error for TtlDecodeError {}
 
 #[cfg(test)]
 mod tests {
-    use super::{MAGIC, TtlEntry, encode_optional_ttl};
+    use super::{
+        MAGIC, STAMP_MAGIC, StampedEntry, TtlEntry, encode_optional_ttl, encode_stamped,
+    };
+    use crate::sync::ballot::{Ballot, Stamp};
+    use crate::sync::topology::SyncNodeId;
+    use crate::tree::Hash;
+    use crate::ttl::filter::{Visibility, visible_value_at};
+
+    fn stamp(counter: u64, node: &str, seq: u64) -> Stamp {
+        Stamp::new(Ballot::new(counter, SyncNodeId::new(node)), seq)
+    }
 
     #[test]
     fn raw_values_decode_as_legacy_never_expiring() -> Result<(), Box<dyn std::error::Error>> {
         assert_eq!(TtlEntry::decode(b"plain")?, None);
+        Ok(())
+    }
+
+    #[test]
+    fn stamped_envelope_round_trips_stamp_ttl_and_value()
+    -> Result<(), Box<dyn std::error::Error>> {
+        // A stamped envelope carries `{ stamp, ttl, value }` and decodes back to
+        // exactly those — including a multi-byte node id and a high seq/counter.
+        let entry = StampedEntry::new(
+            stamp(7, "owner-node-\u{00e9}", 0xdead_beef),
+            Some(42),
+            b"payload".to_vec(),
+        );
+        let decoded = StampedEntry::decode(&entry.encode())?.ok_or("missing stamped envelope")?;
+        assert_eq!(decoded.stamp(), &stamp(7, "owner-node-\u{00e9}", 0xdead_beef));
+        assert_eq!(decoded.expires_at(), Some(42));
+        assert_eq!(decoded.value(), b"payload");
+
+        // A never-expiring stamped value also round-trips (expiry None).
+        let never = StampedEntry::new(stamp(1, "n", 5), None, b"v".to_vec());
+        let decoded = StampedEntry::decode(&never.encode())?.ok_or("missing")?;
+        assert_eq!(decoded.expires_at(), None);
+        assert_eq!(decoded.stamp(), &stamp(1, "n", 5));
+        Ok(())
+    }
+
+    #[test]
+    fn non_stamped_bytes_decode_to_none() -> Result<(), Box<dyn std::error::Error>> {
+        // A plain TTL envelope and a raw value are NOT stamped envelopes.
+        assert_eq!(StampedEntry::decode(b"plain")?, None);
+        assert_eq!(StampedEntry::decode(&TtlEntry::expiring(b"v".to_vec(), 9).encode())?, None);
+        Ok(())
+    }
+
+    /// CAS-SAFETY CRUX (AA-3-4a): two committed writes with the SAME logical value
+    /// bytes but DIFFERENT stamps must produce the SAME `current_value_hash`, i.e.
+    /// the read-visible logical value is identical. The stamp must NOT enter the
+    /// CAS identity. We hash the visibility-filtered (stamp-stripped) value exactly
+    /// as `ShardActor::current_value_hash` does.
+    #[test]
+    fn same_value_different_stamps_hash_identically()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let value = b"logical-value".to_vec();
+        let a = encode_stamped(value.clone(), stamp(3, "A", 0), None);
+        let b = encode_stamped(value.clone(), stamp(9, "B", 17), None);
+        assert_ne!(a, b, "different stamps must encode to different envelope bytes");
+
+        let visible_a = visible_value_at(&a, 0)?;
+        let visible_b = visible_value_at(&b, 0)?;
+        assert_eq!(visible_a, Visibility::Live(value.clone()));
+        assert_eq!(visible_b, Visibility::Live(value.clone()));
+
+        // The CAS hash is over the logical value the read path returns.
+        let hash_a = Hash::of(&visible_a.into_option().ok_or("expired")?);
+        let hash_b = Hash::of(&visible_b.into_option().ok_or("expired")?);
+        assert_eq!(hash_a, hash_b, "the stamp must NOT enter the CAS identity");
+        // And it equals the hash of the bare logical bytes (the proposer's CAS).
+        assert_eq!(hash_a, Hash::of(&value));
+        Ok(())
+    }
+
+    #[test]
+    fn stamped_value_colliding_with_magic_round_trips()
+    -> Result<(), Box<dyn std::error::Error>> {
+        // A logical value that itself begins with STAMP_MAGIC survives the stamped
+        // envelope unambiguously: decode strips the outer header and returns the
+        // inner bytes verbatim (the length-delimited fields make this exact).
+        let mut value = STAMP_MAGIC.to_vec();
+        value.extend_from_slice(b"inner");
+        let encoded = encode_stamped(value.clone(), stamp(2, "z", 1), None);
+        let decoded = StampedEntry::decode(&encoded)?.ok_or("missing")?;
+        assert_eq!(decoded.value(), value.as_slice());
+        assert_eq!(visible_value_at(&encoded, 0)?, Visibility::Live(value));
         Ok(())
     }
 

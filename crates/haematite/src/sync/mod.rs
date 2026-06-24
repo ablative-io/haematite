@@ -9,7 +9,7 @@ pub mod push;
 pub mod scheduler;
 pub mod topology;
 
-pub use ballot::Ballot;
+pub use ballot::{Ballot, Stamp};
 pub use consistency::{
     Ack, CasVote, ConsistencyError, ConsistencyMode, EventualConsistency, QuorumOutcome,
     StrongConsistency, execute_with_consistency, quorum_size, wait_for_cas_quorum,

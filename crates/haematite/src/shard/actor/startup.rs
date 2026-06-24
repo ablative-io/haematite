@@ -16,7 +16,9 @@ use super::{PromiseState, RecordPromiseOutcome};
 pub(super) fn reply_startup_error(command: ShardCommand, message: &str) {
     let error = ShardError::Spawn(message.to_owned());
     match command.kind {
-        ShardCommandKind::Get { reply, .. } => send_get(&reply, error),
+        ShardCommandKind::Get { reply, .. } | ShardCommandKind::GetRaw { reply, .. } => {
+            send_get(&reply, error);
+        }
         ShardCommandKind::DeleteIfExpired { reply, .. } => send_bool(&reply, error),
         ShardCommandKind::Put { reply, .. }
         | ShardCommandKind::Delete { reply, .. }

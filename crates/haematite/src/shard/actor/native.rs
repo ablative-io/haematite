@@ -113,6 +113,14 @@ impl ShardState {
                 drop(reply.send(result));
                 None
             }
+            ShardCommandKind::GetRaw { key, reply } => {
+                let result = self
+                    .actor
+                    .get_raw(&key, &self.store)
+                    .map_err(ShardError::from);
+                drop(reply.send(result));
+                None
+            }
             ShardCommandKind::Put {
                 key,
                 value,
@@ -212,12 +220,12 @@ impl ShardState {
                 expected,
                 value,
                 ttl,
-                write_epoch,
+                stamp,
                 reply,
             } => {
                 let result = self
                     .actor
-                    .apply_durable(&key, expected, value, ttl, write_epoch, &mut self.store)
+                    .apply_durable(&key, expected, value, ttl, stamp, &mut self.store)
                     .map_err(ShardError::from);
                 drop(reply.send(result));
             }

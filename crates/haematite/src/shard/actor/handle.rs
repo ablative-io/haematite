@@ -22,7 +22,7 @@ use beamr::atom::{Atom, AtomTable};
 use beamr::scheduler::Scheduler;
 
 use crate::store::StoreError;
-use crate::sync::ballot::Ballot;
+use crate::sync::ballot::{Ballot, Stamp};
 use crate::tree::{Hash, TreeError};
 use crate::wal::WalError;
 
@@ -182,6 +182,11 @@ pub(super) enum ShardCommandKind {
         key: Vec<u8>,
         reply: SyncSender<Result<Option<Vec<u8>>, ShardError>>,
     },
+    #[doc(hidden)]
+    GetRaw {
+        key: Vec<u8>,
+        reply: SyncSender<Result<Option<Vec<u8>>, ShardError>>,
+    },
     Put {
         key: Vec<u8>,
         value: Vec<u8>,
@@ -226,7 +231,7 @@ pub(super) enum ShardCommandKind {
         expected: Option<Hash>,
         value: Vec<u8>,
         ttl: Option<Duration>,
-        write_epoch: Ballot,
+        stamp: Stamp,
         reply: SyncSender<Result<(), ShardError>>,
     },
     RecordPromise {
@@ -353,6 +358,18 @@ impl ShardHandle {
     pub fn get(&self, key: Vec<u8>, timeout: Duration) -> Result<Option<Vec<u8>>, ShardError> {
         let (reply, response) = mpsc::sync_channel(1);
         self.enqueue(ShardCommandKind::Get { key, reply })?;
+        recv(&response, self.pid, timeout)?
+    }
+
+    /// Read the RAW stored envelope bytes for `key` (stamp + TTL NOT stripped).
+    /// Test-support for AA-3-4a stamp-equality assertions.
+    ///
+    /// # Errors
+    /// Returns a [`ShardError`] as for [`Self::get`].
+    #[doc(hidden)]
+    pub fn get_raw(&self, key: Vec<u8>, timeout: Duration) -> Result<Option<Vec<u8>>, ShardError> {
+        let (reply, response) = mpsc::sync_channel(1);
+        self.enqueue(ShardCommandKind::GetRaw { key, reply })?;
         recv(&response, self.pid, timeout)?
     }
 
@@ -516,23 +533,25 @@ impl ShardHandle {
     /// storage all run inside ONE actor slice, so the compare and the apply cannot
     /// race against another command and the value is on disk before this returns.
     ///
-    /// Before the CAS read runs, the epoch fence (AA-3-3, §2.3) checks
-    /// `write_epoch` against this shard's actor-local `promised` ballot IN THE SAME
-    /// slice: a `write_epoch < promised` is rejected with [`ShardError::Fenced`]
-    /// (nothing applied — a stale/deposed owner's write); a `write_epoch >=
-    /// promised` proceeds to the CAS WITHOUT raising `promised` (R2 — only a
-    /// Prepare advances `promised`).
+    /// Before the CAS read runs, the epoch fence (AA-3-3, §2.3) checks the write's
+    /// epoch (`stamp.epoch`) against this shard's actor-local `promised` ballot IN
+    /// THE SAME slice: a `stamp.epoch < promised` is rejected with
+    /// [`ShardError::Fenced`] (nothing applied — a stale/deposed owner's write); a
+    /// `stamp.epoch >= promised` proceeds to the CAS WITHOUT raising `promised` (R2
+    /// — only a Prepare advances `promised`).
     ///
     /// On a hash mismatch nothing is written and [`ShardError::CasHashMismatch`]
-    /// is returned (a CAS vote-against). On a match the write is committed — which
-    /// fsyncs the tree nodes to the [`crate::store::DiskStore`] and the WAL's
-    /// committed-root marker — BEFORE the reply, so an `Ok` attests durability, not
-    /// merely a page-cache write.
+    /// is returned (a CAS vote-against). On a match the write is committed in the
+    /// STAMPED envelope carrying `stamp` (AA-3-4a) — which fsyncs the tree nodes to
+    /// the [`crate::store::DiskStore`] and the WAL's committed-root marker — BEFORE
+    /// the reply, so an `Ok` attests durability. The `stamp` is the IDENTICAL stamp
+    /// the owner assigned (R-SEQ), stored alongside the value; the CAS hash stays
+    /// over the logical value, so the stamp is not part of the CAS identity.
     ///
     /// # Errors
     /// Returns a [`ShardError`] as for [`Self::get`],
     /// [`ShardError::CasHashMismatch`] when the current value hash is not
-    /// `expected`, or [`ShardError::Fenced`] when `write_epoch` is below the
+    /// `expected`, or [`ShardError::Fenced`] when `stamp.epoch` is below the
     /// shard's `promised` ballot.
     pub fn apply_durable(
         &self,
@@ -540,7 +559,7 @@ impl ShardHandle {
         expected: Option<Hash>,
         value: Vec<u8>,
         ttl: Option<Duration>,
-        write_epoch: Ballot,
+        stamp: Stamp,
         timeout: Duration,
     ) -> Result<(), ShardError> {
         let (reply, response) = mpsc::sync_channel(1);
@@ -549,7 +568,7 @@ impl ShardHandle {
             expected,
             value,
             ttl,
-            write_epoch,
+            stamp,
             reply,
         })?;
         recv(&response, self.pid, timeout)?
