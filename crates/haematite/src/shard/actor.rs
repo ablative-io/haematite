@@ -8,7 +8,7 @@ pub mod native;
 mod scan;
 mod startup;
 
-use errors::{AppendError, CasError};
+use errors::{AppendError, CasError, HashCasError};
 
 pub use handle::{RangeItem, ShardError, ShardHandle};
 
@@ -299,6 +299,59 @@ impl ShardActor {
                 Err(CasError::from(error))
             }
         }
+    }
+
+    /// Conditionally and DURABLY apply a replicated write (active-active 2a-4).
+    ///
+    /// This is the receiver side of quorum-on-write. It reads the current visible
+    /// value for `key`, hashes it, and compares the hash to `expected` (the
+    /// proposing writer's CAS precondition; `None` means expect-absent). On a
+    /// mismatch nothing is written and [`HashCasError::HashMismatch`] is returned —
+    /// the CAS vote-against that fences a stale heal-mid-write proposal at a replica
+    /// that has already moved on. On a match the value (with `ttl`) is buffered and
+    /// committed in this same slice.
+    ///
+    /// The [`Self::commit`] call is the durability boundary: it persists the tree
+    /// nodes to the [`crate::store::DiskStore`] (each node file is fsynced) and
+    /// writes a fsynced committed-root marker into the WAL. Under the production
+    /// `CommitOnly` WAL a plain `put_with_ttl` would only reach the OS page cache;
+    /// committing here is what makes an `Ok` attest stable storage, so the caller
+    /// can acknowledge `Applied` only AFTER this returns.
+    fn apply_durable<S>(
+        &mut self,
+        key: &[u8],
+        expected: Option<Hash>,
+        value: Vec<u8>,
+        ttl: Option<Duration>,
+        store: &mut S,
+    ) -> Result<(), HashCasError>
+    where
+        S: NodeStore + ?Sized,
+    {
+        let actual = self.current_value_hash(key, store)?;
+        if actual != expected {
+            return Err(HashCasError::HashMismatch { expected, actual });
+        }
+        let previous_buffer = self.buffer.clone();
+        let encoded = encode_ttl_value(value, ttl)?;
+        self.buffer.put(key, encoded);
+        match self.commit(store) {
+            Ok(_root) => Ok(()),
+            Err(error) => {
+                self.buffer = previous_buffer;
+                Err(HashCasError::from(error))
+            }
+        }
+    }
+
+    /// Hash of the current visible value for `key`, or `None` if it is absent or
+    /// expired. The hash is `blake3` of the read-visible value bytes (TTL stripped),
+    /// matching what a proposing writer hashes for its CAS precondition.
+    fn current_value_hash<S>(&self, key: &[u8], store: &S) -> Result<Option<Hash>, WalError>
+    where
+        S: NodeStore + ?Sized,
+    {
+        Ok(self.get(key, store)?.map(|value| Hash::of(&value)))
     }
 
     /// Inspect buffered mutations; exposed for tests and future shard wiring.

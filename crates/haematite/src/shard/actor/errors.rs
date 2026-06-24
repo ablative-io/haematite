@@ -5,6 +5,7 @@
 
 use std::fmt;
 
+use crate::tree::Hash;
 use crate::wal::WalError;
 
 use super::handle::ShardError;
@@ -96,6 +97,62 @@ impl From<CasError> for ShardError {
         match error {
             CasError::Mismatch { expected, actual } => Self::CasMismatch { expected, actual },
             CasError::Wal(error) => Self::from(error),
+        }
+    }
+}
+
+/// Errors returned by the receiver-side conditional-durable apply
+/// ([`super::ShardActor::apply_durable`], active-active 2a-4).
+///
+/// Unlike [`CasError`], the precondition is a tree value HASH (not a scalar
+/// `u64`), so a mismatch carries `Option<Hash>` — what the proposing writer
+/// expected vs what this replica actually holds. The distinction matters at the
+/// quorum tally: a [`Self::HashMismatch`] is a CAS *vote-against* (the replica is
+/// ahead and the writer lost the race), whereas [`Self::Wal`] is a genuine apply
+/// fault.
+#[derive(Debug)]
+pub(super) enum HashCasError {
+    HashMismatch {
+        expected: Option<Hash>,
+        actual: Option<Hash>,
+    },
+    Wal(WalError),
+}
+
+impl fmt::Display for HashCasError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::HashMismatch { expected, actual } => write!(
+                formatter,
+                "hash cas mismatch: expected {expected:?}, actual {actual:?}"
+            ),
+            Self::Wal(error) => write!(formatter, "apply WAL error: {error}"),
+        }
+    }
+}
+
+impl std::error::Error for HashCasError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Wal(error) => Some(error),
+            Self::HashMismatch { .. } => None,
+        }
+    }
+}
+
+impl From<WalError> for HashCasError {
+    fn from(error: WalError) -> Self {
+        Self::Wal(error)
+    }
+}
+
+impl From<HashCasError> for ShardError {
+    fn from(error: HashCasError) -> Self {
+        match error {
+            HashCasError::HashMismatch { expected, actual } => {
+                Self::CasHashMismatch { expected, actual }
+            }
+            HashCasError::Wal(error) => Self::from(error),
         }
     }
 }

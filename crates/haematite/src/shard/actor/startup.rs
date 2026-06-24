@@ -20,6 +20,7 @@ pub(super) fn reply_startup_error(command: ShardCommand, message: &str) {
         ShardCommandKind::Put { reply, .. }
         | ShardCommandKind::Delete { reply, .. }
         | ShardCommandKind::Cas { reply, .. }
+        | ShardCommandKind::ApplyDurable { reply, .. }
         | ShardCommandKind::Shutdown { reply } => send_unit(&reply, error),
         ShardCommandKind::Commit { reply } => send_commit(&reply, error),
         ShardCommandKind::Range { reply, .. } => send_range(&reply, error),

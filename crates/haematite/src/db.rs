@@ -23,9 +23,11 @@ use crate::ttl::sweep::{SweepError, SweepHandle};
 mod config;
 mod error;
 pub(crate) mod helpers;
+mod receiver;
 
 pub use config::{DatabaseConfig, DistributedDatabaseConfig};
 pub use error::DatabaseError;
+pub use receiver::respond_to_inbound_writes;
 
 use config::{read_config, validate_database_config, write_config};
 
@@ -266,6 +268,18 @@ impl Database {
     /// Atoms for all currently active distribution connections.
     pub fn connected_nodes(&self) -> Result<Vec<Atom>, DatabaseError> {
         Ok(self.require_distribution()?.connected_nodes())
+    }
+
+    /// Test-support: stop every shard actor so subsequent storage commands fail.
+    ///
+    /// Used by the 2a-4 receiver tests to force a genuine apply fault (a
+    /// disconnected/timed-out shard reply, distinct from a CAS mismatch) and prove
+    /// it surfaces as `Rejected(ApplyError)`. Not part of the production API.
+    #[doc(hidden)]
+    pub fn shutdown_shards_for_test(&self) {
+        for handle in self.router.handles_in_order() {
+            drop(handle.shutdown(self.timeout));
+        }
     }
 
     fn require_distribution(&self) -> Result<&DistributionEndpoint, DatabaseError> {
