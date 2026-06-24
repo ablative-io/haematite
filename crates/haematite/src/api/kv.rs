@@ -176,6 +176,7 @@ mod tests {
             data_dir: path.to_path_buf(),
             shard_count,
             sweep_interval: None,
+            distributed: None,
         }
     }
 

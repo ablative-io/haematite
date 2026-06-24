@@ -25,6 +25,7 @@ fn new_store(dir: &TempDir, shard_count: usize) -> Result<EventStore, Box<dyn Er
         data_dir: dir.path().to_path_buf(),
         shard_count,
         sweep_interval: None,
+        distributed: None,
     };
     Ok(EventStore::new(Database::create(config)?))
 }
@@ -37,6 +38,7 @@ fn new_ttl_store(dir: &TempDir, shard_count: usize) -> Result<EventStore, Box<dy
         // during the sub-second test (its first tick is `interval` away), avoiding
         // scheduler load. Physical sweeping is covered by ttl::sweep's own test.
         sweep_interval: Some(60_000),
+        distributed: None,
     };
     Ok(EventStore::new(Database::create(config)?))
 }

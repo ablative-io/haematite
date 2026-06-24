@@ -26,3 +26,8 @@ pub use pull::{
     pull_from_source,
 };
 pub use push::{build_push_response, build_push_response_for_shard, exchange_roots_for_pull};
+pub use scheduler::{
+    NoopSyncPullTrigger, SyncPullTrigger, SyncSchedulerConfig, SyncSchedulerError,
+    SyncSchedulerHandle, SyncSchedulerStats,
+};
+pub use topology::{ConvergenceProperties, SyncNodeId, SyncPair, SyncTopology, TopologyError};

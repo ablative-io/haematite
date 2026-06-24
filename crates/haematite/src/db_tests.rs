@@ -10,12 +10,15 @@ use beamr::process::ExitReason;
 use serde_json::Value;
 
 use super::{Database, DatabaseConfig, DatabaseError};
+use crate::db::DistributedDatabaseConfig;
+use crate::sync::{SyncNodeId, SyncPair, SyncTopology};
 
 fn config_for(path: &Path, shard_count: usize) -> DatabaseConfig {
     DatabaseConfig {
         data_dir: path.to_path_buf(),
         shard_count,
         sweep_interval: None,
+        distributed: None,
     }
 }
 
@@ -36,6 +39,7 @@ fn assert_config_json(path: &Path, shard_count: usize) -> Result<(), Box<dyn Err
         Some(&Value::from(u64::try_from(shard_count)?))
     );
     assert_eq!(parsed.get("sweep_interval"), Some(&Value::Null));
+    assert_eq!(parsed.get("distributed"), Some(&Value::Null));
     Ok(())
 }
 
@@ -140,6 +144,7 @@ fn open_rejects_zero_shards_from_config() -> Result<(), Box<dyn Error>> {
             "data_dir": dir.path(),
             "shard_count": 0,
             "sweep_interval": null,
+            "distributed": null,
         })
         .to_string(),
     )?;
@@ -403,9 +408,67 @@ fn crate_root_reexports_database_types() {
             data_dir: PathBuf::from("root"),
             shard_count: 1,
             sweep_interval: None,
+            distributed: None,
         },
         None,
         None,
     );
     assert_eq!(result, (PathBuf::from("root"), 1, true, true));
+}
+
+#[test]
+fn distributed_creation_without_topology_is_an_error() -> Result<(), Box<dyn Error>> {
+    let dir = tempfile::tempdir()?;
+    let mut config = config_for(&dir.path().join("db"), 2);
+    config.distributed = Some(DistributedDatabaseConfig {
+        local_node: SyncNodeId::from("a"),
+        nodes: vec!["a".into(), "b".into()],
+        topology: None,
+        sync_interval: 1_000,
+    });
+
+    assert!(matches!(
+        Database::create(config),
+        Err(DatabaseError::MissingSyncTopology)
+    ));
+    Ok(())
+}
+
+#[test]
+fn distributed_creation_writes_explicit_topology_config() -> Result<(), Box<dyn Error>> {
+    let dir = tempfile::tempdir()?;
+    let data_dir = dir.path().join("db");
+    let mut config = config_for(&data_dir, 2);
+    config.distributed = Some(DistributedDatabaseConfig {
+        local_node: SyncNodeId::from("a"),
+        nodes: vec!["a".into(), "b".into(), "c".into()],
+        topology: Some(SyncTopology::Custom(vec![
+            SyncPair::new("a", "b"),
+            SyncPair::new("b", "c"),
+        ])),
+        sync_interval: 60_000,
+    });
+
+    let db = Database::create(config)?;
+    let bytes = fs::read(data_dir.join("config.json"))?;
+    let parsed: Value = serde_json::from_slice(&bytes)?;
+    let distributed = parsed
+        .get("distributed")
+        .and_then(Value::as_object)
+        .ok_or("distributed config missing")?;
+
+    assert_eq!(distributed.get("local_node"), Some(&Value::from("a")));
+    assert_eq!(distributed.get("sync_interval"), Some(&Value::from(60_000)));
+    assert_eq!(
+        distributed.get("topology"),
+        Some(&serde_json::json!({
+            "Custom": [
+                { "source": "a", "target": "b" },
+                { "source": "b", "target": "c" }
+            ]
+        }))
+    );
+
+    drop(db);
+    Ok(())
 }
