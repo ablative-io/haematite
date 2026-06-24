@@ -38,6 +38,17 @@ pub enum SyncError {
     TransportConnectionUnavailable,
     TransportConnectFailed,
     TransportWrite,
+    /// The dedicated distribution runtime could not be constructed.
+    TransportRuntimeUnavailable,
+    /// Binding the distribution listener failed.
+    TransportBind(String),
+    /// The inbound-sync drain has no senders left (endpoint torn down).
+    TransportDrainDisconnected,
+    /// A blocking distribution call (`bind`/`connect`/`send`) was invoked from
+    /// within a tokio runtime context, where its `block_on` bridge would panic.
+    /// Returned instead of panicking; the caller must run it on a blocking thread
+    /// (or drive the work via `DistributionEndpoint::runtime_handle`).
+    TransportBlockingFromAsync,
 }
 
 impl fmt::Display for SyncError {
@@ -83,6 +94,18 @@ impl fmt::Display for SyncError {
             Self::TransportWrite => {
                 formatter.write_str("failed to write sync frame to beamr connection")
             }
+            Self::TransportRuntimeUnavailable => {
+                formatter.write_str("distribution runtime could not be constructed")
+            }
+            Self::TransportBind(message) => {
+                write!(formatter, "distribution listener bind failed: {message}")
+            }
+            Self::TransportDrainDisconnected => {
+                formatter.write_str("distribution inbound drain is disconnected")
+            }
+            Self::TransportBlockingFromAsync => formatter.write_str(
+                "blocking distribution call invoked from within an async runtime context",
+            ),
         }
     }
 }

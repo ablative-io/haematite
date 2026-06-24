@@ -29,6 +29,9 @@ pub enum DatabaseError {
         actual: Option<u64>,
     },
     ConsistencyError(String),
+    /// A live distribution-endpoint operation failed (no endpoint attached, a
+    /// transport send/connect failure, or a disconnected inbound drain).
+    Distribution(String),
 }
 
 impl fmt::Display for DatabaseError {
@@ -81,6 +84,9 @@ impl fmt::Display for DatabaseError {
             Self::ConsistencyError(message) => {
                 write!(formatter, "consistency requirement failed: {message}")
             }
+            Self::Distribution(message) => {
+                write!(formatter, "distribution endpoint error: {message}")
+            }
         }
     }
 }
@@ -106,7 +112,8 @@ impl std::error::Error for DatabaseError {
             | Self::InvalidSyncInterval
             | Self::SequenceConflict { .. }
             | Self::CasMismatch { .. }
-            | Self::ConsistencyError(_) => None,
+            | Self::ConsistencyError(_)
+            | Self::Distribution(_) => None,
         }
     }
 }

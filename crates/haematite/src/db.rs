@@ -8,8 +8,12 @@ use std::time::Duration;
 use beamr::module::ModuleRegistry;
 use beamr::scheduler::{Scheduler, SchedulerConfig};
 
+use beamr::atom::Atom;
+
 use crate::shard::actor::{ShardError, ShardHandle};
 use crate::shard::router::ShardRouter;
+use crate::sync::endpoint::{DistributionEndpoint, InboundSync};
+use crate::sync::protocol::SyncMessage;
 use crate::sync::scheduler::{
     NoopSyncPullTrigger, SyncSchedulerConfig, SyncSchedulerError, SyncSchedulerHandle,
 };
@@ -46,6 +50,13 @@ pub struct Database {
     router: ShardRouter,
     sweeps: Vec<SweepHandle>,
     sync_schedulers: Vec<SyncSchedulerHandle>,
+    /// Live beamr distribution endpoint, present once `with_distribution` runs.
+    ///
+    /// The active-active "2a-0" substrate: the inbound drain + outbound send
+    /// plumbing that lets two live databases exchange `SyncMessage`s. It does not
+    /// yet drive the merge/pull protocol (the sync trigger is still a no-op); it
+    /// only exposes the transport primitives later increments build on.
+    distribution: Option<DistributionEndpoint>,
     timeout: Duration,
 }
 
@@ -180,6 +191,89 @@ impl Database {
             .map_err(map_shard_error)
     }
 
+    /// Attach a live beamr distribution endpoint to this database.
+    ///
+    /// This is the active-active "2a-0" substrate: it installs the inbound-drain
+    /// and outbound-send plumbing two live databases need to exchange
+    /// `SyncMessage`s over a real network. The endpoint owns its own atom table,
+    /// connection manager, accept loop, and tokio runtime (see
+    /// [`DistributionEndpoint`]).
+    ///
+    /// It does NOT replace the no-op sync trigger or drive the pull/merge
+    /// protocol — those are later increments. The database simply takes ownership
+    /// of the endpoint and re-exports its transport primitives
+    /// ([`Database::connect_peer`], [`Database::send_sync_message`],
+    /// [`Database::recv_sync_message`]).
+    #[must_use]
+    pub fn with_distribution(mut self, endpoint: DistributionEndpoint) -> Self {
+        self.distribution = Some(endpoint);
+        self
+    }
+
+    /// Borrow the attached distribution endpoint, if any.
+    #[must_use]
+    pub const fn distribution(&self) -> Option<&DistributionEndpoint> {
+        self.distribution.as_ref()
+    }
+
+    /// Register `peer_name` at `addr` and dial it over real distribution.
+    ///
+    /// Requires [`Database::with_distribution`] to have installed an endpoint.
+    pub fn connect_peer(
+        &self,
+        peer_name: &str,
+        addr: std::net::SocketAddr,
+    ) -> Result<(), DatabaseError> {
+        let endpoint = self.require_distribution()?;
+        endpoint.add_peer(peer_name, addr);
+        endpoint
+            .connect(peer_name)
+            .map_err(|error| DatabaseError::Distribution(error.to_string()))
+    }
+
+    /// Intern `peer_name` into the endpoint's atom table for addressed sends.
+    pub fn peer_atom(&self, peer_name: &str) -> Result<Atom, DatabaseError> {
+        Ok(self.require_distribution()?.peer_atom(peer_name))
+    }
+
+    /// Send `message` to the peer named `peer_name` over the live transport.
+    ///
+    /// Requires an attached endpoint and an established connection to the peer.
+    pub fn send_sync_message(
+        &self,
+        peer_name: &str,
+        message: &SyncMessage,
+    ) -> Result<(), DatabaseError> {
+        self.require_distribution()?
+            .send_to(peer_name, message)
+            .map_err(|error| DatabaseError::Distribution(error.to_string()))
+    }
+
+    /// Block until an inbound sync message arrives or `timeout` elapses.
+    ///
+    /// Returns `Ok(Some(_))` with the decoded message (or a decode error from the
+    /// wire), `Ok(None)` on timeout, and an error if no endpoint is attached or
+    /// the drain has been disconnected.
+    pub fn recv_sync_message(
+        &self,
+        timeout: Duration,
+    ) -> Result<Option<InboundSync>, DatabaseError> {
+        self.require_distribution()?
+            .recv_inbound(timeout)
+            .map_err(|error| DatabaseError::Distribution(error.to_string()))
+    }
+
+    /// Atoms for all currently active distribution connections.
+    pub fn connected_nodes(&self) -> Result<Vec<Atom>, DatabaseError> {
+        Ok(self.require_distribution()?.connected_nodes())
+    }
+
+    fn require_distribution(&self) -> Result<&DistributionEndpoint, DatabaseError> {
+        self.distribution
+            .as_ref()
+            .ok_or_else(|| DatabaseError::Distribution("no distribution endpoint".into()))
+    }
+
     /// Collect every stream's `(stream_key, next_seq)` pair across all shards.
     ///
     /// This walks each shard in parallel, scanning its full key range for the
@@ -291,6 +385,7 @@ fn start_database(config: DatabaseConfig, mode: StartupMode) -> Result<Database,
         router,
         sweeps,
         sync_schedulers,
+        distribution: None,
         timeout: DEFAULT_TIMEOUT,
     })
 }
