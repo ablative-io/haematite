@@ -1,6 +1,7 @@
 pub mod ballot;
 pub mod consistency;
 pub mod endpoint;
+pub mod handoff_merge;
 pub mod membership;
 pub mod merge;
 pub mod protocol;
@@ -18,6 +19,7 @@ pub use consistency::{
 pub use endpoint::{
     DistributionEndpoint, ElectionError, ElectionOutcome, ElectionVote, InboundSync,
 };
+pub use handoff_merge::{HandoffMergeError, merge_committed_union};
 pub use membership::{WriteMembership, resolve_membership};
 pub use merge::{SyncMergeError, SyncMergeResult, SyncMergeRoots, merge_synced_roots};
 pub use protocol::{
