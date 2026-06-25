@@ -150,6 +150,90 @@ impl Database {
         range_on_handle(self.handle_for_shard(shard_id)?, from, to, self.timeout())
     }
 
+    /// Append a routed single-key put, co-located by `route_key` (AA-4-1).
+    ///
+    /// Routes to a shard by hashing `route_key` (via [`Self::handle_for`]) but
+    /// reads/writes the physical `key` bytes. The owning shard stores the physical
+    /// key inside `route_key`'s shard, so every routed operation that supplies the
+    /// SAME `route_key` lands on the SAME shard regardless of the physical key —
+    /// this is the general-KV generalization of how [`crate::EventStore::append`]
+    /// co-locates a stream's events by routing on `stream_key`.
+    ///
+    /// Callers MUST use a stable `route_key` for every record in a co-located
+    /// family; mixing route keys for the same physical key splits it across shards
+    /// and breaks read-after-write. Like plain [`Self::put`] this is a local WAL
+    /// append with no consistency/quorum wait; [`Self::commit`] owns the tree
+    /// flush.
+    pub fn put_routed(
+        &self,
+        route_key: &[u8],
+        key: KvKey,
+        value: KvValue,
+    ) -> Result<(), DatabaseError> {
+        self.handle_for(route_key)?
+            .put_with_ttl(key, value, None, self.timeout())
+            .map_err(map_shard_error)
+    }
+
+    /// Read a routed single key, co-located by `route_key` (AA-4-1).
+    ///
+    /// Routes to a shard by hashing `route_key` (via [`Self::handle_for`]) but
+    /// reads the physical `key` bytes from that shard. Mirrors [`Self::get`]'s
+    /// buffer-before-tree read semantics inside `route_key`'s shard. The caller
+    /// MUST pass the SAME `route_key` used for the matching [`Self::put_routed`];
+    /// a different route key routes to a different shard and will not see the
+    /// value (the co-location guarantee is keyed on `route_key`, exactly as
+    /// [`crate::EventStore`] co-locates a stream by `stream_key`).
+    pub fn get_routed(
+        &self,
+        route_key: &[u8],
+        key: &[u8],
+    ) -> Result<Option<KvValue>, DatabaseError> {
+        self.handle_for(route_key)?
+            .get(key.to_vec(), self.timeout())
+            .map_err(map_shard_error)
+    }
+
+    /// Append a routed single-key STAMPED TOMBSTONE, co-located by `route_key`
+    /// (AA-4-1).
+    ///
+    /// Routes to a shard by hashing `route_key` (via [`Self::handle_for`]) but
+    /// deletes the physical `key` inside that shard. Mirrors [`Self::delete`]'s
+    /// stamped-tombstone path: the stamp is still drawn per physical `key` (R-LE /
+    /// R-SEQ); only the routing target changes to `route_key`. The caller MUST use
+    /// the SAME `route_key` as the matching [`Self::put_routed`] so the tombstone
+    /// lands on the shard that holds the record — the same route-by-key
+    /// co-location [`crate::EventStore`] relies on for `stream_key`.
+    pub fn delete_routed(&self, route_key: &[u8], key: KvKey) -> Result<(), DatabaseError> {
+        let stamp = self.next_stamp_for_key(&key);
+        self.handle_for(route_key)?
+            .delete(key, stamp, self.timeout())
+            .map_err(map_shard_error)
+    }
+
+    /// Read a routed `[from, to)` range, co-located by `route_key` (AA-4-1).
+    ///
+    /// Routes to a shard by hashing `route_key` (via [`Self::handle_for`]) but
+    /// scans the physical `[from, to)` range inside that one shard. Mirrors
+    /// [`Self::range`]'s shard-local merge of committed tree and WAL-buffer
+    /// entries; `from >= to` returns empty without routing. The scan is
+    /// deliberately shard-LOCAL within `route_key`'s shard: a co-located record
+    /// family (all sharing one stable `route_key`) lives entirely on that shard,
+    /// so this returns the whole family in sorted order. Callers MUST use the SAME
+    /// `route_key` used to write the family — the same route-by-key co-location
+    /// [`crate::EventStore`] relies on for `stream_key`.
+    pub fn range_routed(
+        &self,
+        route_key: &[u8],
+        from: &[u8],
+        to: &[u8],
+    ) -> Result<KvRange, DatabaseError> {
+        if from >= to {
+            return Ok(Vec::new());
+        }
+        range_on_handle(self.handle_for(route_key)?, from, to, self.timeout())
+    }
+
     /// Flush every shard's WAL buffer to its prolly tree and return roots by
     /// shard id.
     ///
@@ -535,6 +619,82 @@ mod tests {
         // Out-of-range shard id errors cleanly (no panic).
         let err = db.range_per_shard(db.shard_count(), low, high);
         assert!(err.is_err(), "out-of-range shard_id must error, not panic");
+
+        Ok(())
+    }
+
+    #[test]
+    fn routed_ops_colocate_by_route_key_not_physical_key() -> Result<(), Box<dyn Error>> {
+        let dir = tempfile::tempdir()?;
+        let data_dir = dir.path().join("db");
+        let db = Database::create(config_for(&data_dir, 3))?;
+        assert_eq!(db.shard_count(), 3);
+
+        // Physical key and a bracketing range for the routed scan.
+        let physical_key = b"physical:key".to_vec();
+        let lo = b"physical:";
+        let hi = b"physical;";
+
+        // Find a route_key whose shard differs from the physical key's shard, so
+        // the test proves routing follows route_key, not the physical key. If they
+        // matched, a non-routed get could "accidentally" find the value.
+        let physical_shard = db.shard_for(&physical_key);
+        let mut route_key: Vec<u8> = Vec::new();
+        let mut found = false;
+        for candidate in 0_u64..10_000 {
+            let candidate_key = format!("route:{candidate:06}").into_bytes();
+            if db.shard_for(&candidate_key) != physical_shard {
+                route_key = candidate_key;
+                found = true;
+                break;
+            }
+        }
+        assert!(
+            found,
+            "must find a route_key on a different shard (test is non-vacuous)"
+        );
+        let route_shard = db.shard_for(&route_key);
+        assert_ne!(
+            route_shard, physical_shard,
+            "route_key and physical key must hash to different shards"
+        );
+
+        let value = b"routed-value".to_vec();
+        db.put_routed(&route_key, physical_key.clone(), value.clone())?;
+        db.commit()?;
+
+        // Routed read finds it (routes to route_key's shard).
+        assert_eq!(db.get_routed(&route_key, &physical_key)?, Some(value.clone()));
+
+        // A NON-routed get(physical_key) routes to shard_for(physical_key) — a
+        // DIFFERENT shard — so it must NOT see the value. This is the proof that
+        // co-location is keyed on route_key, not the physical key.
+        assert_eq!(
+            db.get(&physical_key)?,
+            None,
+            "non-routed get must not find a value co-located by route_key"
+        );
+
+        // The value physically lives on route_key's shard, not the physical key's.
+        let in_route_shard = db.range_per_shard(route_shard, lo, hi)?;
+        assert!(
+            in_route_shard.iter().any(|(k, _)| k == &physical_key),
+            "value must physically live on route_key's shard"
+        );
+        let in_physical_shard = db.range_per_shard(physical_shard, lo, hi)?;
+        assert!(
+            !in_physical_shard.iter().any(|(k, _)| k == &physical_key),
+            "value must NOT live on the physical key's shard"
+        );
+
+        // Routed range finds it and is shard-local to route_key's shard.
+        let routed_range = db.range_routed(&route_key, lo, hi)?;
+        assert_eq!(routed_range, vec![(physical_key.clone(), value)]);
+
+        // Routed delete removes it.
+        db.delete_routed(&route_key, physical_key.clone())?;
+        db.commit()?;
+        assert_eq!(db.get_routed(&route_key, &physical_key)?, None);
 
         Ok(())
     }
