@@ -25,7 +25,7 @@ use crate::db::helpers::{event_range_start, event_sequence_key, map_shard_error}
 use crate::db::{Database, DatabaseError};
 use crate::shard::actor::{PromiseState, RecordPromiseOutcome, ShardError};
 use crate::sync::ballot::Ballot;
-use crate::sync::endpoint::{ElectionError, ElectionOutcome};
+use crate::sync::endpoint::{ElectionError, ElectionOutcome, ProposeWrite};
 use crate::sync::membership::WriteMembership;
 use crate::sync::{QuorumOutcome, SyncNodeId};
 use crate::sync::protocol::{
@@ -113,10 +113,12 @@ impl Database {
         // durable apply in step 2 needs them again.
         let outcome = endpoint
             .propose_write_stamped(
-                key.clone(),
-                expected,
-                value.clone(),
-                ttl,
+                ProposeWrite {
+                    key: key.clone(),
+                    expected,
+                    value: value.clone(),
+                    ttl,
+                },
                 stamp.clone(),
                 false,
                 membership,
@@ -184,10 +186,12 @@ impl Database {
         // `tombstone` flag tells each receiver to store a stamped tombstone).
         let outcome = endpoint
             .propose_write_stamped(
-                key.clone(),
-                expected,
-                Vec::new(),
-                None,
+                ProposeWrite {
+                    key: key.clone(),
+                    expected,
+                    value: Vec::new(),
+                    ttl: None,
+                },
                 stamp.clone(),
                 true,
                 membership,
@@ -267,16 +271,14 @@ impl Database {
     /// [`DatabaseError::ConsistencyError`] (the batch did not reach quorum — fenced,
     /// timed out, or transport unavailable), or [`DatabaseError::LocalCommitFailed`]
     /// (quorum reached but the proposer's own durable batch commit failed).
-    // `stream_key`/`payloads` are taken by value to match the owned-argument
-    // ergonomics of the `append` family (`EventStore::append`, `Database::append`)
-    // and `replicate_write`'s owned `key` — the caller builds owned event payloads.
-    // They are addressed by reference internally (the key is reused for every event
-    // key + the counter; payloads are encoded in place), so neither is moved.
-    #[allow(clippy::needless_pass_by_value)]
+    // `stream_key`/`payloads` are borrowed: the key is reused for every event key +
+    // the counter, and the payloads are encoded in place (`payloads.iter()`), so
+    // neither is moved — by-reference is the honest signature and lets callers keep
+    // their owned buffers (e.g. the Aion adapter avoids a `.to_vec()` clone).
     pub fn replicate_append(
         &self,
-        stream_key: Vec<u8>,
-        payloads: Vec<Vec<u8>>,
+        stream_key: &[u8],
+        payloads: &[Vec<u8>],
         expected_seq: u64,
         membership: &WriteMembership,
         timeout: Duration,
@@ -288,7 +290,7 @@ impl Database {
         // Step a: OWNER-LOCAL OCC pre-check. An absent stream reads next-seq 0. On a
         // mismatch we return SequenceConflict and propose NOTHING — the SAME contract
         // `append` honours, so a stale caller never half-replicates a batch.
-        let actual_seq = self.read_stream_next_seq(&stream_key)?.unwrap_or(0);
+        let actual_seq = self.read_stream_next_seq(stream_key)?.unwrap_or(0);
         if actual_seq != expected_seq {
             return Err(DatabaseError::SequenceConflict {
                 expected: expected_seq,
@@ -328,7 +330,7 @@ impl Database {
                     DatabaseError::ConsistencyError("append sequence overflow".to_owned())
                 })?;
             entries.push(BatchWriteEntry {
-                key: event_range_start(&stream_key, engine_seq),
+                key: event_range_start(stream_key, engine_seq),
                 // Event keys are WRITE-ONCE: create-if-absent.
                 expected: None,
                 value: encode_event_value(timestamp, payload),
@@ -346,7 +348,7 @@ impl Database {
             Some(Hash::of(&expected_seq.to_be_bytes()))
         };
         entries.push(BatchWriteEntry {
-            key: event_sequence_key(&stream_key),
+            key: event_sequence_key(stream_key),
             expected: seq_expected,
             value: new_seq.to_be_bytes().to_vec(),
             ttl: None,
@@ -355,7 +357,7 @@ impl Database {
         // Step d: draw ONE stamp (R-LE + R-SEQ, as `replicate_write`), drive the
         // WHOLE batch to peer-quorum, then on success durably apply it locally with
         // the IDENTICAL stamp every replica accepted (§2.4).
-        let shard = self.shard_for(&stream_key);
+        let shard = self.shard_for(stream_key);
         let stamp = self.owner_stamps.next_stamp(shard);
 
         endpoint

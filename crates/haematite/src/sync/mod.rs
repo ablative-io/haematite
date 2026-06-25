@@ -17,7 +17,7 @@ pub use consistency::{
     wait_for_cas_quorum_from_receiver, wait_for_quorum, wait_for_quorum_from_receiver,
 };
 pub use endpoint::{
-    DistributionEndpoint, ElectionError, ElectionOutcome, ElectionVote, InboundSync,
+    DistributionEndpoint, ElectionError, ElectionOutcome, ElectionVote, InboundSync, ProposeWrite,
 };
 pub use handoff_merge::{HandoffMergeError, merge_committed_union};
 pub use membership::{WriteMembership, resolve_membership};

@@ -19,7 +19,7 @@ use std::time::{Duration, Instant};
 use haematite::db::respond_to_inbound_writes;
 use haematite::sync::ballot::Ballot;
 use haematite::sync::membership::WriteMembership;
-use haematite::sync::{DistributionEndpoint, SyncNodeId};
+use haematite::sync::{DistributionEndpoint, ProposeWrite, SyncNodeId};
 use haematite::{Database, DatabaseConfig};
 
 type TestResult = Result<(), Box<dyn Error>>;
@@ -103,10 +103,12 @@ fn real_apply_round_trip_commits_and_stores_value() -> TestResult {
     };
     let key = b"replicated".to_vec();
     let outcome = endpoint_a.propose_write(
-        key.clone(),
-        None,
-        b"value".to_vec(),
-        None,
+        ProposeWrite {
+            key: key.clone(),
+            expected: None,
+            value: b"value".to_vec(),
+            ttl: None,
+        },
         Ballot::bottom(),
         &membership,
         Duration::from_secs(5),

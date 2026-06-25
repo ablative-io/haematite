@@ -39,7 +39,7 @@ use std::time::{Duration, Instant};
 use haematite::db::{DatabaseError, respond_to_inbound_writes};
 use haematite::sync::ballot::Ballot;
 use haematite::sync::membership::WriteMembership;
-use haematite::sync::{ConsistencyError, DistributionEndpoint, SyncNodeId};
+use haematite::sync::{ConsistencyError, DistributionEndpoint, ProposeWrite, SyncNodeId};
 use haematite::{Database, DatabaseConfig};
 
 type TestResult = Result<(), Box<dyn Error>>;
@@ -201,10 +201,12 @@ fn assert_post_heal_c_fenced(node_c: &Node, key: &[u8], value_c: &[u8]) -> TestR
 
     // (1) Structured proof: fenced specifically by CAS rejects.
     let structured = endpoint.propose_write(
-        key.to_vec(),
-        None,
-        value_c.to_vec(),
-        None,
+        ProposeWrite {
+            key: key.to_vec(),
+            expected: None,
+            value: value_c.to_vec(),
+            ttl: None,
+        },
         Ballot::bottom(),
         &membership(3, &[NODE_A, NODE_B]),
         QUORUM_TIMEOUT,
@@ -367,10 +369,12 @@ fn minority_is_fenced_without_reachable_peers() -> TestResult {
     // The structured fence shape: directly drive the quorum primitive to prove C
     // counts ONLY its local ack (1) against required 2 — it cannot self-quorum.
     let direct = node_c.db.distribution().ok_or("C has no endpoint")?.propose_write(
-        key.clone(),
-        None,
-        value,
-        None,
+        ProposeWrite {
+            key: key.clone(),
+            expected: None,
+            value,
+            ttl: None,
+        },
         Ballot::bottom(),
         &membership(3, &[]),
         FENCE_TIMEOUT,
@@ -478,10 +482,12 @@ fn heal_mid_write_exactly_one_side_acquires() -> TestResult {
     // --- Minority C (still partitioned): proposes the conflicting create. -----
     // C starts from k absent on ITS copy and has no reachable peers -> fenced.
     let c_fenced_pre_heal = node_c.db.distribution().ok_or("C has no endpoint")?.propose_write(
-        key.clone(),
-        None,
-        value_c.clone(),
-        None,
+        ProposeWrite {
+            key: key.clone(),
+            expected: None,
+            value: value_c.clone(),
+            ttl: None,
+        },
         Ballot::bottom(),
         &membership(3, &[]),
         FENCE_TIMEOUT,

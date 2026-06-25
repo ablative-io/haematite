@@ -270,6 +270,26 @@ impl std::fmt::Debug for DistributionEndpoint {
     }
 }
 
+/// The write attributes one CAS proposal carries.
+///
+/// Grouped so the [`DistributionEndpoint::propose_write`] /
+/// [`DistributionEndpoint::propose_write_stamped`] coordinators take few
+/// arguments. These four travel together — key + its CAS precondition + the
+/// value to write + an optional TTL — while the stamp tail (epoch / stamp /
+/// tombstone) and quorum tail (membership / timeout) stay separate because they
+/// are coordinator concerns, not the write's own data.
+pub struct ProposeWrite {
+    /// The key to write.
+    pub key: KvKey,
+    /// CAS precondition: the prior value hash (`None` means create-if-absent).
+    pub expected: Option<Hash>,
+    /// The value to write (empty for a tombstone, where `tombstone` is set on the
+    /// coordinator call).
+    pub value: KvValue,
+    /// Optional time-to-live for the written entry.
+    pub ttl: Option<Duration>,
+}
+
 impl DistributionEndpoint {
     /// Bind a distribution listener for `local_name` on `listen_addr`.
     ///
@@ -481,18 +501,9 @@ impl DistributionEndpoint {
     /// runtime context it returns [`ConsistencyError::TransportUnavailable`] rather
     /// than parking a beamr worker (which could wedge the single-worker runtime
     /// under load).
-    // AA-3-3 added the `epoch` stamp, taking this transport primitive to 8
-    // parameters. They are each a distinct, orthogonal write attribute (key /
-    // expected / value / ttl / epoch / membership / timeout); bundling them into a
-    // struct would only move the same fields behind one more indirection and
-    // obscure the call sites, so an exception is clearer than the cure here.
-    #[allow(clippy::too_many_arguments)]
     pub fn propose_write(
         &self,
-        key: KvKey,
-        expected: Option<Hash>,
-        value: KvValue,
-        ttl: Option<Duration>,
+        write: ProposeWrite,
         epoch: Ballot,
         membership: &WriteMembership,
         timeout: Duration,
@@ -500,16 +511,7 @@ impl DistributionEndpoint {
         // The bare-epoch entry point (2a / 3-3 direct callers) stamps `seq = 0`.
         // The owner-driven path (`Database::replicate_write`) uses
         // `propose_write_stamped` with the atomic per-epoch `seq` (R-SEQ).
-        self.propose_write_stamped(
-            key,
-            expected,
-            value,
-            ttl,
-            Stamp::new(epoch, 0),
-            false,
-            membership,
-            timeout,
-        )
+        self.propose_write_stamped(write, Stamp::new(epoch, 0), false, membership, timeout)
     }
 
     /// As [`Self::propose_write`], but carrying the full owner-assigned commit
@@ -517,18 +519,20 @@ impl DistributionEndpoint {
     /// `seq` is placed on the `WriteProposal` so every replica stores the identical
     /// stamp (§2.4); `tombstone` tells the receiver to apply a stamped tombstone
     /// (a replicated delete) through the same fence + CAS path.
-    #[allow(clippy::too_many_arguments)]
     pub fn propose_write_stamped(
         &self,
-        key: KvKey,
-        expected: Option<Hash>,
-        value: KvValue,
-        ttl: Option<Duration>,
+        write: ProposeWrite,
         stamp: Stamp,
         tombstone: bool,
         membership: &WriteMembership,
         timeout: Duration,
     ) -> Result<QuorumOutcome<SyncNodeId>, ConsistencyError> {
+        let ProposeWrite {
+            key,
+            expected,
+            value,
+            ttl,
+        } = write;
         // The coordinator BLOCKS; it must not run on a runtime worker (it would
         // park a beamr worker and can deadlock the single-worker runtime).
         if Handle::try_current().is_ok() {

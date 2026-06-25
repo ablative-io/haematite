@@ -20,7 +20,8 @@ use haematite::sync::consistency::ConsistencyError;
 use haematite::sync::ballot::Ballot;
 use haematite::sync::membership::WriteMembership;
 use haematite::sync::{
-    AckOutcome, DistributionEndpoint, SyncMessage, SyncNodeId, WriteAck, WriteProposal,
+    AckOutcome, DistributionEndpoint, ProposeWrite, SyncMessage, SyncNodeId, WriteAck,
+    WriteProposal,
 };
 
 type TestResult = Result<(), Box<dyn Error>>;
@@ -129,10 +130,12 @@ fn reaches_quorum_via_real_two_endpoint_ack() -> TestResult {
 
     let membership = membership(2, &[NODE_B]);
     let outcome = endpoint_a.propose_write(
-        b"k".to_vec(),
-        None,
-        b"v".to_vec(),
-        None,
+        ProposeWrite {
+            key: b"k".to_vec(),
+            expected: None,
+            value: b"v".to_vec(),
+            ttl: None,
+        },
         Ballot::bottom(),
         &membership,
         Duration::from_secs(5),
@@ -185,10 +188,12 @@ fn duplicate_write_ack_deduped() -> TestResult {
     // The duplicate must NOT count, so a quorum of 2 is exactly right and stable.
     let membership = membership(3, &[NODE_B]);
     let outcome = endpoint_a.propose_write(
-        b"k".to_vec(),
-        None,
-        b"v".to_vec(),
-        None,
+        ProposeWrite {
+            key: b"k".to_vec(),
+            expected: None,
+            value: b"v".to_vec(),
+            ttl: None,
+        },
         Ballot::bottom(),
         &membership,
         Duration::from_secs(5),
@@ -245,10 +250,12 @@ fn late_ack_after_quorum_dropped() -> TestResult {
 
     let membership = membership(2, &[NODE_B]);
     let outcome = endpoint_a.propose_write(
-        b"k".to_vec(),
-        None,
-        b"v".to_vec(),
-        None,
+        ProposeWrite {
+            key: b"k".to_vec(),
+            expected: None,
+            value: b"v".to_vec(),
+            ttl: None,
+        },
         Ballot::bottom(),
         &membership,
         Duration::from_secs(5),
@@ -277,10 +284,12 @@ fn late_ack_after_quorum_dropped() -> TestResult {
         AckOutcome::Applied,
     );
     let outcome2 = endpoint_a.propose_write(
-        b"k2".to_vec(),
-        None,
-        b"v2".to_vec(),
-        None,
+        ProposeWrite {
+            key: b"k2".to_vec(),
+            expected: None,
+            value: b"v2".to_vec(),
+            ttl: None,
+        },
         Ballot::bottom(),
         &membership,
         Duration::from_secs(5),
@@ -331,10 +340,12 @@ fn restart_reuse_ack_rejected_fix_d() -> TestResult {
     // the local ack counts -> quorum unreachable -> timeout.
     let membership = membership(2, &[NODE_B]);
     let outcome = endpoint_a.propose_write(
-        b"k".to_vec(),
-        None,
-        b"v".to_vec(),
-        None,
+        ProposeWrite {
+            key: b"k".to_vec(),
+            expected: None,
+            value: b"v".to_vec(),
+            ttl: None,
+        },
         Ballot::bottom(),
         &membership,
         Duration::from_millis(800),
@@ -370,10 +381,12 @@ async fn propose_write_from_async_context_errors_not_panics() -> TestResult {
         send_targets: Vec::new(),
     };
     let outcome = endpoint.propose_write(
-        b"k".to_vec(),
-        None,
-        b"v".to_vec(),
-        None,
+        ProposeWrite {
+            key: b"k".to_vec(),
+            expected: None,
+            value: b"v".to_vec(),
+            ttl: None,
+        },
         Ballot::bottom(),
         &membership,
         Duration::from_millis(100),

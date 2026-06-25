@@ -248,8 +248,8 @@ fn replicated_batch_lands_on_all_nodes() -> TestResult {
         .acquire_shard_and_serve(SHARD, &membership(3, &[NODE_B, NODE_C]), OP_TIMEOUT)?;
 
     let returned = node_a.db.replicate_append(
-        stream.clone(),
-        vec![e1.clone(), e2.clone(), e3.clone()],
+        &stream,
+        &[e1.clone(), e2.clone(), e3.clone()],
         0,
         &membership(3, &[NODE_B, NODE_C]),
         OP_TIMEOUT,
@@ -292,8 +292,8 @@ fn scan_sequence_keys_enumerates_stamped_counter() -> TestResult {
         .db
         .acquire_shard_and_serve(SHARD, &membership(3, &[NODE_B, NODE_C]), OP_TIMEOUT)?;
     node_a.db.replicate_append(
-        stream.clone(),
-        vec![b"e1".to_vec(), b"e2".to_vec()],
+        &stream,
+        &[b"e1".to_vec(), b"e2".to_vec()],
         0,
         &membership(3, &[NODE_B, NODE_C]),
         OP_TIMEOUT,
@@ -346,8 +346,8 @@ fn multi_shard_each_node_owns_a_distinct_shard_and_replicates() -> TestResult {
         assert_eq!(owner.db.shard_for(&stream), shard);
         let payload = format!("event-on-shard-{shard}").into_bytes();
         let next = owner.db.replicate_append(
-            stream.clone(),
-            vec![payload.clone()],
+            &stream,
+            std::slice::from_ref(&payload),
             0,
             &membership(3, targets),
             OP_TIMEOUT,
@@ -401,8 +401,8 @@ fn failover_serves_full_batch() -> TestResult {
         .acquire_shard_and_serve(SHARD, &membership(3, &[NODE_B, NODE_C]), OP_TIMEOUT)?;
     // Replicate to {B} ONLY: quorum {A,B} reached; C never receives the batch.
     node_a.db.replicate_append(
-        stream.clone(),
-        full.clone(),
+        &stream,
+        &full,
         0,
         &membership(3, &[NODE_B]),
         OP_TIMEOUT,
@@ -454,8 +454,8 @@ fn bare_acquire_without_merge_lacks_batch() -> TestResult {
         .acquire_shard_and_serve(SHARD, &membership(3, &[NODE_B, NODE_C]), OP_TIMEOUT)?;
     // Replicate to {B} ONLY: quorum {A,B} reached, C never receives the batch.
     node_a.db.replicate_append(
-        stream.clone(),
-        vec![e1, e2],
+        &stream,
+        &[e1, e2],
         0,
         &membership(3, &[NODE_B]),
         OP_TIMEOUT,
@@ -504,8 +504,8 @@ fn deposed_owner_append_is_fenced() -> TestResult {
         .db
         .acquire_shard_and_serve(SHARD, &membership(3, &[NODE_B, NODE_C]), OP_TIMEOUT)?;
     node_a.db.replicate_append(
-        stream.clone(),
-        vec![b"pre".to_vec()],
+        &stream,
+        &[b"pre".to_vec()],
         0,
         &membership(3, &[NODE_B, NODE_C]),
         OP_TIMEOUT,
@@ -520,8 +520,8 @@ fn deposed_owner_append_is_fenced() -> TestResult {
     // The DEPOSED owner A appends. Its stamp carries the STALE (lower) epoch; the
     // fence rejects it on the majority. NEVER Ok.
     let deposed = node_a.db.replicate_append(
-        stream.clone(),
-        vec![b"stale-batch-event".to_vec()],
+        &stream,
+        &[b"stale-batch-event".to_vec()],
         1,
         &membership(3, &[NODE_B, NODE_C]),
         OP_TIMEOUT,
@@ -573,8 +573,8 @@ fn stale_expected_seq_conflicts_and_proposes_nothing() -> TestResult {
         .db
         .acquire_shard_and_serve(SHARD, &membership(3, &[NODE_B, NODE_C]), OP_TIMEOUT)?;
     node_a.db.replicate_append(
-        stream.clone(),
-        original.clone(),
+        &stream,
+        &original,
         0,
         &membership(3, &[NODE_B, NODE_C]),
         OP_TIMEOUT,
@@ -582,8 +582,8 @@ fn stale_expected_seq_conflicts_and_proposes_nothing() -> TestResult {
 
     // STALE expected_seq = 0 (the stream is already at 3).
     let conflict = node_a.db.replicate_append(
-        stream.clone(),
-        vec![b"should-not-land".to_vec()],
+        &stream,
+        &[b"should-not-land".to_vec()],
         0,
         &membership(3, &[NODE_B, NODE_C]),
         OP_TIMEOUT,
