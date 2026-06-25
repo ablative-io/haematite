@@ -170,6 +170,12 @@ pub(super) type StreamSeq = (Vec<u8>, u64);
 /// reachable from it, ordered children-before-parents.
 pub type ShardSyncExport = (Option<Hash>, Vec<crate::sync::NodeTransfer>);
 
+/// One item of an [`ShardHandle::apply_durable_batch`] multi-key apply (A1a):
+/// `(key, expected, value, ttl)`. `expected` is that key's own CAS precondition
+/// (`None` = expect-absent); every item in the batch shares ONE stamp and lands
+/// in ONE atomic commit.
+pub type BatchItem = (Vec<u8>, Option<Hash>, Vec<u8>, Option<Duration>);
+
 /// One promiser's contribution to a handoff merge (AA-3-4d): the promiser's
 /// committed `root` (`None` if it had no committed data) plus the full reachable
 /// node set exported from it. The actor `put`s the transfers then folds
@@ -249,6 +255,11 @@ pub(super) enum ShardCommandKind {
     ApplyDurableTombstone {
         key: Vec<u8>,
         expected: Option<Hash>,
+        stamp: Stamp,
+        reply: SyncSender<Result<(), ShardError>>,
+    },
+    ApplyDurableBatch {
+        items: Vec<BatchItem>,
         stamp: Stamp,
         reply: SyncSender<Result<(), ShardError>>,
     },
@@ -623,6 +634,43 @@ impl ShardHandle {
             expected,
             value,
             ttl,
+            stamp,
+            reply,
+        })?;
+        recv(&response, self.pid, timeout)?
+    }
+
+    /// Conditionally + durably apply a BATCH of value puts under ONE shared
+    /// `stamp`, ALL-OR-NOTHING, in ONE WAL commit/fsync (A1a — the actor-level
+    /// foundation for a future replicated multi-key append).
+    ///
+    /// The multi-key generalisation of [`Self::apply_durable`]: every item
+    /// `(key, expected, value, ttl)` is checked against the SAME epoch fence and
+    /// its own per-key CAS (over the stamp-excluded logical value hash) BEFORE
+    /// anything is written, then — only if EVERY check passes — every key's stamped
+    /// put is buffered and committed in ONE atomic fsync'd tree commit, each key
+    /// carrying the IDENTICAL `stamp`.
+    ///
+    /// All-or-nothing: a fence rejection (`stamp.epoch < promised`) rejects the
+    /// WHOLE batch with [`ShardError::Fenced`]; any single key's CAS mismatch
+    /// rejects the WHOLE batch with [`ShardError::CasHashMismatch`]. In either case
+    /// NO key is written (no partial application). An admitted batch does NOT raise
+    /// `promised` (R2). Value puts only.
+    ///
+    /// # Errors
+    /// Returns a [`ShardError`] as for [`Self::get`],
+    /// [`ShardError::CasHashMismatch`] when any key's current value hash is not its
+    /// `expected`, or [`ShardError::Fenced`] when `stamp.epoch` is below the shard's
+    /// `promised` ballot.
+    pub fn apply_durable_batch(
+        &self,
+        items: Vec<BatchItem>,
+        stamp: Stamp,
+        timeout: Duration,
+    ) -> Result<(), ShardError> {
+        let (reply, response) = mpsc::sync_channel(1);
+        self.enqueue(ShardCommandKind::ApplyDurableBatch {
+            items,
             stamp,
             reply,
         })?;

@@ -185,6 +185,7 @@ impl ShardState {
             extra @ (ShardCommandKind::Cas { .. }
             | ShardCommandKind::ApplyDurable { .. }
             | ShardCommandKind::ApplyDurableTombstone { .. }
+            | ShardCommandKind::ApplyDurableBatch { .. }
             | ShardCommandKind::RecordPromise { .. }
             | ShardCommandKind::RecordOwnerEpoch { .. }
             | ShardCommandKind::ReserveMinted { .. }
@@ -241,6 +242,17 @@ impl ShardState {
                 let result = self
                     .actor
                     .apply_durable_tombstone(&key, expected, stamp, &mut self.store)
+                    .map_err(ShardError::from);
+                drop(reply.send(result));
+            }
+            ShardCommandKind::ApplyDurableBatch {
+                items,
+                stamp,
+                reply,
+            } => {
+                let result = self
+                    .actor
+                    .apply_durable_batch(items, stamp, &mut self.store)
                     .map_err(ShardError::from);
                 drop(reply.send(result));
             }
