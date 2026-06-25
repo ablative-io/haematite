@@ -7,24 +7,91 @@ description = "Content-addressed, branchable, actor-native storage engine"
 repository = "https://github.com/tomWhiting/haematite"
 authors = ["Tom Whiting <tom@ablative.com.au>"]
 
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[features]
+default = []
+# Browser storage + hash-parity core. Compiles for wasm32-unknown-unknown from
+# published crates only (R1, R2, R4, R5, R6, R7).
+wasm = [
+    "dep:indexed_db_futures",
+    "dep:js-sys",
+    "dep:wasm-bindgen",
+    "dep:wasm-bindgen-futures",
+    "dep:web-sys",
+    "dep:zrip",
+]
+# Web-worker shard runtime via beamr-wasm (R3). Additive over `wasm`. beamr-wasm
+# 0.4.1 pulls beamr's native default features (zstd C bindings, tokio) which do
+# not target wasm32, so a wasm-clean beamr must be supplied via a workspace
+# [patch.crates-io] (see vendor/). Kept separate so the `wasm` build stays green
+# from published crates.
+wasm-runtime = ["wasm", "dep:beamr-wasm"]
+
 [dependencies]
-blake3 = "1"
 crc32fast = "1"
 log = "0.4"
-zstd = "0.13"
-beamr = "0.9.0"
 lru = "0.12"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+
+# Native-only dependencies. Excluded from the wasm32-unknown-unknown build so
+# that no native-only code (DiskStore, durable WAL, the actor runtime) leaks in.
+[target.'cfg(not(all(target_arch = "wasm32", target_os = "unknown")))'.dependencies]
+beamr = "0.9.0"
+blake3 = "1"
+dashmap = "6.2.1"
 tempfile = "3"
 tokio = { version = "1", features = ["rt-multi-thread", "net"] }
-dashmap = "6.2.1"
+zstd = "0.13"
 
+# WASM-only dependencies. blake3 uses its portable (pure-Rust) backend, zrip is
+# a pure-Rust zstd implementation (the C-backed zstd crate cannot target
+# wasm32-unknown-unknown), and the wasm bindings drive IndexedDB and beamr-wasm.
+[target.'cfg(all(target_arch = "wasm32", target_os = "unknown"))'.dependencies]
+beamr-wasm = { version = "0.4.1", optional = true }
+blake3 = { version = "1", default-features = false, features = ["pure"] }
+indexed_db_futures = { version = "0.6.4", default-features = false, features = [
+    "typed-arrays",
+], optional = true }
+js-sys = { version = "0.3", optional = true }
+wasm-bindgen = { version = "0.2", optional = true }
+wasm-bindgen-futures = { version = "0.4", optional = true }
+web-sys = { version = "0.3", features = [
+    "DedicatedWorkerGlobalScope",
+    "DomException",
+    "IdbDatabase",
+    "IdbFactory",
+    "IdbObjectStore",
+    "IdbObjectStoreParameters",
+    "IdbOpenDbRequest",
+    "IdbRequest",
+    "IdbTransaction",
+    "IdbTransactionMode",
+    "IdbVersionChangeEvent",
+    "MessageEvent",
+    "Worker",
+    "WorkerGlobalScope",
+    "WorkerOptions",
+    "WorkerType",
+    "Window",
+], optional = true }
+zrip = { version = "0.6.0", default-features = false, features = [
+    "std",
+], optional = true }
+
+# Size optimisation: wasm-opt -Oz on the release wasm-pack build (R7).
+[package.metadata.wasm-pack.profile.release]
+wasm-opt = ["-Oz"]
 
 [dev-dependencies]
 proptest = "1"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "time", "sync"] }
 criterion = "0.5"
+
+[target.'cfg(all(target_arch = "wasm32", target_os = "unknown"))'.dev-dependencies]
+wasm-bindgen-test = "0.3"
 
 [[bench]]
 name = "single_shard_ops"
@@ -57,3 +124,8 @@ module_name_repetitions = "allow"
 must_use_candidate = "allow"
 missing_errors_doc = "allow"
 missing_panics_doc = "allow"
+# The wasm IndexedDB futures hold `!Send` JS handles across await points; this
+# is inherent to single-threaded browser async and never applies to the native
+# build (which has no such futures), so the nursery `future_not_send` lint is
+# not meaningful here.
+future_not_send = "allow"
