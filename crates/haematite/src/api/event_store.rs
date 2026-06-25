@@ -314,6 +314,16 @@ fn decode_event_seq(stream_key: &[u8], encoded: &[u8]) -> Result<u64, ApiError> 
 
 /// Encode a stored event value: `timestamp.to_be_bytes() || payload`.
 fn encode_value(timestamp: Timestamp, payload: &[u8]) -> Vec<u8> {
+    encode_event_value(timestamp, payload)
+}
+
+/// Encode a stored event value `timestamp.to_be_bytes() || payload` (A1c).
+///
+/// The single shared definition the LOCAL `append` (via [`encode_value`]) and the
+/// replicated [`replicate_append`](crate::db::Database::replicate_append) both use,
+/// so a replicated event's logical value is byte-identical to a locally-appended
+/// one and [`decode_value`] reads either back to the same `(timestamp, payload)`.
+pub(crate) fn encode_event_value(timestamp: Timestamp, payload: &[u8]) -> Vec<u8> {
     let mut encoded = Vec::with_capacity(TS_WIDTH.saturating_add(payload.len()));
     encoded.extend_from_slice(&timestamp.to_be_bytes());
     encoded.extend_from_slice(payload);

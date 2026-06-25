@@ -58,9 +58,9 @@ use crate::sync::membership::WriteMembership;
 use crate::tree::Hash;
 
 use super::protocol::{
-    AckOutcome, Nack, Prepare, Promise, PushResponse, RejectReason, ShardSyncRequest, SyncError,
-    SyncMessage, WriteAck, WriteId, WriteProposal, encode_beamr_sync_frame,
-    register_beamr_sync_handler, send_sync_message_via_beamr,
+    AckOutcome, BatchWriteAck, BatchWriteEntry, BatchWriteProposal, Nack, Prepare, Promise,
+    PushResponse, RejectReason, ShardSyncRequest, SyncError, SyncMessage, WriteAck, WriteId,
+    WriteProposal, encode_beamr_sync_frame, register_beamr_sync_handler, send_sync_message_via_beamr,
 };
 
 /// Writer-side correlation registry: in-flight `WriteId` → the channel that the
@@ -602,6 +602,106 @@ impl DistributionEndpoint {
         wait_for_cas_quorum_from_receiver(strong, &vote_rx)
     }
 
+    /// Coordinate ONE all-or-nothing multi-key BATCH to quorum across the cluster
+    /// (A1c — the batch analogue of [`Self::propose_write_stamped`]).
+    ///
+    /// Sends ONE [`BatchWriteProposal`] (the WHOLE stream-append's entries under
+    /// ONE shared `(epoch, seq)` `stamp` and ONE explicit owning `shard_id`) to each
+    /// membership peer, then blocks collecting [`BatchWriteAck`]s and tallies a
+    /// strict-majority quorum on EXACTLY the same machinery the single-key path uses:
+    ///
+    /// * the SAME writer-side correlation registry (`write_id → Sender<CasVote>`),
+    ///   because a [`BatchWriteAck`] has the identical `(write_id, acker,
+    ///   acker_creation, outcome)` shape as a [`WriteAck`] — the inbound router maps
+    ///   its outcome to a [`CasVote`] with [`route_write_ack`], so an ack counts
+    ///   toward quorum ONLY when `outcome == Applied`; a [`AckOutcome::Rejected`]
+    ///   (a fence or any single-key CAS mismatch) is a vote-AGAINST, and a genuine
+    ///   apply fault is a retryable `Fault` — IDENTICAL to the single-key tally;
+    /// * the SAME [`StrongConsistency`] tally + [`wait_for_cas_quorum_from_receiver`]
+    ///   blocking primitive, so the local node self-accepts as a phantom (no local
+    ///   apply yet — the proposer applies in `replicate_append` step d).
+    ///
+    /// Because the ack shape and the vote mapping are shared, there is NO parallel
+    /// tally: this is `propose_write_stamped` over a batch frame.
+    ///
+    /// # Threading contract
+    /// BLOCKS the calling thread on the quorum receiver, so it must run OUTSIDE any
+    /// tokio runtime (same guard as [`Self::propose_write_stamped`]); from within a
+    /// runtime it returns [`ConsistencyError::TransportUnavailable`].
+    ///
+    /// # Errors
+    /// Returns [`ConsistencyError`] when the batch does not reach quorum (fenced,
+    /// timed out, or the transport was unavailable / the frame could not be encoded).
+    pub fn propose_batch_stamped(
+        &self,
+        shard_id: ShardId,
+        entries: Vec<BatchWriteEntry>,
+        stamp: Stamp,
+        membership: &WriteMembership,
+        timeout: Duration,
+    ) -> Result<QuorumOutcome<SyncNodeId>, ConsistencyError> {
+        // The coordinator BLOCKS; it must not run on a runtime worker (it would
+        // park a beamr worker and can deadlock the single-worker runtime).
+        if Handle::try_current().is_ok() {
+            return Err(ConsistencyError::TransportUnavailable);
+        }
+
+        let write_id = WriteId {
+            origin: SyncNodeId::new(self.local_name.clone()),
+            origin_creation: self.local_creation,
+            counter: self.write_counter.fetch_add(1, Ordering::Relaxed),
+        };
+
+        // The SAME writer-side registry the single-key path uses: a BatchWriteAck
+        // echoes this write_id and the inbound router feeds its CasVote back here.
+        let (vote_tx, vote_rx) = mpsc::channel::<CasVote<SyncNodeId>>();
+        self.registry.insert(write_id.clone(), vote_tx);
+        let _guard = RegistryGuard {
+            registry: &self.registry,
+            write_id: write_id.clone(),
+        };
+
+        let handle = self
+            .runtime()
+            .map_err(|_error| ConsistencyError::TransportUnavailable)?
+            .handle()
+            .clone();
+        let proposal = BatchWriteProposal {
+            write_id,
+            shard_id,
+            entries,
+            stamp,
+        };
+
+        // Encode the batch frame ONCE on this synchronous thread (a framing failure
+        // means the batch is unsendable — fail closed rather than self-quorum on an
+        // unsendable write).
+        let frame = encode_beamr_sync_frame(&SyncMessage::BatchWriteProposal(proposal))
+            .map_err(|_error| ConsistencyError::TransportUnavailable)?;
+        let frame = Arc::new(frame);
+
+        // Fire-and-forget the batch proposal to each reachable send target, spawned
+        // onto the endpoint runtime exactly like `propose_write_stamped`.
+        for target in &membership.send_targets {
+            let manager = self.manager.clone();
+            let remote = self.atom_table.intern(target.as_str());
+            let frame = Arc::clone(&frame);
+            handle.spawn(async move {
+                match manager.get_connection(remote) {
+                    Some(connection) => {
+                        if let Err(error) = connection.write_raw(frame.as_slice()).await {
+                            log::warn!("batch write proposal send failed: {error}");
+                        }
+                    }
+                    None => log::warn!("batch write proposal send target unreachable"),
+                }
+            });
+        }
+
+        let strong = StrongConsistency::new(membership.total_nodes, timeout);
+        wait_for_cas_quorum_from_receiver(strong, &vote_rx)
+    }
+
     /// Run ONE Phase-1 Prepare round for `shard_id` at `ballot` and collect
     /// promises to a strict majority of `membership.total_nodes` (§2.2 steps 2-4).
     ///
@@ -1022,6 +1122,16 @@ fn register_inbound_drain(
         // non-blocking and safe to call from there.
         match decoded {
             Ok(SyncMessage::WriteAck(ack)) => route_write_ack(&registry, local_creation, &ack),
+            // A1c: a BatchWriteAck is the REPLY to a local in-flight
+            // `propose_batch_stamped`. It has the identical (write_id, acker,
+            // acker_creation, outcome) shape as a WriteAck, so it routes through the
+            // SAME writer-side registry with the SAME incarnation gate + vote mapping
+            // (`route_ack_outcome`) — Applied = Accept, fence/CAS-mismatch = Reject,
+            // apply-fault = Fault. Without this it would fall to the generic drain and
+            // the coordinator's votes would be lost (perpetual timeout).
+            Ok(SyncMessage::BatchWriteAck(ack)) => {
+                route_batch_write_ack(&registry, local_creation, &ack);
+            }
             // Promise/Nack are REPLIES to a local in-flight `acquire_shard`, routed
             // to the election registry (not the generic drain). A `Prepare`, by
             // contrast, is a REQUEST to act as an acceptor — it flows to the generic
@@ -1079,27 +1189,63 @@ fn route_catch_up_response(catch_ups: &CatchUpRegistry, response: PushResponse) 
 /// `write_id` (already deregistered) and a send onto a disconnected receiver are
 /// both dropped quietly — no panic.
 fn route_write_ack(registry: &WriteRegistry, local_creation: u32, ack: &WriteAck) {
+    route_ack_outcome(
+        registry,
+        local_creation,
+        &ack.write_id,
+        &ack.acker,
+        ack.outcome,
+    );
+}
+
+/// Route an inbound `BatchWriteAck` to the coordinator waiting on its `write_id`
+/// (A1c). Identical routing to [`route_write_ack`] — same incarnation gate, same
+/// registry, same `outcome → CasVote` mapping — because a [`BatchWriteAck`] carries
+/// the identical correlation fields. The single all-or-nothing batch verdict counts
+/// toward quorum exactly as a single-key verdict does.
+fn route_batch_write_ack(registry: &WriteRegistry, local_creation: u32, ack: &BatchWriteAck) {
+    route_ack_outcome(
+        registry,
+        local_creation,
+        &ack.write_id,
+        &ack.acker,
+        ack.outcome,
+    );
+}
+
+/// Shared routing for a single-key or batch ack: apply the Fix D incarnation gate,
+/// look up the in-flight `write_id`, map the [`AckOutcome`] to a [`CasVote`], and
+/// feed it to the waiting coordinator. An ack for a prior incarnation, an
+/// unknown/expired `write_id`, or a send onto a disconnected receiver are all
+/// dropped quietly — no panic.
+fn route_ack_outcome(
+    registry: &WriteRegistry,
+    local_creation: u32,
+    write_id: &WriteId,
+    acker: &SyncNodeId,
+    outcome: AckOutcome,
+) {
     // Fix D incarnation gate: discard an ack minted for a prior incarnation of
     // this writer, even if it names a counter we have since reused.
-    if ack.write_id.origin_creation != local_creation {
+    if write_id.origin_creation != local_creation {
         return;
     }
 
     // Unknown / already-deregistered write_id -> drop quietly.
-    let Some(sender) = registry.get(&ack.write_id) else {
+    let Some(sender) = registry.get(write_id) else {
         return;
     };
 
-    let vote = match ack.outcome {
-        AckOutcome::Applied => CasVote::Accept(ack.acker.clone()),
+    let vote = match outcome {
+        AckOutcome::Applied => CasVote::Accept(acker.clone()),
         // A CAS mismatch AND an epoch fence are both vote-AGAINSTs: the replica
         // refused on purpose (it is ahead / it promised a higher ballot), so each
         // erodes possible-accepts toward ConsistencyError::Fenced. Only a genuine
         // apply fault is a (retryable) transport-style Fault.
         AckOutcome::Rejected(RejectReason::CasMismatch | RejectReason::Fenced) => {
-            CasVote::Reject(ack.acker.clone())
+            CasVote::Reject(acker.clone())
         }
-        AckOutcome::Rejected(RejectReason::ApplyError) => CasVote::Fault(ack.acker.clone()),
+        AckOutcome::Rejected(RejectReason::ApplyError) => CasVote::Fault(acker.clone()),
     };
 
     // Send-on-disconnected (coordinator already returned + dropped the receiver)

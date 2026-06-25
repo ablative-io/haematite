@@ -18,9 +18,10 @@
 
 use std::time::Duration;
 
+use crate::api::event_store::encode_event_value;
 use crate::api::kv::{KvKey, KvValue};
-use crate::branch::ShardId;
-use crate::db::helpers::map_shard_error;
+use crate::branch::{ShardId, current_timestamp};
+use crate::db::helpers::{event_range_start, event_sequence_key, map_shard_error};
 use crate::db::{Database, DatabaseError};
 use crate::shard::actor::{PromiseState, RecordPromiseOutcome, ShardError};
 use crate::sync::ballot::Ballot;
@@ -28,8 +29,8 @@ use crate::sync::endpoint::{ElectionError, ElectionOutcome};
 use crate::sync::membership::WriteMembership;
 use crate::sync::{QuorumOutcome, SyncNodeId};
 use crate::sync::protocol::{
-    AckOutcome, BatchWriteAck, BatchWriteProposal, Nack, Prepare, Promise, RejectReason, WriteAck,
-    WriteProposal,
+    AckOutcome, BatchWriteAck, BatchWriteEntry, BatchWriteProposal, Nack, Prepare, Promise,
+    RejectReason, WriteAck, WriteProposal,
 };
 use crate::tree::Hash;
 
@@ -201,6 +202,169 @@ impl Database {
             .map_err(|error| DatabaseError::LocalCommitFailed(error.to_string()))?;
         match handle.apply_durable_tombstone(key, expected, stamp, self.timeout()) {
             Ok(()) => Ok(outcome),
+            Err(error) => Err(DatabaseError::LocalCommitFailed(error.to_string())),
+        }
+    }
+
+    /// Coordinate ONE replicated, all-or-nothing multi-key STREAM APPEND to quorum
+    /// across the cluster AND, on commit, durably apply the proposer's own batch
+    /// LOCALLY (A1c — the multi-key analogue of [`Self::replicate_write`]).
+    ///
+    /// `payloads` are appended in order to `stream_key` starting at `expected_seq`
+    /// (0-based, matching [`crate::api::event_store::EventStore::append`]'s
+    /// `expected_seq` contract). Returns the stream's new next-seq
+    /// (`expected_seq + payloads.len()`) on success.
+    ///
+    /// Sequencing (apply STRICTLY after quorum, never before), mirroring
+    /// [`Self::replicate_write`]:
+    ///
+    /// a. **Owner-local OCC pre-check.** Read the stream's current next-seq; if it
+    ///    is not `expected_seq`, return [`DatabaseError::SequenceConflict`] WITHOUT
+    ///    proposing anything (the SAME contract `append` honours). An absent stream
+    ///    reads as next-seq `0`.
+    /// b. **Build the byte-identical batch entries.** One write-once event put per
+    ///    payload — `(event_key, expected = None, encode_event_value(ts, payload))` —
+    ///    PLUS the sequence-counter put. The event value uses the SAME
+    ///    `encode_event_value` the local `append` path uses, under ONE timestamp, so
+    ///    every replica stores the IDENTICAL logical value and the existing
+    ///    `EventStore::read` decodes it after replication.
+    /// c. **Sequence-counter CAS (the OCC decision).** The counter entry's `expected`
+    ///    is `Some(Hash::of(expected_seq.to_be_bytes()))` when `expected_seq > 0`
+    ///    (the counter already exists, holding the BE-encoded `expected_seq`), and
+    ///    `None` when `expected_seq == 0` (a fresh stream's counter is absent, so a
+    ///    create-if-absent CAS is the only one that matches).
+    ///
+    ///    Why NOT `expected = None` unconditionally (the obvious "lean"): the batch
+    ///    CAS in `apply_durable_batch` is over the LOGICAL value hash, and `None`
+    ///    means create-if-absent. On every append PAST the first the counter EXISTS,
+    ///    so `expected = None` would MISMATCH the present counter and reject EVERY
+    ///    valid append — a correctness/liveness bug, not merely an availability one.
+    ///
+    ///    Why this CAS is safe AND does not erode availability: the epoch fence in
+    ///    `apply_durable_batch` (`stamp.epoch < promised` ⇒ reject the whole batch)
+    ///    already guarantees only the single live owner can commit, and step (a)
+    ///    already guarantees the OWNER's counter equals `expected_seq`. A correctly-
+    ///    replicated in-quorum replica only ever applied THIS owner's stamped
+    ///    batches, so its counter is also `expected_seq` and `Hash::of(its bytes)`
+    ///    matches — it accepts. A replica that legitimately MISSED a prior batch has
+    ///    a different counter and SHOULD reject (accepting would silently create an
+    ///    event-sequence gap / overwrite). So the counter CAS rejects exactly the
+    ///    replicas that must reject; it is the guard against partial-replication
+    ///    gaps, complementing (not duplicating) the fence. The event keys are
+    ///    write-once, so they carry `expected = None` (create-if-absent) — a re-sent
+    ///    identical batch is idempotent on an already-applied event key only if the
+    ///    counter also matches, which all-or-nothing enforces.
+    /// d. **Draw ONE stamp, drive quorum, then apply locally.** Draw a single
+    ///    `(epoch, seq)` stamp from `owner_stamps.next_stamp(shard)`,
+    ///    `propose_batch_stamped` it to quorum, and on quorum-success durably apply
+    ///    the IDENTICAL batch + stamp locally via `apply_durable_batch`. A quorum
+    ///    failure surfaces as [`DatabaseError::ConsistencyError`]; a failed local
+    ///    commit as [`DatabaseError::LocalCommitFailed`] — exactly as
+    ///    [`Self::replicate_write`].
+    ///
+    /// # Errors
+    /// [`DatabaseError::SequenceConflict`] (stale `expected_seq`, nothing proposed),
+    /// [`DatabaseError::ConsistencyError`] (the batch did not reach quorum — fenced,
+    /// timed out, or transport unavailable), or [`DatabaseError::LocalCommitFailed`]
+    /// (quorum reached but the proposer's own durable batch commit failed).
+    pub fn replicate_append(
+        &self,
+        stream_key: Vec<u8>,
+        payloads: Vec<Vec<u8>>,
+        expected_seq: u64,
+        membership: &WriteMembership,
+        timeout: Duration,
+    ) -> Result<u64, DatabaseError> {
+        let endpoint = self.distribution().ok_or_else(|| {
+            DatabaseError::Distribution("no distribution endpoint for replicate_append".to_owned())
+        })?;
+
+        // Step a: OWNER-LOCAL OCC pre-check. An absent stream reads next-seq 0. On a
+        // mismatch we return SequenceConflict and propose NOTHING — the SAME contract
+        // `append` honours, so a stale caller never half-replicates a batch.
+        let actual_seq = self.read_stream_next_seq(&stream_key)?.unwrap_or(0);
+        if actual_seq != expected_seq {
+            return Err(DatabaseError::SequenceConflict {
+                expected: expected_seq,
+                actual: actual_seq,
+            });
+        }
+
+        // An empty batch is a no-op append (matches `append`): next-seq is unchanged
+        // and nothing is proposed or committed.
+        if payloads.is_empty() {
+            return Ok(expected_seq);
+        }
+
+        let entry_count = u64::try_from(payloads.len()).map_err(|_| {
+            DatabaseError::ConsistencyError("too many append entries".to_owned())
+        })?;
+        let new_seq = expected_seq.checked_add(entry_count).ok_or_else(|| {
+            DatabaseError::ConsistencyError("append sequence overflow".to_owned())
+        })?;
+
+        // Step b: build the byte-identical batch. ONE timestamp for the whole batch,
+        // exactly as `append_batch_with_ttl` uses one `current_timestamp()`.
+        let timestamp = current_timestamp();
+        let mut entries = Vec::with_capacity(payloads.len().saturating_add(1));
+        for (offset, payload) in payloads.iter().enumerate() {
+            // The engine stores the first event at engine-key seq 1 (1-based); the
+            // API `expected_seq` is 0-based, so event i lands at engine seq
+            // `expected_seq + i + 1` — the SAME mapping the local `append` uses
+            // (`actual.checked_add(offset + 1)`).
+            let offset = u64::try_from(offset).map_err(|_| {
+                DatabaseError::ConsistencyError("too many append entries".to_owned())
+            })?;
+            let engine_seq = expected_seq
+                .checked_add(offset)
+                .and_then(|seq| seq.checked_add(1))
+                .ok_or_else(|| {
+                    DatabaseError::ConsistencyError("append sequence overflow".to_owned())
+                })?;
+            entries.push(BatchWriteEntry {
+                key: event_range_start(&stream_key, engine_seq),
+                // Event keys are WRITE-ONCE: create-if-absent.
+                expected: None,
+                value: encode_event_value(timestamp, payload),
+                ttl: None,
+            });
+        }
+
+        // Step c: the sequence-counter put with the OCC CAS decided above.
+        let seq_expected = if expected_seq == 0 {
+            // Fresh stream: the counter is absent → create-if-absent.
+            None
+        } else {
+            // Existing stream: the counter holds the BE-encoded `expected_seq`. CAS
+            // on its logical value hash so a replica missing a prior batch rejects.
+            Some(Hash::of(&expected_seq.to_be_bytes()))
+        };
+        entries.push(BatchWriteEntry {
+            key: event_sequence_key(&stream_key),
+            expected: seq_expected,
+            value: new_seq.to_be_bytes().to_vec(),
+            ttl: None,
+        });
+
+        // Step d: draw ONE stamp (R-LE + R-SEQ, as `replicate_write`), drive the
+        // WHOLE batch to peer-quorum, then on success durably apply it locally with
+        // the IDENTICAL stamp every replica accepted (§2.4).
+        let shard = self.shard_for(&stream_key);
+        let stamp = self.owner_stamps.next_stamp(shard);
+
+        endpoint
+            .propose_batch_stamped(shard, entries.clone(), stamp.clone(), membership, timeout)
+            .map_err(|error| DatabaseError::ConsistencyError(error.to_string()))?;
+
+        let handle = self
+            .handle_for_shard(shard)
+            .map_err(|error| DatabaseError::LocalCommitFailed(error.to_string()))?;
+        let items = entries
+            .into_iter()
+            .map(|entry| (entry.key, entry.expected, entry.value, entry.ttl))
+            .collect();
+        match handle.apply_durable_batch(items, stamp, self.timeout()) {
+            Ok(()) => Ok(new_seq),
             Err(error) => Err(DatabaseError::LocalCommitFailed(error.to_string())),
         }
     }
