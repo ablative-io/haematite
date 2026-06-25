@@ -58,9 +58,9 @@ use crate::sync::membership::WriteMembership;
 use crate::tree::Hash;
 
 use super::protocol::{
-    AckOutcome, Nack, Prepare, Promise, RejectReason, SyncError, SyncMessage, WriteAck, WriteId,
-    WriteProposal, encode_beamr_sync_frame, register_beamr_sync_handler,
-    send_sync_message_via_beamr,
+    AckOutcome, Nack, Prepare, Promise, PushResponse, RejectReason, ShardSyncRequest, SyncError,
+    SyncMessage, WriteAck, WriteId, WriteProposal, encode_beamr_sync_frame,
+    register_beamr_sync_handler, send_sync_message_via_beamr,
 };
 
 /// Writer-side correlation registry: in-flight `WriteId` → the channel that the
@@ -90,6 +90,18 @@ type WriteRegistry = Arc<DashMap<WriteId, Sender<CasVote<SyncNodeId>>>>;
 /// [`WriteRegistry`]: a `DashMap` for poison-free concurrent access between the
 /// async read loop (routing votes) and the blocking coordinator (registering).
 type ElectionRegistry = Arc<DashMap<ShardId, Sender<ElectionVote>>>;
+
+/// Catch-up correlation registry (AA-3-4, §2.4): an in-flight handoff state-sync
+/// keyed by the shard being caught up → the channel its blocked coordinator
+/// collects the [`PushResponse`] on.
+///
+/// Keyed by `ShardId` alone, exactly like [`ElectionRegistry`]: a single endpoint
+/// runs at most ONE catch-up for a given shard at a time (the coordinator blocks),
+/// so the shard id uniquely identifies the in-flight pull, and the `PushResponse`
+/// carries its `shard_id` so the inbound router can route it back. A `DashMap` for
+/// poison-free concurrent access between the async read loop (routing the response)
+/// and the blocking coordinator (registering).
+type CatchUpRegistry = Arc<DashMap<ShardId, Sender<PushResponse>>>;
 
 /// One inbound reply to a `Prepare` round, routed to the waiting coordinator.
 #[derive(Debug, Clone)]
@@ -243,6 +255,9 @@ pub struct DistributionEndpoint {
     /// Election-side correlation registry shared with the inbound `Promise`/`Nack`
     /// router (AA-3-2).
     elections: ElectionRegistry,
+    /// Catch-up correlation registry shared with the inbound `PushResponse` router
+    /// (AA-3-4 handoff state-sync).
+    catch_ups: CatchUpRegistry,
 }
 
 impl std::fmt::Debug for DistributionEndpoint {
@@ -304,11 +319,13 @@ impl DistributionEndpoint {
         let (tx, inbound) = mpsc::channel::<InboundSync>();
         let registry: WriteRegistry = Arc::new(DashMap::new());
         let elections: ElectionRegistry = Arc::new(DashMap::new());
+        let catch_ups: CatchUpRegistry = Arc::new(DashMap::new());
         register_inbound_drain(
             &manager,
             tx,
             Arc::clone(&registry),
             Arc::clone(&elections),
+            Arc::clone(&catch_ups),
             local_creation,
         );
 
@@ -325,6 +342,7 @@ impl DistributionEndpoint {
             write_counter: AtomicU64::new(0),
             registry,
             elections,
+            catch_ups,
         })
     }
 
@@ -676,6 +694,102 @@ impl DistributionEndpoint {
         collect_prepare_votes(ballot, required, self_promise, &vote_rx, timeout)
     }
 
+    /// Run one handoff catch-up round against a single `source` promiser (AA-3-4,
+    /// §2.4): send a [`ShardSyncRequest`] naming this node as requester and block
+    /// for the source's [`PushResponse`] (the full reachable node set + its
+    /// committed root). Mirrors [`Self::run_prepare_round`]'s registry+coordinator
+    /// shape: register a per-shard channel, fire the request onto the runtime,
+    /// park for the reply.
+    ///
+    /// Returns the source's `PushResponse` (the caller folds it into the owning
+    /// shard's `merge_adopt`). Like the Prepare round, this BLOCKS, so it must run
+    /// OUTSIDE the distribution runtime.
+    ///
+    /// # Errors
+    /// Returns [`SyncError`] if called from inside the runtime, if framing the
+    /// request fails, or if no response arrives within `timeout`.
+    pub fn run_catch_up_round(
+        &self,
+        shard_id: ShardId,
+        source: &SyncNodeId,
+        from_root: Option<Hash>,
+        timeout: Duration,
+    ) -> Result<PushResponse, SyncError> {
+        // The coordinator BLOCKS; it must not run on a runtime worker.
+        if Handle::try_current().is_ok() {
+            return Err(SyncError::TransportBlockingFromAsync);
+        }
+
+        let (tx, rx) = mpsc::channel::<PushResponse>();
+        // Only one catch-up per shard per endpoint at a time; replace any stale
+        // entry. Deregister on EVERY exit so a late response after return is dropped.
+        self.catch_ups.insert(shard_id, tx);
+        let _guard = CatchUpGuard {
+            catch_ups: &self.catch_ups,
+            shard_id,
+        };
+
+        let handle = self.runtime()?.handle().clone();
+
+        let request = ShardSyncRequest::new(
+            shard_id,
+            SyncNodeId::new(self.local_name.clone()),
+            from_root,
+        );
+        let frame = encode_beamr_sync_frame(&SyncMessage::ShardSyncRequest(request))?;
+        let frame = Arc::new(frame);
+
+        let manager = self.manager.clone();
+        let remote = self.atom_table.intern(source.as_str());
+        let frame_for_send = Arc::clone(&frame);
+        handle.spawn(async move {
+            match manager.get_connection(remote) {
+                Some(connection) => {
+                    if let Err(error) = connection.write_raw(frame_for_send.as_slice()).await {
+                        log::warn!("catch-up request send failed: {error}");
+                    }
+                }
+                None => log::warn!("catch-up request source unreachable"),
+            }
+        });
+
+        match rx.recv_timeout(timeout) {
+            Ok(response) => Ok(response),
+            Err(RecvTimeoutError::Timeout | RecvTimeoutError::Disconnected) => {
+                Err(SyncError::TransportDrainDisconnected)
+            }
+        }
+    }
+
+    /// Send a framed [`SyncMessage`] to `target` over the live transport, fire-and-
+    /// forget onto the runtime (AA-3-4 source-side reply). Used by the responder to
+    /// route a `PushResponse` back to a catch-up requester it cannot block on.
+    ///
+    /// # Errors
+    /// Returns [`SyncError`] if framing fails or the runtime is unavailable.
+    pub fn send_message_fire_and_forget(
+        &self,
+        target: &SyncNodeId,
+        message: &SyncMessage,
+    ) -> Result<(), SyncError> {
+        let frame = encode_beamr_sync_frame(message)?;
+        let frame = Arc::new(frame);
+        let handle = self.runtime()?.handle().clone();
+        let manager = self.manager.clone();
+        let remote = self.atom_table.intern(target.as_str());
+        handle.spawn(async move {
+            match manager.get_connection(remote) {
+                Some(connection) => {
+                    if let Err(error) = connection.write_raw(frame.as_slice()).await {
+                        log::warn!("catch-up response send failed: {error}");
+                    }
+                }
+                None => log::warn!("catch-up response target unreachable"),
+            }
+        });
+        Ok(())
+    }
+
     /// Block until an inbound sync message arrives or `timeout` elapses.
     ///
     /// Returns `Ok(Some(_))` with the decoded message (or a decode error),
@@ -777,6 +891,21 @@ struct ElectionGuard<'registry> {
 impl Drop for ElectionGuard<'_> {
     fn drop(&mut self) {
         self.elections.remove(&self.shard_id);
+    }
+}
+
+/// Deregisters an in-flight catch-up (by shard id) from the catch-up registry on
+/// drop (AA-3-4). Held by [`DistributionEndpoint::run_catch_up_round`] so EVERY
+/// exit path — success, timeout, early return, or panic — removes the entry; a
+/// late `PushResponse` arriving after the coordinator returned is then dropped.
+struct CatchUpGuard<'registry> {
+    catch_ups: &'registry CatchUpRegistry,
+    shard_id: ShardId,
+}
+
+impl Drop for CatchUpGuard<'_> {
+    fn drop(&mut self) {
+        self.catch_ups.remove(&self.shard_id);
     }
 }
 
@@ -885,6 +1014,7 @@ fn register_inbound_drain(
     sender: Sender<InboundSync>,
     registry: WriteRegistry,
     elections: ElectionRegistry,
+    catch_ups: CatchUpRegistry,
     local_creation: u32,
 ) {
     register_beamr_sync_handler(manager, move |decoded| {
@@ -902,8 +1032,16 @@ fn register_inbound_drain(
             Ok(SyncMessage::Nack(nack)) => {
                 route_election_vote(&elections, nack.shard_id, ElectionVote::Nacked(nack));
             }
-            // Every OTHER variant (Prepare, sync traffic, decode errors) -> generic
-            // drain. A send error means the receiver was dropped (endpoint torn down).
+            // A PushResponse is the REPLY to a local in-flight `become_live` catch-up
+            // (AA-3-4): route it to the catch-up registry by shard. A
+            // ShardSyncRequest, by contrast, is a REQUEST to act as the sync SOURCE —
+            // it flows to the generic drain so the responder loop answers it via
+            // `handle_inbound_shard_sync_request`.
+            Ok(SyncMessage::PushResponse(response)) => {
+                route_catch_up_response(&catch_ups, response);
+            }
+            // Every OTHER variant (Prepare, ShardSyncRequest, sync traffic, decode
+            // errors) -> generic drain. A send error means the receiver was dropped.
             other => {
                 let _ = sender.send(other);
             }
@@ -920,6 +1058,17 @@ fn route_election_vote(elections: &ElectionRegistry, shard_id: ShardId, vote: El
         return;
     };
     let _ = sender.send(vote);
+}
+
+/// Route an inbound catch-up reply (`PushResponse`) to the coordinator waiting on
+/// its shard (AA-3-4). An unknown/expired shard key (the catch-up already returned
+/// and deregistered) and a send onto a disconnected receiver are both dropped
+/// quietly — mirrors [`route_election_vote`].
+fn route_catch_up_response(catch_ups: &CatchUpRegistry, response: PushResponse) {
+    let Some(sender) = catch_ups.get(&response.shard_id) else {
+        return;
+    };
+    let _ = sender.send(response);
 }
 
 /// Route an inbound `WriteAck` to the coordinator waiting on its `write_id`.

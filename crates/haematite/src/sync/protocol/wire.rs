@@ -12,7 +12,7 @@ use crate::tree::{Hash, Node};
 
 use super::{
     AckOutcome, Nack, NodeTransfer, Prepare, Promise, PullRequest, PushResponse, RejectReason,
-    RootExchangeRequest, RootExchangeResponse, SyncDecision, SyncError, SyncStats,
+    RootExchangeRequest, RootExchangeResponse, ShardSyncRequest, SyncDecision, SyncError, SyncStats,
     TargetNodeRequest, TargetNodeResponse, TargetNodeSummary, WriteAck, WriteId, WriteProposal,
 };
 
@@ -30,6 +30,7 @@ const MESSAGE_WRITE_ACK: u8 = 8;
 const MESSAGE_PREPARE: u8 = 9;
 const MESSAGE_PROMISE: u8 = 10;
 const MESSAGE_NACK: u8 = 11;
+const MESSAGE_SHARD_SYNC_REQUEST: u8 = 12;
 
 const ACK_OUTCOME_APPLIED: u8 = 0;
 const ACK_OUTCOME_REJECTED: u8 = 1;
@@ -41,6 +42,10 @@ pub enum SyncMessage {
     RootResponse(RootExchangeResponse),
     PullRequest(PullRequest),
     PushResponse(PushResponse),
+    /// Step-3 handoff catch-up request (§2.4): a freshly-elected owner asks a
+    /// promiser for the full reachable node set so it can sync to the max
+    /// committed root before serving. The reply reuses [`Self::PushResponse`].
+    ShardSyncRequest(ShardSyncRequest),
     TargetNodeRequest(TargetNodeRequest),
     TargetNodeResponse(TargetNodeResponse),
     WriteProposal(WriteProposal),
@@ -73,6 +78,12 @@ pub fn encode_sync_message(message: &SyncMessage) -> Result<Vec<u8>, SyncError> 
             append_optional_hash(&mut bytes, request.target_root);
         }
         SyncMessage::PushResponse(response) => encode_push_response(response, &mut bytes),
+        SyncMessage::ShardSyncRequest(request) => {
+            bytes.push(MESSAGE_SHARD_SYNC_REQUEST);
+            append_shard_id(&mut bytes, request.shard_id);
+            append_len_prefixed_bytes(&mut bytes, request.requester.as_str().as_bytes());
+            append_optional_hash(&mut bytes, request.from_root);
+        }
         SyncMessage::TargetNodeRequest(request) => {
             bytes.push(MESSAGE_TARGET_NODE_REQUEST);
             append_shard_id(&mut bytes, request.shard_id);
@@ -148,6 +159,11 @@ pub fn decode_sync_message(bytes: &[u8]) -> Result<SyncMessage, SyncError> {
             target_root: cursor.read_optional_hash()?,
         }),
         MESSAGE_PUSH_RESPONSE => decode_push_response(&mut cursor)?,
+        MESSAGE_SHARD_SYNC_REQUEST => SyncMessage::ShardSyncRequest(ShardSyncRequest {
+            shard_id: cursor.read_shard_id()?,
+            requester: cursor.read_sync_node_id()?,
+            from_root: cursor.read_optional_hash()?,
+        }),
         MESSAGE_TARGET_NODE_REQUEST => SyncMessage::TargetNodeRequest(TargetNodeRequest {
             shard_id: cursor.read_shard_id()?,
             hash: cursor.read_hash()?,
@@ -315,6 +331,23 @@ where
         manager,
         remote,
         &SyncMessage::PushResponse(response.clone()),
+        write_frame,
+    )
+}
+
+pub fn send_shard_sync_request_via_beamr<F>(
+    manager: &ConnectionManager,
+    remote: Atom,
+    request: ShardSyncRequest,
+    write_frame: F,
+) -> Result<(), SyncError>
+where
+    F: FnOnce(Arc<DistConnection>, Vec<u8>) -> Result<(), SyncError>,
+{
+    send_sync_message_via_beamr(
+        manager,
+        remote,
+        &SyncMessage::ShardSyncRequest(request),
         write_frame,
     )
 }

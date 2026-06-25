@@ -516,6 +516,160 @@ impl Database {
             })
         }
     }
+
+    // =====================================================================
+    // AA-3-4d: Handoff merge — reconstruct a LOSSLESS committed baseline from
+    // the ENTIRE promise majority before serving (§2.4). THE durability gate.
+    // =====================================================================
+
+    /// Acquire a shard AND become a live owner: win the Phase-1 election, then
+    /// merge the promise majority's committed states into a lossless baseline
+    /// before returning (§2.2 + §2.4). This is the ONLY entry point that
+    /// authorizes serving.
+    ///
+    /// Composes [`Self::acquire_shard`] (single-ownership + the Promise majority)
+    /// with [`Self::become_live`] (union-merge over ALL promisers). On return the
+    /// node is a LIVE owner: every committed write/delete across the majority is
+    /// locally present, so a subsequent read/`replicate_write` can never roll one
+    /// back (R5). A bare `acquire_shard` leaves the node "elected but not live" — it
+    /// MUST NOT serve until `become_live` completes.
+    ///
+    /// # Errors
+    /// Propagates any [`Self::acquire_shard`] election error, or a
+    /// [`DatabaseError::Distribution`] / [`DatabaseError::ShardError`] if a
+    /// promiser pull or the local merge/apply fails (in which case the node is
+    /// elected but NOT live and must not serve — fail-closed).
+    pub fn acquire_shard_and_serve(
+        &self,
+        shard_id: ShardId,
+        membership: &WriteMembership,
+        timeout: Duration,
+    ) -> Result<ElectionOutcome, DatabaseError> {
+        let outcome = self.acquire_shard(shard_id, membership, timeout)?;
+        self.become_live(shard_id, &outcome, timeout)?;
+        Ok(outcome)
+    }
+
+    /// Reconstruct a lossless committed baseline for a freshly-elected owner by
+    /// MERGING the committed states of EVERY promiser in its majority, then permit
+    /// it to serve (§2.4 handoff merge — THE durability gate, R5).
+    ///
+    /// Steps, exactly:
+    ///
+    /// 1. For each DISTINCT promiser (by node id) in `outcome.promises` that is NOT
+    ///    the local node, pull its full reachable committed node set over the live
+    ///    transport (`run_catch_up_round` → the source's `export_reachable`). A
+    ///    promiser whose `committed_root` is `None` contributes an empty tree (it
+    ///    still gets visited, but its `merge_committed_union(acc, None)` is a no-op).
+    /// 2. Hand ALL promiser contributions (their `committed_root` + transfers) to
+    ///    the shard actor's `merge_adopt`, which folds
+    ///    `merge_committed_union(acc, promiser_root)` over them starting from the
+    ///    LOCAL committed root, then durably adopts the merged union. Because the
+    ///    merge is a commutative/associative/idempotent max-stamp semilattice join
+    ///    and the promise majority intersects every committed-write quorum (§4), the
+    ///    adopted baseline dominates EVERY committed write/delete across the majority
+    ///    — forks and tombstones included. No single root is "selected"; the union
+    ///    is taken over all of them, so no committed write is dropped.
+    /// 3. Return `Ok(())` ONLY after the merge is durably adopted. A caller that uses
+    ///    [`Self::acquire_shard_and_serve`] therefore cannot serve before the merge.
+    ///
+    /// `seq` needs no recovery from the merge: `live_epoch` (set by `acquire_shard`)
+    /// strictly exceeds every merged write's epoch, so the owner's writes start at
+    /// `(live_epoch, 0)` and dominate (R-LE).
+    ///
+    /// # Errors
+    /// Returns [`DatabaseError::Distribution`] if a promiser pull fails (no
+    /// endpoint, source unreachable, or no response within `timeout`), or
+    /// [`DatabaseError::ShardError`] if the local merge/apply fails. On ANY error the
+    /// node is elected but NOT live and must NOT serve (fail-closed): the merge is
+    /// never partially adopted, so a pull failure can never serve stale/partial data.
+    pub fn become_live(
+        &self,
+        shard_id: ShardId,
+        outcome: &ElectionOutcome,
+        timeout: Duration,
+    ) -> Result<(), DatabaseError> {
+        use std::collections::HashSet;
+
+        let endpoint = self
+            .distribution()
+            .ok_or_else(|| DatabaseError::Distribution("no distribution endpoint".to_owned()))?;
+        let handle = self.handle_for_shard(shard_id)?;
+        let local_node = SyncNodeId::new(endpoint.local_name().to_owned());
+
+        // Pull each DISTINCT non-local promiser's full committed tree. We CANNOT
+        // pull from ourselves (the local committed root is already the merge's
+        // starting accumulator inside `merge_adopt`). De-dup by promiser node id so a
+        // promiser that appears twice is pulled once; ALL distinct promisers are
+        // folded (no single-root selection — that is what would drop a forked write).
+        let mut seen: HashSet<SyncNodeId> = HashSet::new();
+        let mut contributions: Vec<(Option<Hash>, Vec<crate::sync::NodeTransfer>)> = Vec::new();
+        for promise in &outcome.promises {
+            if promise.promiser == local_node {
+                continue;
+            }
+            if !seen.insert(promise.promiser.clone()) {
+                continue;
+            }
+            // Pull the promiser's full reachable committed set. `from_root` is the
+            // root it advertised in its Promise; the source answers from its CURRENT
+            // committed root and we adopt whatever `source_root` it returns.
+            let response = endpoint
+                .run_catch_up_round(shard_id, &promise.promiser, promise.committed_root, timeout)
+                .map_err(|error| DatabaseError::Distribution(error.to_string()))?;
+            contributions.push((response.source_root, response.transfers));
+        }
+
+        // Fold merge_committed_union over the LOCAL root + every promiser, durably.
+        // A pull failure above returned early WITHOUT adopting anything; the adopt is
+        // a single in-slice commit, so serving never sees a partial baseline.
+        handle
+            .merge_adopt(contributions, self.timeout())
+            .map_err(map_shard_error)?;
+
+        Ok(())
+    }
+
+    /// Source side of handoff merge (§2.4): answer an inbound
+    /// [`crate::sync::ShardSyncRequest`] by exporting this shard's full reachable
+    /// committed node set and routing the [`crate::sync::PushResponse`] back to the
+    /// requester.
+    ///
+    /// Routes to the owning shard by `request.shard_id`, reads the reachable set via
+    /// `export_reachable` (the existing `find_missing_nodes` pull primitive against
+    /// an empty target), and fires the response back fire-and-forget (the source
+    /// cannot block on a reply). The requester's blocked `run_catch_up_round`
+    /// receives it via the catch-up registry.
+    ///
+    /// # Errors
+    /// Returns a [`DatabaseError`] only if routing/exporting/sending failed.
+    pub fn handle_inbound_shard_sync_request(
+        &self,
+        request: &crate::sync::ShardSyncRequest,
+    ) -> Result<(), DatabaseError> {
+        use crate::sync::{PushResponse, SyncMessage};
+
+        let handle = self.handle_for_shard(request.shard_id)?;
+        let (source_root, transfers) = handle
+            .export_reachable(request.shard_id, self.timeout())
+            .map_err(map_shard_error)?;
+
+        let response = PushResponse::new(
+            request.shard_id,
+            source_root,
+            // The requester asked for the full set (target_root = None); echo that.
+            None,
+            transfers,
+            crate::sync::SyncStats::default(),
+        );
+
+        let endpoint = self
+            .distribution()
+            .ok_or_else(|| DatabaseError::Distribution("no distribution endpoint".to_owned()))?;
+        endpoint
+            .send_message_fire_and_forget(&request.requester, &SyncMessage::PushResponse(response))
+            .map_err(|error| DatabaseError::Distribution(error.to_string()))
+    }
 }
 
 /// The §2.2 mint floor: `max(promised.counter, owner_epoch.counter,
@@ -591,6 +745,14 @@ pub fn respond_to_inbound_writes(
             // the candidate's election registry, not the generic drain.)
             Some(Ok(SyncMessage::Prepare(prepare))) => {
                 drop(database.handle_inbound_prepare(&prepare));
+            }
+            // AA-3-4d source: an inbound ShardSyncRequest is a handoff-merge REQUEST —
+            // the source exports its reachable committed node set and routes the
+            // PushResponse back to the requester. A send failure (requester already
+            // merged / gone) is non-fatal; keep draining. (PushResponse itself never
+            // lands here — it is a REPLY routed to the catch-up registry.)
+            Some(Ok(SyncMessage::ShardSyncRequest(request))) => {
+                drop(database.handle_inbound_shard_sync_request(&request));
             }
             // Other inbound messages are not this responder's concern.
             Some(_) => {}

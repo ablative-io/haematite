@@ -28,8 +28,9 @@ pub use wire::{
     encode_sync_message, register_beamr_sync_handler, send_nack_via_beamr, send_prepare_via_beamr,
     send_promise_via_beamr, send_pull_request_via_beamr, send_push_response_via_beamr,
     send_root_exchange_request_via_beamr, send_root_exchange_response_via_beamr,
-    send_sync_message_via_beamr, send_target_node_request_via_beamr,
-    send_target_node_response_via_beamr, send_write_ack_via_beamr, send_write_proposal_via_beamr,
+    send_shard_sync_request_via_beamr, send_sync_message_via_beamr,
+    send_target_node_request_via_beamr, send_target_node_response_via_beamr, send_write_ack_via_beamr,
+    send_write_proposal_via_beamr,
 };
 
 /// Decision made by the root-hash exchange for one shard.
@@ -382,6 +383,46 @@ pub struct Promise {
 pub struct Nack {
     pub shard_id: ShardId,
     pub promised: Ballot,
+}
+
+/// Step-3 handoff catch-up request (§2.4, AA-3-4).
+///
+/// A freshly-elected owner asks a promiser for every content-addressed node
+/// reachable from its committed root for `shard_id`, so it can sync its local
+/// committed state up to the max `committed_root` carried in its Promise majority
+/// BEFORE serving.
+///
+/// Unlike a [`PullRequest`] (which carries only a `target_root` and no requester),
+/// this request names the `requester` so the source can route the [`PushResponse`]
+/// reply back over the live transport — the requester/response correlation a
+/// blind pull lacks. `from_root` is the source's expected committed root (the one
+/// the requester saw in the Promise); the source answers from its CURRENT committed
+/// root regardless, and the requester adopts whatever `source_root` the response
+/// carries. `target_root` is intentionally `None`: the new owner asks for the FULL
+/// reachable set (correct-over-clever, §2.4), letting the idempotent
+/// content-addressed `put` skip the nodes it already holds.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ShardSyncRequest {
+    pub shard_id: ShardId,
+    /// The node making the request, so the source can route the reply back.
+    pub requester: SyncNodeId,
+    /// The committed root the requester saw in the promiser's Promise, if any.
+    pub from_root: Option<Hash>,
+}
+
+impl ShardSyncRequest {
+    #[must_use]
+    pub const fn new(
+        shard_id: ShardId,
+        requester: SyncNodeId,
+        from_root: Option<Hash>,
+    ) -> Self {
+        Self {
+            shard_id,
+            requester,
+            from_root,
+        }
+    }
 }
 
 /// One content-addressed node to transfer from source to target.

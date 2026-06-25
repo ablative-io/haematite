@@ -9,7 +9,9 @@ use std::sync::mpsc::SyncSender;
 
 use crate::tree::Hash;
 
-use super::handle::{RangeItem, ScanReply, ShardCommand, ShardCommandKind, ShardError};
+use super::handle::{
+    RangeItem, ScanReply, ShardCommand, ShardCommandKind, ShardError, ShardSyncExport,
+};
 use super::{PromiseState, RecordPromiseOutcome};
 
 /// Reply to a queued command with a startup error so its caller fails fast.
@@ -34,6 +36,8 @@ pub(super) fn reply_startup_error(command: ShardCommand, message: &str) {
         ShardCommandKind::RecordPromise { reply, .. } => send_promise(&reply, error),
         ShardCommandKind::ReserveMinted { reply, .. } => send_reserved(&reply, error),
         ShardCommandKind::ReadPromiseState { reply } => send_promise_state(&reply, error),
+        ShardCommandKind::ExportReachable { reply, .. } => send_export(&reply, error),
+        ShardCommandKind::MergeAdopt { reply, .. } => send_merge_adopt(&reply, error),
         ShardCommandKind::ScanSequences { reply } => send_scan(&reply, error),
     }
 }
@@ -82,5 +86,13 @@ fn send_reserved(reply: &SyncSender<Result<u64, ShardError>>, error: ShardError)
 }
 
 fn send_promise_state(reply: &SyncSender<Result<PromiseState, ShardError>>, error: ShardError) {
+    drop(reply.send(Err(error)));
+}
+
+fn send_export(reply: &SyncSender<Result<ShardSyncExport, ShardError>>, error: ShardError) {
+    drop(reply.send(Err(error)));
+}
+
+fn send_merge_adopt(reply: &SyncSender<Result<Option<Hash>, ShardError>>, error: ShardError) {
     drop(reply.send(Err(error)));
 }
