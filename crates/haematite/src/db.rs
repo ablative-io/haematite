@@ -404,6 +404,37 @@ impl Database {
         Ok(streams)
     }
 
+    /// Collect `(stream_key, next_seq)` pairs from ONLY the named shards.
+    ///
+    /// The scoped counterpart of [`Self::scan_sequence_keys`]: a node that owns a
+    /// subset of shards enumerates only its own streams (e.g. to recover exactly
+    /// the workflows whose event streams it serves) without paying for, or
+    /// surfacing, streams that live on shards another node owns. Each id must be in
+    /// `0..shard_count`; an out-of-range id is [`DatabaseError::InvalidShardCount`].
+    pub fn scan_sequence_keys_for_shards(
+        &self,
+        shard_ids: &[usize],
+    ) -> Result<Vec<(Vec<u8>, u64)>, DatabaseError> {
+        let all = self.router.handles_in_order();
+        let mut handles = Vec::with_capacity(shard_ids.len());
+        for &shard_id in shard_ids {
+            handles.push(
+                all.get(shard_id)
+                    .ok_or(DatabaseError::InvalidShardCount)?
+                    .clone(),
+            );
+        }
+        let timeout = self.timeout;
+        let results = run_indexed_parallel(handles, |handle: ShardHandle| {
+            handle.scan_sequences(timeout)
+        })?;
+        let mut streams = Vec::new();
+        for (_, result) in results {
+            streams.extend(result.map_err(map_shard_error)?);
+        }
+        Ok(streams)
+    }
+
     pub const fn shard_count(&self) -> usize {
         self.config.shard_count
     }

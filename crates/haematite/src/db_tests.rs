@@ -326,6 +326,47 @@ fn append_read_events_and_sequence_conflicts_work() -> Result<(), Box<dyn Error>
 }
 
 #[test]
+fn scan_sequence_keys_for_shards_scopes_to_named_shards() -> Result<(), Box<dyn Error>> {
+    use std::collections::{BTreeMap, BTreeSet};
+
+    let dir = tempfile::tempdir()?;
+    let db = Database::create(config_for(&dir.path().join("db"), 3))?;
+
+    // Append one event to many streams and group each by its owning shard.
+    let mut by_shard: BTreeMap<usize, BTreeSet<Vec<u8>>> = BTreeMap::new();
+    for i in 0..30_u64 {
+        let key = format!("stream-{i:04}").into_bytes();
+        db.append(key.clone(), vec![b"e".to_vec()], 0)?;
+        by_shard.entry(db.shard_for(&key)).or_default().insert(key);
+    }
+    db.commit()?;
+    assert!(by_shard.len() >= 2, "streams must span multiple shards");
+
+    // The full scan returns every stream.
+    let all: BTreeSet<Vec<u8>> = db.scan_sequence_keys()?.into_iter().map(|(k, _)| k).collect();
+    let expected: BTreeSet<Vec<u8>> = by_shard.values().flatten().cloned().collect();
+    assert_eq!(all, expected, "full scan must return all streams");
+
+    // A scoped scan returns ONLY the named shard's streams.
+    for (&shard, keys) in &by_shard {
+        let scoped: BTreeSet<Vec<u8>> = db
+            .scan_sequence_keys_for_shards(&[shard])?
+            .into_iter()
+            .map(|(k, seq)| {
+                assert_eq!(db.shard_for(&k), shard, "scoped scan surfaced a foreign-shard stream");
+                assert_eq!(seq, 1, "each stream has exactly one event");
+                k
+            })
+            .collect();
+        assert_eq!(&scoped, keys, "shard {shard} scan must return exactly its own streams");
+    }
+
+    // An out-of-range shard id errors cleanly rather than panicking.
+    assert!(db.scan_sequence_keys_for_shards(&[db.shard_count()]).is_err());
+    Ok(())
+}
+
+#[test]
 fn concurrent_appends_with_same_expected_seq_conflict_without_partial_write()
 -> Result<(), Box<dyn Error>> {
     let dir = tempfile::tempdir()?;
