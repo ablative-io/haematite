@@ -11,6 +11,7 @@ use std::collections::BTreeMap;
 use crate::shard::actor::decode_sequence_key;
 use crate::store::NodeStore;
 use crate::tree::{Hash, Node, TreeError};
+use crate::ttl::filter::{Visibility, visible_value};
 use crate::wal::{Mutation, WalBuffer, WalError};
 
 use super::handle::{ShardError, StreamSeq};
@@ -47,8 +48,21 @@ where
     let mut streams = Vec::new();
     for (key, value) in merged {
         if let Some(stream_key) = decode_sequence_key(&key) {
-            let next_seq = decode_seq_value(&value)?;
-            streams.push((stream_key.to_vec(), next_seq));
+            // Every committed write is stamped (AA-3-4a) and may carry a TTL
+            // envelope, so the raw tree value here is NOT the bare sequence number
+            // — it is the same stamped/enveloped value `get` decodes. Resolve it to
+            // the LOGICAL bytes the read path sees before decoding the sequence. A
+            // tombstoned or expired counter reads as absent (the stream no longer
+            // exists), exactly as `read_stream_next_seq` would see it, so skip it.
+            match visible_value(&value)
+                .map_err(|error| ShardError::Wal(WalError::TreeError(error.to_string())))?
+            {
+                Visibility::Live(logical) => {
+                    let next_seq = decode_seq_value(&logical)?;
+                    streams.push((stream_key.to_vec(), next_seq));
+                }
+                Visibility::Expired => {}
+            }
         }
     }
     Ok(streams)
