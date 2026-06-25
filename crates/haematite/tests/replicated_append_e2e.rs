@@ -258,6 +258,43 @@ fn replicated_batch_lands_on_all_nodes() -> TestResult {
     Ok(())
 }
 
+/// REGRESSION: `scan_sequence_keys` must enumerate a stream whose sequence counter
+/// was written by `replicate_append` — i.e. a STAMPED value. A locally-appended
+/// counter is stored as a bare eight-byte value, but the replicated apply path
+/// stores the counter inside a stamp envelope (`HMSTMP01 || .. || seq`). The
+/// full-keyspace scan must strip that envelope exactly as `get` /
+/// `read_stream_next_seq` do; decoding the raw stamped bytes as a bare sequence
+/// failed with "invalid sequence metadata" and broke any `EventStore::scan` /
+/// workflow enumeration over a replicated stream.
+#[test]
+fn scan_sequence_keys_enumerates_stamped_counter() -> TestResult {
+    let mesh = spawn_mesh()?;
+    let node_a = &mesh.node_a;
+    let stream = b"stream-scan".to_vec();
+
+    node_a
+        .db
+        .acquire_shard_and_serve(SHARD, &membership(3, &[NODE_B, NODE_C]), OP_TIMEOUT)?;
+    node_a.db.replicate_append(
+        stream.clone(),
+        vec![b"e1".to_vec(), b"e2".to_vec()],
+        0,
+        &membership(3, &[NODE_B, NODE_C]),
+        OP_TIMEOUT,
+    )?;
+
+    // The headline: this walks the whole keyspace and decodes the STAMPED counter.
+    // Before the fix it returned Err("invalid sequence metadata").
+    let streams = node_a.db.scan_sequence_keys()?;
+    let found = streams.iter().find(|(key, _seq)| key == &stream);
+    assert_eq!(
+        found.map(|(_, seq)| *seq),
+        Some(2),
+        "scan_sequence_keys must surface the replicated stream with the stamped next-seq 2"
+    );
+    Ok(())
+}
+
 // ===========================================================================
 // GATE 2 — FAILOVER serves the FULL batch (the headline).
 // ===========================================================================
