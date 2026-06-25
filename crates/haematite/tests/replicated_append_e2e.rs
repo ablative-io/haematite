@@ -67,10 +67,10 @@ fn loopback() -> Result<SocketAddr, Box<dyn Error>> {
     Ok("127.0.0.1:0".parse()?)
 }
 
-fn config_for(path: &Path) -> DatabaseConfig {
+fn config_for_shards(path: &Path, shard_count: usize) -> DatabaseConfig {
     DatabaseConfig {
         data_dir: path.to_path_buf(),
-        shard_count: 1,
+        shard_count,
         sweep_interval: None,
         distributed: None,
     }
@@ -101,11 +101,12 @@ struct Node {
 }
 
 impl Node {
-    fn spawn(name: &'static str, dir: &Path) -> Result<Self, Box<dyn Error>> {
+    fn spawn_sharded(name: &'static str, dir: &Path, shard_count: usize) -> Result<Self, Box<dyn Error>> {
         let endpoint = DistributionEndpoint::bind(name, loopback()?, 1, None)?;
         let addr = endpoint.local_addr();
         let db = Arc::new(
-            Database::create(config_for(dir.join("db").as_path()))?.with_distribution(endpoint),
+            Database::create(config_for_shards(dir.join("db").as_path(), shard_count))?
+                .with_distribution(endpoint),
         );
 
         let running = Arc::new(std::sync::atomic::AtomicBool::new(true));
@@ -173,12 +174,16 @@ struct Mesh {
 }
 
 fn spawn_mesh() -> Result<Mesh, Box<dyn Error>> {
+    spawn_mesh_sharded(1)
+}
+
+fn spawn_mesh_sharded(shard_count: usize) -> Result<Mesh, Box<dyn Error>> {
     let dir_a = tempfile::tempdir()?;
     let dir_b = tempfile::tempdir()?;
     let dir_c = tempfile::tempdir()?;
-    let node_a = Node::spawn(NODE_A, dir_a.path())?;
-    let node_b = Node::spawn(NODE_B, dir_b.path())?;
-    let node_c = Node::spawn(NODE_C, dir_c.path())?;
+    let node_a = Node::spawn_sharded(NODE_A, dir_a.path(), shard_count)?;
+    let node_b = Node::spawn_sharded(NODE_B, dir_b.path(), shard_count)?;
+    let node_c = Node::spawn_sharded(NODE_C, dir_c.path(), shard_count)?;
     link_both(&node_a, &node_b)?;
     link_both(&node_a, &node_c)?;
     link_both(&node_b, &node_c)?;
@@ -188,6 +193,17 @@ fn spawn_mesh() -> Result<Mesh, Box<dyn Error>> {
         node_c,
         _dirs: [dir_a, dir_b, dir_c],
     })
+}
+
+/// Find a stream key that routes (whole-key BLAKE3 % shard_count) to `shard`.
+fn stream_for_shard(db: &Database, shard: usize) -> Vec<u8> {
+    for i in 0..1_000_000_u64 {
+        let key = format!("wf-{i:06}").into_bytes();
+        if db.shard_for(&key) == shard {
+            return key;
+        }
+    }
+    panic!("no stream key found routing to shard {shard}");
 }
 
 /// Read a node's local event stream, stripping the per-event timestamp header to
@@ -292,6 +308,72 @@ fn scan_sequence_keys_enumerates_stamped_counter() -> TestResult {
         Some(2),
         "scan_sequence_keys must surface the replicated stream with the stamped next-seq 2"
     );
+    Ok(())
+}
+
+/// SPIKE / REGRESSION: distribution × multi-shard. Three nodes, shard_count=3, each
+/// node OWNS a DIFFERENT shard (A=0, B=1, C=2) and is a follower for the other two.
+/// A `replicate_append` routed to shard S is driven by S's owner and replicated to
+/// the full quorum, so every node can read every shard's stream. Proves per-shard
+/// election + `replicate_append` routing COMPOSE under shard_count>1 — the foundation
+/// the active-active multi-shard demo (different workflows owned by different nodes)
+/// stands on.
+#[test]
+fn multi_shard_each_node_owns_a_distinct_shard_and_replicates() -> TestResult {
+    let mesh = spawn_mesh_sharded(3)?;
+    let (node_a, node_b, node_c) = (&mesh.node_a, &mesh.node_b, &mesh.node_c);
+
+    // Each node acquires ONE distinct shard; the other two promise/follow it.
+    node_a
+        .db
+        .acquire_shard_and_serve(0, &membership(3, &[NODE_B, NODE_C]), OP_TIMEOUT)?;
+    node_b
+        .db
+        .acquire_shard_and_serve(1, &membership(3, &[NODE_A, NODE_C]), OP_TIMEOUT)?;
+    node_c
+        .db
+        .acquire_shard_and_serve(2, &membership(3, &[NODE_A, NODE_B]), OP_TIMEOUT)?;
+
+    // One stream per shard, each driven by THAT shard's owner.
+    let plan: [(&Node, usize, &[&str]); 3] = [
+        (node_a, 0, &[NODE_B, NODE_C]),
+        (node_b, 1, &[NODE_A, NODE_C]),
+        (node_c, 2, &[NODE_A, NODE_B]),
+    ];
+    let mut streams = Vec::new();
+    for (owner, shard, targets) in plan {
+        let stream = stream_for_shard(&owner.db, shard);
+        assert_eq!(owner.db.shard_for(&stream), shard);
+        let payload = format!("event-on-shard-{shard}").into_bytes();
+        let next = owner.db.replicate_append(
+            stream.clone(),
+            vec![payload.clone()],
+            0,
+            &membership(3, targets),
+            OP_TIMEOUT,
+        )?;
+        assert_eq!(next, 1, "shard {shard} owner append returns next-seq 1");
+        streams.push((shard, stream, payload));
+    }
+
+    // Every node holds every shard's stream — full replication across the quorum,
+    // with three different shards owned by three different nodes simultaneously.
+    for (shard, stream, payload) in &streams {
+        for node in [&node_a, &node_b, &node_c] {
+            assert_eq!(
+                read_payloads(node, stream)?,
+                vec![payload.clone()],
+                "node {} must hold shard {shard}'s replicated event",
+                node.name
+            );
+            assert_eq!(
+                next_seq(node, stream)?,
+                Some(1),
+                "node {} must hold next-seq 1 for shard {shard}",
+                node.name
+            );
+        }
+    }
     Ok(())
 }
 
