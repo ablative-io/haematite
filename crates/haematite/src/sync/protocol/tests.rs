@@ -382,6 +382,180 @@ fn write_ack_round_trips_for_every_outcome() -> Result<(), Box<dyn std::error::E
 }
 
 #[test]
+fn batch_write_proposal_round_trips_across_sizes_and_field_variations()
+-> Result<(), Box<dyn std::error::Error>> {
+    use super::{BatchWriteEntry, BatchWriteProposal};
+    use crate::sync::ballot::Stamp;
+
+    let h1 = sample_hash(b"prev-a", b"old-a")?;
+    let h2 = sample_hash(b"prev-b", b"old-b")?;
+    let write_id = WriteId::new("node-origin-name", 7, 42);
+    // A REAL (non-bottom) shared stamp with a multi-byte node tiebreak and non-zero
+    // seq, so the round-trip exercises the full epoch+seq framing, not just bottom.
+    let stamp = Stamp::new(Ballot::new(9, SyncNodeId::new("owner-node-\u{00e9}")), 1234);
+
+    // (a) EMPTY batch (zero entries) — a valid no-op proposal.
+    let empty = BatchWriteProposal {
+        write_id: write_id.clone(),
+        shard_id: 0,
+        entries: Vec::new(),
+        stamp: Stamp::bottom(),
+    };
+
+    // (b) SINGLE entry.
+    let single = BatchWriteProposal {
+        write_id: write_id.clone(),
+        shard_id: 3,
+        entries: vec![BatchWriteEntry {
+            key: b"only/key".to_vec(),
+            expected: None,
+            value: b"v".to_vec(),
+            ttl: None,
+        }],
+        stamp: stamp.clone(),
+    };
+
+    // (c) SEVERAL entries with mixed expected Some/None and with/without ttl.
+    let mixed = BatchWriteProposal {
+        write_id: write_id.clone(),
+        shard_id: 7,
+        entries: vec![
+            BatchWriteEntry {
+                key: b"stream\0\0\0\0\0\0\0\0\x01".to_vec(),
+                expected: None,
+                value: b"event-1".to_vec(),
+                ttl: Some(Duration::new(12, 345)),
+            },
+            BatchWriteEntry {
+                key: b"stream\0\0\0\0\0\0\0\0\x02".to_vec(),
+                expected: Some(h1),
+                value: b"event-2".to_vec(),
+                ttl: None,
+            },
+            BatchWriteEntry {
+                key: b"stream\xff seq".to_vec(),
+                expected: Some(h2),
+                value: 2_u64.to_be_bytes().to_vec(),
+                ttl: Some(Duration::from_secs(3600)),
+            },
+        ],
+        stamp,
+    };
+
+    // (d) LARGE batch: many entries, alternating expected/ttl, a big value.
+    let mut large_entries = Vec::new();
+    for index in 0..512_u64 {
+        large_entries.push(BatchWriteEntry {
+            key: {
+                let mut key = b"k".to_vec();
+                key.extend_from_slice(&index.to_be_bytes());
+                key
+            },
+            expected: if index % 2 == 0 { Some(h1) } else { None },
+            value: vec![u8::try_from(index % 256)?; 1 + (index as usize % 17)],
+            ttl: if index % 3 == 0 {
+                Some(Duration::new(index, u32::try_from(index % 1_000_000_000)?))
+            } else {
+                None
+            },
+        });
+    }
+    // One genuinely large value to exercise multi-KiB length prefixes.
+    large_entries.push(BatchWriteEntry {
+        key: b"big".to_vec(),
+        expected: Some(h2),
+        value: vec![0xAB; 64 * 1024],
+        ttl: None,
+    });
+    let large = BatchWriteProposal {
+        write_id,
+        shard_id: usize::MAX,
+        entries: large_entries,
+        stamp: Stamp::new(Ballot::new(u64::MAX, SyncNodeId::new("z")), u64::MAX),
+    };
+
+    for proposal in [empty, single, mixed, large] {
+        assert_message_round_trips(&SyncMessage::BatchWriteProposal(proposal))?;
+    }
+    Ok(())
+}
+
+#[test]
+fn batch_write_ack_round_trips_for_every_outcome() -> Result<(), Box<dyn std::error::Error>> {
+    use super::BatchWriteAck;
+
+    let write_id = WriteId::new("origin", 1, 9);
+    // Every outcome a batch ack can carry: an accept, and a reject for EACH reason
+    // (Fenced and CasMismatch are the two the receiver maps a fence / CAS mismatch
+    // onto, plus ApplyError).
+    let outcomes = [
+        AckOutcome::Applied,
+        AckOutcome::Rejected(RejectReason::Fenced),
+        AckOutcome::Rejected(RejectReason::CasMismatch),
+        AckOutcome::Rejected(RejectReason::ApplyError),
+    ];
+
+    for outcome in outcomes {
+        let ack = BatchWriteAck {
+            write_id: write_id.clone(),
+            acker: SyncNodeId::new("multi-byte-acker-name-\u{00e9}"),
+            acker_creation: 5,
+            outcome,
+        };
+        assert_message_round_trips(&SyncMessage::BatchWriteAck(ack))?;
+    }
+    Ok(())
+}
+
+#[test]
+fn truncated_batch_write_messages_decode_to_clean_error()
+-> Result<(), Box<dyn std::error::Error>> {
+    use super::{BatchWriteAck, BatchWriteEntry, BatchWriteProposal};
+    use crate::sync::ballot::Stamp;
+
+    let proposal = SyncMessage::BatchWriteProposal(BatchWriteProposal {
+        write_id: WriteId::new("origin", 3, 1),
+        shard_id: 2,
+        entries: vec![
+            BatchWriteEntry {
+                key: b"k1".to_vec(),
+                expected: Some(sample_hash(b"p", b"o")?),
+                value: b"v1".to_vec(),
+                ttl: Some(Duration::new(1, 1)),
+            },
+            BatchWriteEntry {
+                key: b"k2".to_vec(),
+                expected: None,
+                value: b"v2".to_vec(),
+                ttl: None,
+            },
+        ],
+        stamp: Stamp::new(Ballot::new(9, SyncNodeId::new("owner")), 7),
+    });
+    let ack = SyncMessage::BatchWriteAck(BatchWriteAck {
+        write_id: WriteId::new("origin", 3, 1),
+        acker: SyncNodeId::new("acker"),
+        acker_creation: 2,
+        outcome: AckOutcome::Rejected(RejectReason::Fenced),
+    });
+
+    for message in [proposal, ack] {
+        let payload = encode_sync_message(&message)?;
+        // Every non-empty truncation must be a clean Err, never a panic — this also
+        // sweeps truncations inside the entry vector, the per-entry CAS hash, and
+        // the trailing shared stamp.
+        for len in 0..payload.len() {
+            assert!(decode_sync_message(&payload[..len]).is_err());
+        }
+        // Trailing garbage must also be rejected by the finish() check.
+        let mut extended = payload.clone();
+        extended.push(0xFF);
+        assert!(decode_sync_message(&extended).is_err());
+    }
+    Ok(())
+}
+
+#[test]
 fn truncated_write_messages_decode_to_clean_error() -> Result<(), Box<dyn std::error::Error>> {
     let proposal = SyncMessage::WriteProposal(WriteProposal {
         write_id: WriteId::new("origin", 3, 1),

@@ -11,10 +11,12 @@ use crate::sync::ballot::Ballot;
 use crate::tree::{Hash, Node};
 
 use super::{
-    AckOutcome, Nack, NodeTransfer, Prepare, Promise, PullRequest, PushResponse, RejectReason,
-    RootExchangeRequest, RootExchangeResponse, ShardSyncRequest, SyncDecision, SyncError, SyncStats,
-    TargetNodeRequest, TargetNodeResponse, TargetNodeSummary, WriteAck, WriteId, WriteProposal,
+    AckOutcome, BatchWriteAck, BatchWriteEntry, BatchWriteProposal, Nack, NodeTransfer, Prepare,
+    Promise, PullRequest, PushResponse, RejectReason, RootExchangeRequest, RootExchangeResponse,
+    ShardSyncRequest, SyncDecision, SyncError, SyncStats, TargetNodeRequest, TargetNodeResponse,
+    TargetNodeSummary, WriteAck, WriteId, WriteProposal,
 };
+use crate::sync::ballot::Stamp;
 
 const SYNC_CONTROL_FRAME: &[u8] = b"haematite.sync.v1";
 const SYNC_PROTOCOL_VERSION: u8 = 1;
@@ -31,6 +33,8 @@ const MESSAGE_PREPARE: u8 = 9;
 const MESSAGE_PROMISE: u8 = 10;
 const MESSAGE_NACK: u8 = 11;
 const MESSAGE_SHARD_SYNC_REQUEST: u8 = 12;
+const MESSAGE_BATCH_WRITE_PROPOSAL: u8 = 13;
+const MESSAGE_BATCH_WRITE_ACK: u8 = 14;
 
 const ACK_OUTCOME_APPLIED: u8 = 0;
 const ACK_OUTCOME_REJECTED: u8 = 1;
@@ -50,6 +54,12 @@ pub enum SyncMessage {
     TargetNodeResponse(TargetNodeResponse),
     WriteProposal(WriteProposal),
     WriteAck(WriteAck),
+    /// A1b: a replicated multi-key append (the batch analogue of
+    /// [`Self::WriteProposal`]), applied all-or-nothing through
+    /// `apply_durable_batch`.
+    BatchWriteProposal(BatchWriteProposal),
+    /// A1b: the single all-or-nothing verdict for a [`Self::BatchWriteProposal`].
+    BatchWriteAck(BatchWriteAck),
     Prepare(Prepare),
     Promise(Promise),
     Nack(Nack),
@@ -108,6 +118,29 @@ pub fn encode_sync_message(message: &SyncMessage) -> Result<Vec<u8>, SyncError> 
         }
         SyncMessage::WriteAck(ack) => {
             bytes.push(MESSAGE_WRITE_ACK);
+            append_write_id(&mut bytes, &ack.write_id);
+            append_len_prefixed_bytes(&mut bytes, ack.acker.as_str().as_bytes());
+            bytes.extend_from_slice(&ack.acker_creation.to_be_bytes());
+            append_ack_outcome(&mut bytes, ack.outcome);
+        }
+        SyncMessage::BatchWriteProposal(proposal) => {
+            bytes.push(MESSAGE_BATCH_WRITE_PROPOSAL);
+            append_write_id(&mut bytes, &proposal.write_id);
+            append_shard_id(&mut bytes, proposal.shard_id);
+            // Length-prefixed entry vector: count, then each entry's fields in the
+            // same order as a single-key proposal (minus the per-entry stamp).
+            append_usize(&mut bytes, proposal.entries.len());
+            for entry in &proposal.entries {
+                append_len_prefixed_bytes(&mut bytes, &entry.key);
+                append_optional_hash(&mut bytes, entry.expected);
+                append_len_prefixed_bytes(&mut bytes, &entry.value);
+                append_optional_duration(&mut bytes, entry.ttl);
+            }
+            // ONE shared stamp for the whole batch: epoch ballot then seq.
+            append_stamp(&mut bytes, &proposal.stamp);
+        }
+        SyncMessage::BatchWriteAck(ack) => {
+            bytes.push(MESSAGE_BATCH_WRITE_ACK);
             append_write_id(&mut bytes, &ack.write_id);
             append_len_prefixed_bytes(&mut bytes, ack.acker.as_str().as_bytes());
             bytes.extend_from_slice(&ack.acker_creation.to_be_bytes());
@@ -184,6 +217,33 @@ pub fn decode_sync_message(bytes: &[u8]) -> Result<SyncMessage, SyncError> {
             tombstone: cursor.read_bool()?,
         }),
         MESSAGE_WRITE_ACK => SyncMessage::WriteAck(WriteAck {
+            write_id: cursor.read_write_id()?,
+            acker: cursor.read_sync_node_id()?,
+            acker_creation: cursor.read_u32()?,
+            outcome: cursor.read_ack_outcome()?,
+        }),
+        MESSAGE_BATCH_WRITE_PROPOSAL => {
+            let write_id = cursor.read_write_id()?;
+            let shard_id = cursor.read_shard_id()?;
+            let entry_count = cursor.read_usize()?;
+            let mut entries = Vec::new();
+            for _ in 0..entry_count {
+                entries.push(BatchWriteEntry {
+                    key: cursor.read_len_prefixed_bytes()?,
+                    expected: cursor.read_optional_hash()?,
+                    value: cursor.read_len_prefixed_bytes()?,
+                    ttl: cursor.read_optional_duration()?,
+                });
+            }
+            let stamp = cursor.read_stamp()?;
+            SyncMessage::BatchWriteProposal(BatchWriteProposal {
+                write_id,
+                shard_id,
+                entries,
+                stamp,
+            })
+        }
+        MESSAGE_BATCH_WRITE_ACK => SyncMessage::BatchWriteAck(BatchWriteAck {
             write_id: cursor.read_write_id()?,
             acker: cursor.read_sync_node_id()?,
             acker_creation: cursor.read_u32()?,
@@ -420,6 +480,40 @@ where
     )
 }
 
+pub fn send_batch_write_proposal_via_beamr<F>(
+    manager: &ConnectionManager,
+    remote: Atom,
+    proposal: &BatchWriteProposal,
+    write_frame: F,
+) -> Result<(), SyncError>
+where
+    F: FnOnce(Arc<DistConnection>, Vec<u8>) -> Result<(), SyncError>,
+{
+    send_sync_message_via_beamr(
+        manager,
+        remote,
+        &SyncMessage::BatchWriteProposal(proposal.clone()),
+        write_frame,
+    )
+}
+
+pub fn send_batch_write_ack_via_beamr<F>(
+    manager: &ConnectionManager,
+    remote: Atom,
+    ack: &BatchWriteAck,
+    write_frame: F,
+) -> Result<(), SyncError>
+where
+    F: FnOnce(Arc<DistConnection>, Vec<u8>) -> Result<(), SyncError>,
+{
+    send_sync_message_via_beamr(
+        manager,
+        remote,
+        &SyncMessage::BatchWriteAck(ack.clone()),
+        write_frame,
+    )
+}
+
 pub fn send_prepare_via_beamr<F>(
     manager: &ConnectionManager,
     remote: Atom,
@@ -571,6 +665,14 @@ fn append_ballot(bytes: &mut Vec<u8>, ballot: &Ballot) {
     append_len_prefixed_bytes(bytes, ballot.node.as_str().as_bytes());
 }
 
+/// Wire-encode a [`Stamp`] (A1b): its `epoch` ballot followed by the `seq`
+/// (big-endian `u64`). Mirrors the single-key path's `epoch` + `seq` framing on a
+/// [`WriteProposal`], grouped here because a batch carries ONE shared stamp.
+fn append_stamp(bytes: &mut Vec<u8>, stamp: &Stamp) {
+    append_ballot(bytes, &stamp.epoch);
+    bytes.extend_from_slice(&stamp.seq.to_be_bytes());
+}
+
 fn append_optional_ballot(bytes: &mut Vec<u8>, ballot: Option<&Ballot>) {
     match ballot {
         Some(ballot) => {
@@ -700,6 +802,12 @@ impl<'a> MessageCursor<'a> {
         let counter = self.read_u64()?;
         let node = self.read_sync_node_id()?;
         Ok(Ballot::new(counter, node))
+    }
+
+    fn read_stamp(&mut self) -> Result<Stamp, SyncError> {
+        let epoch = self.read_ballot()?;
+        let seq = self.read_u64()?;
+        Ok(Stamp::new(epoch, seq))
     }
 
     fn read_optional_ballot(&mut self) -> Result<Option<Ballot>, SyncError> {

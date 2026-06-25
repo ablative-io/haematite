@@ -5,7 +5,7 @@ use crate::api::kv::{KvKey, KvValue};
 use crate::branch::ShardId;
 use crate::store::NodeStore;
 use crate::sync::SyncNodeId;
-use crate::sync::ballot::Ballot;
+use crate::sync::ballot::{Ballot, Stamp};
 use crate::tree::{Hash, Node};
 
 #[path = "protocol/wire.rs"]
@@ -25,7 +25,8 @@ pub use error::SyncError;
 pub use target::{TargetNodeReader, TargetNodeRequest, TargetNodeResponse, TargetNodeSummary};
 pub use wire::{
     SyncMessage, decode_beamr_sync_frame, decode_sync_message, encode_beamr_sync_frame,
-    encode_sync_message, register_beamr_sync_handler, send_nack_via_beamr, send_prepare_via_beamr,
+    encode_sync_message, register_beamr_sync_handler, send_batch_write_ack_via_beamr,
+    send_batch_write_proposal_via_beamr, send_nack_via_beamr, send_prepare_via_beamr,
     send_promise_via_beamr, send_pull_request_via_beamr, send_push_response_via_beamr,
     send_root_exchange_request_via_beamr, send_root_exchange_response_via_beamr,
     send_shard_sync_request_via_beamr, send_sync_message_via_beamr,
@@ -340,6 +341,87 @@ impl WriteProposal {
 /// Acknowledgement of a [`WriteProposal`] from a receiving replica.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WriteAck {
+    pub write_id: WriteId,
+    pub acker: SyncNodeId,
+    pub acker_creation: u32,
+    pub outcome: AckOutcome,
+}
+
+/// One entry of a [`BatchWriteProposal`] (A1b): a single key's CAS-conditioned
+/// put within a replicated multi-key append.
+///
+/// Mirrors the per-key fields of a [`WriteProposal`] — `key`, the CAS
+/// precondition `expected` (`None` = create-if-absent), `value`, and `ttl` — but
+/// carries NO per-entry stamp or epoch: the WHOLE batch shares ONE `stamp` on the
+/// enclosing [`BatchWriteProposal`] (§2.4), so every key in an applied batch lands
+/// the IDENTICAL commit stamp in ONE atomic fsync. The wire-codec encodes the
+/// entries length-prefixed; the field order matches
+/// [`crate::shard::actor::handle::BatchItem`] so the receiver can hand them
+/// straight to `apply_durable_batch` without re-ordering.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BatchWriteEntry {
+    pub key: KvKey,
+    /// CAS precondition for THIS key (`None` means create-if-absent). Each entry
+    /// has its own precondition; any single mismatch rejects the WHOLE batch.
+    pub expected: Option<Hash>,
+    pub value: KvValue,
+    pub ttl: Option<Duration>,
+}
+
+/// Active-active BATCH proposal (A1b): the replicated multi-key analogue of a
+/// [`WriteProposal`].
+///
+/// A whole stream-append's entries (event keys + the sequence key) are proposed as
+/// ONE all-or-nothing unit applied through `apply_durable_batch`.
+///
+/// Routing/metadata mirror the single-key path, with the multi-key
+/// generalisations:
+///
+/// * `shard_id` — the explicit owning shard for the WHOLE batch. A
+///   [`WriteProposal`] routes by hashing its single `key`; a batch spans many keys
+///   that (by construction at the proposer in A1c, exactly as a stream append's
+///   keys do) all map to ONE shard, so the shard is named directly here — the same
+///   way election messages ([`Prepare`]) name their shard rather than re-deriving
+///   it. The receiver routes by `shard_id`.
+/// * `entries` — the per-key puts, each its own [`BatchWriteEntry`] (with its own
+///   CAS `expected`). May be empty (a no-op batch) or large.
+/// * `stamp` — ONE shared commit stamp `(epoch, seq)` for the WHOLE batch (§2.4).
+///   Its `epoch` is the fence epoch (the receiver rejects the whole batch iff
+///   `epoch < promised[shard]`); its `seq` is the owner-assigned per-(shard,epoch)
+///   sequence drawn ONCE. Every replica stores the identical stamp on every key.
+/// * `write_id` — the SAME incarnation-safe correlation id a [`WriteProposal`]
+///   carries, so the batch ack's incarnation gate matches verbatim.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BatchWriteProposal {
+    pub write_id: WriteId,
+    pub shard_id: ShardId,
+    pub entries: Vec<BatchWriteEntry>,
+    /// The ONE commit stamp `(epoch, seq)` shared by every entry (§2.4). The
+    /// receiver fences the whole batch iff `stamp.epoch < promised[shard]`, and
+    /// stores THIS stamp verbatim on every applied key.
+    pub stamp: Stamp,
+}
+
+impl BatchWriteProposal {
+    /// The whole batch's shared commit stamp `(epoch, seq)`.
+    #[must_use]
+    pub fn stamp(&self) -> Stamp {
+        self.stamp.clone()
+    }
+}
+
+/// Acknowledgement of a [`BatchWriteProposal`] from a receiving replica (A1b).
+///
+/// Same shape as [`WriteAck`] (echoes `write_id`, carries `acker`/`acker_creation`,
+/// and an [`AckOutcome`]) but for a whole batch. Because `apply_durable_batch` is
+/// all-or-nothing, the `outcome` is a single verdict for the ENTIRE batch:
+/// [`AckOutcome::Applied`] iff EVERY key was durably applied under the shared
+/// stamp, otherwise [`AckOutcome::Rejected`] with the reason a fence
+/// ([`RejectReason::Fenced`]) or any single CAS mismatch
+/// ([`RejectReason::CasMismatch`]) — in which case NOTHING was written. There is no
+/// per-entry partial outcome.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BatchWriteAck {
     pub write_id: WriteId,
     pub acker: SyncNodeId,
     pub acker_creation: u32,
