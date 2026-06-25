@@ -129,8 +129,8 @@ fn main() -> Result3<()> {
         println!("      event {i}: {}", String::from_utf8_lossy(event));
     }
     let new_seq = node_a.db.replicate_append(
-        stream.to_vec(),
-        events.clone(),
+        stream,
+        &events,
         0,
         &membership(3, &[NODE_B]), // send to B; quorum {A, B} reached; C excluded
         OP_TIMEOUT,
@@ -252,8 +252,8 @@ fn main() -> Result3<()> {
         .db
         .acquire_shard_and_serve(SHARD, &membership(3, &[NODE_C]), OP_TIMEOUT)?;
     let after = node_b.db.replicate_append(
-        stream.to_vec(),
-        vec![b"OrderShipped".to_vec()],
+        stream,
+        &[b"OrderShipped".to_vec()],
         3,
         &membership(3, &[NODE_C]),
         OP_TIMEOUT,

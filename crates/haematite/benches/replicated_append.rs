@@ -113,8 +113,8 @@ fn bench_replicated_append(c: &mut Criterion) {
                 .node_a
                 .db
                 .replicate_append(
-                    black_box(stream),
-                    black_box(batch.clone()),
+                    black_box(stream.as_slice()),
+                    black_box(batch.as_slice()),
                     0,
                     &membership(3, &[NODE_B, NODE_C]),
                     OP_TIMEOUT,

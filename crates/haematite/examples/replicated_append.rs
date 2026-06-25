@@ -80,8 +80,8 @@ fn main() -> Result3<()> {
         println!("    event {i}: {}", String::from_utf8_lossy(e));
     }
     let next = node_a.db.replicate_append(
-        stream.to_vec(),
-        batch.clone(),
+        stream,
+        &batch,
         0,
         &membership(3, &[NODE_B, NODE_C]),
         OP_TIMEOUT,
@@ -102,8 +102,8 @@ fn main() -> Result3<()> {
     // -- The OCC guard: a re-send at the stale seq is rejected, not doubled ------
     println!("-- a re-send at the now-stale expected_seq 0 is rejected (no double-apply) --");
     match node_a.db.replicate_append(
-        stream.to_vec(),
-        vec![b"should-not-land".to_vec()],
+        stream,
+        &[b"should-not-land".to_vec()],
         0,
         &membership(3, &[NODE_B, NODE_C]),
         OP_TIMEOUT,
