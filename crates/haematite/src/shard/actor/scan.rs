@@ -30,19 +30,27 @@ pub(super) fn scan_sequences<S>(
 where
     S: NodeStore + ?Sized,
 {
+    // Only sequence-metadata keys are ever needed here, so filter to them DURING
+    // collection rather than materialising the shard's entire keyspace (every event
+    // payload + KV value) and filtering at the end. Without a secondary index the
+    // tree walk still visits every node, but the merged map and its clones become
+    // O(streams) instead of O(total entries) — no event payload is ever cloned.
     let mut merged: BTreeMap<Vec<u8>, Vec<u8>> = BTreeMap::new();
     if let Some(root) = committed_root {
-        collect_tree(store, root, &mut merged)?;
+        collect_sequence_entries(store, root, &mut merged)?;
     }
     let buffered = buffer.iter();
     for mutation in buffered {
         match mutation {
-            Mutation::Put { key, value } => {
+            Mutation::Put { key, value } if decode_sequence_key(key).is_some() => {
                 merged.insert(key.clone(), value.clone());
             }
-            Mutation::Delete { key } => {
+            Mutation::Delete { key } if decode_sequence_key(key).is_some() => {
                 merged.remove(key);
             }
+            // Non-sequence keys (event payloads, KV records) never affect the
+            // sequence enumeration; skip without cloning.
+            Mutation::Put { .. } | Mutation::Delete { .. } => {}
         }
     }
     let mut streams = Vec::new();
@@ -68,9 +76,11 @@ where
     Ok(streams)
 }
 
-/// Walk the committed tree rooted at `root`, inserting every leaf entry into
-/// `out`. Uses an explicit stack to bound recursion depth on deep trees.
-fn collect_tree<S>(
+/// Walk the committed tree rooted at `root`, inserting only the
+/// sequence-metadata leaf entries into `out`. Uses an explicit stack to bound
+/// recursion depth on deep trees. Event payloads and other KV values are never
+/// cloned — only keys that decode as sequence keys are retained.
+fn collect_sequence_entries<S>(
     store: &S,
     root: Hash,
     out: &mut BTreeMap<Vec<u8>, Vec<u8>>,
@@ -83,7 +93,9 @@ where
         match load_node(store, hash)? {
             Node::Leaf(leaf) => {
                 for (key, value) in leaf.entries() {
-                    out.insert(key.clone(), value.clone());
+                    if decode_sequence_key(key).is_some() {
+                        out.insert(key.clone(), value.clone());
+                    }
                 }
             }
             Node::Internal(internal) => {
