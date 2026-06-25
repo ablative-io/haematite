@@ -134,6 +134,22 @@ impl Database {
         range_on_handle(self.handle_for(from)?, from, to, self.timeout())
     }
 
+    /// Read a `[from, to)` range from the shard at `shard_id` (by index), in
+    /// ascending key order. Unlike [`Self::range`] (which routes by the `from`
+    /// key's hash), this names the shard directly — the primitive a cross-shard
+    /// enumeration fans out over every shard with. `from >= to` returns empty.
+    pub fn range_per_shard(
+        &self,
+        shard_id: usize,
+        from: &[u8],
+        to: &[u8],
+    ) -> Result<KvRange, DatabaseError> {
+        if from >= to {
+            return Ok(Vec::new());
+        }
+        range_on_handle(self.handle_for_shard(shard_id)?, from, to, self.timeout())
+    }
+
     /// Flush every shard's WAL buffer to its prolly tree and return roots by
     /// shard id.
     ///
@@ -451,6 +467,75 @@ mod tests {
             db.range(range_from, range_to)?,
             vec![(keys[1].clone(), b"live".to_vec())]
         );
+        Ok(())
+    }
+
+    #[test]
+    fn range_per_shard_returns_only_that_shards_keys_and_union_is_complete()
+    -> Result<(), Box<dyn Error>> {
+        let dir = tempfile::tempdir()?;
+        let data_dir = dir.path().join("db");
+        let db = Database::create(config_for(&data_dir, 3))?;
+        assert_eq!(db.shard_count(), 3);
+
+        // A range covering every test key. All keys share the "k:" prefix and are
+        // spread across shards by whole-key BLAKE3 routing.
+        let low = b"k:";
+        let high = b"k;";
+
+        // Put a spread of keys (and one delete) so multiple shards are populated.
+        let mut put_keys: Vec<Vec<u8>> = Vec::new();
+        for i in 0..30_u64 {
+            let key = format!("k:{i:04}").into_bytes();
+            db.put(key.clone(), format!("v{i}").into_bytes())?;
+            put_keys.push(key);
+        }
+        // A committed-then-deleted key must NOT appear in any shard's range.
+        let deleted = b"k:deleted".to_vec();
+        db.put(deleted.clone(), b"gone".to_vec())?;
+        db.commit()?;
+        db.delete(deleted.clone())?;
+
+        // Confirm the keys really do spread across more than one shard, else this
+        // test would not exercise per-shard routing.
+        let distinct_shards: std::collections::BTreeSet<usize> =
+            put_keys.iter().map(|k| db.shard_for(k)).collect();
+        assert!(
+            distinct_shards.len() > 1,
+            "test keys must span multiple shards (got {distinct_shards:?})"
+        );
+
+        // Per-shard: every returned key belongs to that shard, and the union over
+        // all shards equals exactly the live key set.
+        let mut union: std::collections::BTreeSet<Vec<u8>> = std::collections::BTreeSet::new();
+        for s in 0..db.shard_count() {
+            let entries = db.range_per_shard(s, low, high)?;
+            for (key, _value) in &entries {
+                assert_eq!(
+                    db.shard_for(key),
+                    s,
+                    "key {key:?} surfaced on shard {s} but routes to {}",
+                    db.shard_for(key)
+                );
+                assert!(
+                    union.insert(key.clone()),
+                    "key {key:?} appeared in more than one shard's result"
+                );
+            }
+        }
+        let expected: std::collections::BTreeSet<Vec<u8>> = put_keys.iter().cloned().collect();
+        assert_eq!(union, expected, "union of shard ranges must equal live keys");
+        assert!(!union.contains(&deleted), "deleted key must not appear");
+
+        // Empty range [k, k) returns empty on every shard.
+        for s in 0..db.shard_count() {
+            assert_eq!(db.range_per_shard(s, low, low)?, Vec::new());
+        }
+
+        // Out-of-range shard id errors cleanly (no panic).
+        let err = db.range_per_shard(db.shard_count(), low, high);
+        assert!(err.is_err(), "out-of-range shard_id must error, not panic");
+
         Ok(())
     }
 }
