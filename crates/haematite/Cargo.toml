@@ -24,6 +24,23 @@ dashmap = "6.2.1"
 [dev-dependencies]
 proptest = "1"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "time", "sync"] }
+criterion = "0.5"
+
+[[bench]]
+name = "single_shard_ops"
+harness = false
+
+[[bench]]
+name = "multi_shard_scaling"
+harness = false
+
+[[bench]]
+name = "replicated_write"
+harness = false
+
+[[bench]]
+name = "replicated_append"
+harness = false
 
 [lints.rust]
 unsafe_code = "forbid"
