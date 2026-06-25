@@ -23,12 +23,14 @@ pub use handoff_merge::{HandoffMergeError, merge_committed_union};
 pub use membership::{WriteMembership, resolve_membership};
 pub use merge::{SyncMergeError, SyncMergeResult, SyncMergeRoots, merge_synced_roots};
 pub use protocol::{
-    AckOutcome, MissingNodes, Nack, NodeTransfer, Prepare, Promise, PullRequest, PushResponse,
-    RejectReason, RootExchange, RootExchangeRequest, RootExchangeResponse, ShardSyncRequest,
-    SyncDecision, SyncError, SyncMessage, SyncPlan, SyncStats, TargetNodeReader, TargetNodeRequest,
-    TargetNodeResponse, TargetNodeSummary, WriteAck, WriteId, WriteProposal, decode_beamr_sync_frame,
+    AckOutcome, BatchWriteAck, BatchWriteEntry, BatchWriteProposal, MissingNodes, Nack,
+    NodeTransfer, Prepare, Promise, PullRequest, PushResponse, RejectReason, RootExchange,
+    RootExchangeRequest, RootExchangeResponse, ShardSyncRequest, SyncDecision, SyncError,
+    SyncMessage, SyncPlan, SyncStats, TargetNodeReader, TargetNodeRequest, TargetNodeResponse,
+    TargetNodeSummary, WriteAck, WriteId, WriteProposal, decode_beamr_sync_frame,
     decode_sync_message, encode_beamr_sync_frame, encode_sync_message, find_missing_nodes,
-    plan_sync, register_beamr_sync_handler, send_nack_via_beamr, send_prepare_via_beamr,
+    plan_sync, register_beamr_sync_handler, send_batch_write_ack_via_beamr,
+    send_batch_write_proposal_via_beamr, send_nack_via_beamr, send_prepare_via_beamr,
     send_promise_via_beamr, send_pull_request_via_beamr, send_push_response_via_beamr,
     send_root_exchange_request_via_beamr, send_root_exchange_response_via_beamr,
     send_shard_sync_request_via_beamr, send_sync_message_via_beamr,

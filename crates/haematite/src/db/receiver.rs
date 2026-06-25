@@ -27,7 +27,10 @@ use crate::sync::ballot::Ballot;
 use crate::sync::endpoint::{ElectionError, ElectionOutcome};
 use crate::sync::membership::WriteMembership;
 use crate::sync::{QuorumOutcome, SyncNodeId};
-use crate::sync::protocol::{AckOutcome, Nack, Prepare, Promise, RejectReason, WriteAck, WriteProposal};
+use crate::sync::protocol::{
+    AckOutcome, BatchWriteAck, BatchWriteProposal, Nack, Prepare, Promise, RejectReason, WriteAck,
+    WriteProposal,
+};
 use crate::tree::Hash;
 
 impl Database {
@@ -300,6 +303,97 @@ impl Database {
             Err(ShardError::Fenced { .. }) => AckOutcome::Rejected(RejectReason::Fenced),
             // Any other shard error (IO, timeout, unavailable, WAL/tree fault) is a
             // genuine apply error.
+            Err(_other) => AckOutcome::Rejected(RejectReason::ApplyError),
+        }
+    }
+
+    /// Conditionally + durably apply an inbound [`BatchWriteProposal`] ALL-OR-
+    /// NOTHING and produce the [`BatchWriteAck`] to return to the originating writer
+    /// (A1b — the receiver half of a replicated multi-key append).
+    ///
+    /// The batch analogue of [`Self::apply_write_proposal`]: the proposal names ONE
+    /// owning `shard_id` (a batch spans many keys that all map to one shard, exactly
+    /// as a stream append's keys do), the entries are handed straight to that shard's
+    /// `apply_durable_batch`, and the SINGLE verdict is returned. `apply_durable_batch`
+    /// is atomic — it fences once, runs EVERY per-key CAS, then commits ALL keys in
+    /// one fsync, or writes NOTHING — so:
+    ///
+    /// * Every key durably applied under the shared `stamp` → [`AckOutcome::Applied`].
+    /// * The shard fenced the batch (`stamp.epoch < promised[shard]`) → nothing
+    ///   written, ack [`AckOutcome::Rejected`]([`RejectReason::Fenced`]).
+    /// * Any single key's CAS precondition mismatched → nothing written, ack
+    ///   [`AckOutcome::Rejected`]([`RejectReason::CasMismatch`]).
+    /// * Any other apply fault (routing/IO/timeout) → nothing written, ack
+    ///   [`AckOutcome::Rejected`]([`RejectReason::ApplyError`]).
+    ///
+    /// A fence or any CAS mismatch rejects the WHOLE batch; the ack is NEVER a false
+    /// accept, because `apply_durable_batch` guarantees nothing was written on either
+    /// rejection. The returned ack echoes `proposal.write_id` UNCHANGED and carries
+    /// this node's `acker`/`acker_creation`.
+    #[must_use]
+    pub fn apply_batch_write_proposal(&self, proposal: &BatchWriteProposal) -> BatchWriteAck {
+        let (acker, acker_creation) = self.acker_identity();
+        let outcome = self.apply_batch_proposal_durably(proposal);
+        BatchWriteAck {
+            write_id: proposal.write_id.clone(),
+            acker,
+            acker_creation,
+            outcome,
+        }
+    }
+
+    /// Apply an inbound [`BatchWriteProposal`] and SEND the resulting
+    /// [`BatchWriteAck`] back to the originating writer over the live distribution
+    /// transport (A1b). The batch analogue of [`Self::handle_inbound_write`].
+    ///
+    /// # Errors
+    /// Returns a [`DatabaseError`] only if the ack could not be SENT (no endpoint or
+    /// a transport failure). A fence or CAS mismatch is NOT an error here — it is
+    /// carried as the ack `outcome` (a vote-against) and delivered to the writer.
+    pub fn handle_inbound_batch_write(
+        &self,
+        proposal: &BatchWriteProposal,
+    ) -> Result<(), DatabaseError> {
+        let ack = self.apply_batch_write_proposal(proposal);
+        let origin = proposal.write_id.origin.as_str().to_owned();
+        self.send_sync_message(&origin, &crate::sync::SyncMessage::BatchWriteAck(ack))
+    }
+
+    /// Run the all-or-nothing conditional-durable BATCH apply against the named
+    /// owning shard and classify the single result into an [`AckOutcome`] (A1b).
+    fn apply_batch_proposal_durably(&self, proposal: &BatchWriteProposal) -> AckOutcome {
+        let handle = match self.handle_for_shard(proposal.shard_id) {
+            Ok(handle) => handle,
+            Err(_error) => return AckOutcome::Rejected(RejectReason::ApplyError),
+        };
+        // Hand the entries to the shard's atomic multi-key apply in the SAME
+        // `(key, expected, value, ttl)` order, under the ONE shared stamp the whole
+        // batch carries. This replica never invents its own seq — every key stores
+        // the owner-assigned stamp verbatim (§2.4).
+        let items = proposal
+            .entries
+            .iter()
+            .map(|entry| {
+                (
+                    entry.key.clone(),
+                    entry.expected,
+                    entry.value.clone(),
+                    entry.ttl,
+                )
+            })
+            .collect();
+        match handle.apply_durable_batch(items, proposal.stamp(), self.timeout()) {
+            Ok(()) => AckOutcome::Applied,
+            // A single key's CAS hash mismatch rejects the WHOLE batch (nothing
+            // written) — a vote-against, not a fault.
+            Err(ShardError::CasHashMismatch { .. }) => {
+                AckOutcome::Rejected(RejectReason::CasMismatch)
+            }
+            // An epoch fence rejects the WHOLE batch (nothing written) — a
+            // vote-against from a node that promised a higher ballot (§2.3).
+            Err(ShardError::Fenced { .. }) => AckOutcome::Rejected(RejectReason::Fenced),
+            // Any other shard error (IO, timeout, unavailable, WAL/tree fault) is a
+            // genuine apply error; still nothing was written (all-or-nothing).
             Err(_other) => AckOutcome::Rejected(RejectReason::ApplyError),
         }
     }
@@ -737,6 +831,14 @@ pub fn respond_to_inbound_writes(
                 // A send failure here (e.g. the writer already returned) is not
                 // fatal to the responder; keep draining.
                 drop(database.handle_inbound_write(&proposal));
+            }
+            // A1b receiver: an inbound BatchWriteProposal is the multi-key analogue
+            // of a WriteProposal — apply it all-or-nothing through the named shard
+            // and reply with the single BatchWriteAck verdict. A send failure is
+            // non-fatal; keep draining. (BatchWriteAck itself never lands here — it
+            // is a REPLY routed to the proposer.)
+            Some(Ok(SyncMessage::BatchWriteProposal(proposal))) => {
+                drop(database.handle_inbound_batch_write(&proposal));
             }
             // AA-3-2 acceptor: an inbound Prepare is the election counterpart of a
             // WriteProposal — record the promise and reply Promise/Nack. A send

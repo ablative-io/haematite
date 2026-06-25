@@ -304,6 +304,24 @@ impl Database {
             .map(|state| state.promised)
     }
 
+    /// Test-support: durably advance a shard's `promised` ballot (AA-3-2), the same
+    /// way an inbound `Prepare` would, WITHOUT needing a live election/transport.
+    ///
+    /// Returns `true` iff the ballot strictly exceeded the prior `promised` (so it
+    /// was recorded). Used by the A1b receiver fence test to put a shard's
+    /// `promised` above an inbound batch's epoch so the batch is fenced. Not part of
+    /// the production API.
+    #[doc(hidden)]
+    pub fn record_promise_for_test(&self, shard_id: usize, ballot: crate::sync::Ballot) -> bool {
+        let Some(handle) = self.router.handle_for_shard(shard_id) else {
+            return false;
+        };
+        matches!(
+            handle.record_promise(ballot, self.timeout),
+            Ok(crate::shard::actor::RecordPromiseOutcome::Promised)
+        )
+    }
+
     /// Test-support: decode the committed commit-stamp `(epoch, seq)` a node
     /// stored for `key` (AA-3-4a). Reads the RAW stored envelope (stamp NOT
     /// stripped) and decodes its stamp, so a test can prove every replica stored
