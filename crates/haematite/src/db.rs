@@ -404,7 +404,7 @@ impl Database {
         Ok(streams)
     }
 
-    pub(crate) const fn shard_count(&self) -> usize {
+    pub const fn shard_count(&self) -> usize {
         self.config.shard_count
     }
 
