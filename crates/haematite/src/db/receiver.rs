@@ -267,6 +267,12 @@ impl Database {
     /// [`DatabaseError::ConsistencyError`] (the batch did not reach quorum — fenced,
     /// timed out, or transport unavailable), or [`DatabaseError::LocalCommitFailed`]
     /// (quorum reached but the proposer's own durable batch commit failed).
+    // `stream_key`/`payloads` are taken by value to match the owned-argument
+    // ergonomics of the `append` family (`EventStore::append`, `Database::append`)
+    // and `replicate_write`'s owned `key` — the caller builds owned event payloads.
+    // They are addressed by reference internally (the key is reused for every event
+    // key + the counter; payloads are encoded in place), so neither is moved.
+    #[allow(clippy::needless_pass_by_value)]
     pub fn replicate_append(
         &self,
         stream_key: Vec<u8>,
