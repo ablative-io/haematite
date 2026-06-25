@@ -567,3 +567,212 @@ fn merge_adopt_root_survives_crash_recovery() -> Result<(), Box<dyn Error>> {
     scheduler.shutdown();
     Ok(())
 }
+
+// =====================================================================
+// A1a: LOCAL atomic multi-key fenced+stamped apply (apply_durable_batch).
+// =====================================================================
+
+/// Decode the committed stamp stored for `key`, reading the RAW envelope (stamp
+/// NOT stripped). Returns `None` when the key is absent. Used to prove every key
+/// in a batch landed with the IDENTICAL shared stamp.
+fn stamp_of(handle: &ShardHandle, key: &[u8]) -> Result<Option<Stamp>, Box<dyn Error>> {
+    let Some(raw) = handle.get_raw(key.to_vec(), TIMEOUT)? else {
+        return Ok(None);
+    };
+    let entry = crate::ttl::entry::StampedEntry::decode(&raw)?
+        .ok_or("committed value is not a stamped envelope")?;
+    Ok(Some(entry.stamp().clone()))
+}
+
+/// GATE 1 — Atomic multi-key apply. A batch of N keys at ONE stamp lands ALL N
+/// readable with that exact shared stamp, in a SINGLE commit.
+///
+/// Non-vacuous: it asserts EVERY one of the three keys is readable with the
+/// expected value AND that each one's stored stamp equals the single shared
+/// stamp. A regression that wrote only some keys, dropped the stamp, or used a
+/// different stamp per key would fail. The single-commit property is asserted by
+/// the committed-root marker being present after the batch (the fence/CAS tests
+/// confirm the no-write case writes NO marker).
+#[test]
+fn batch_applies_all_keys_at_one_stamp_in_one_commit() -> Result<(), Box<dyn Error>> {
+    let scheduler = test_scheduler()?;
+    let shard = TestShard::spawn(&scheduler, "batch-atomic")?;
+    let handle = &shard.handle;
+
+    let batch_stamp = Stamp::new(ballot(4, "owner"), 7);
+    handle.apply_durable_batch(
+        vec![
+            (b"k1".to_vec(), None, b"v1".to_vec(), None),
+            (b"k2".to_vec(), None, b"v2".to_vec(), None),
+            (b"k3".to_vec(), None, b"v3".to_vec(), None),
+        ],
+        batch_stamp.clone(),
+        TIMEOUT,
+    )?;
+
+    // All N keys are readable with their batch value.
+    assert_eq!(get(handle, b"k1")?, Some(b"v1".to_vec()));
+    assert_eq!(get(handle, b"k2")?, Some(b"v2".to_vec()));
+    assert_eq!(get(handle, b"k3")?, Some(b"v3".to_vec()));
+
+    // And every key carries the IDENTICAL shared stamp (not a per-key invented one).
+    assert_eq!(stamp_of(handle, b"k1")?, Some(batch_stamp.clone()));
+    assert_eq!(stamp_of(handle, b"k2")?, Some(batch_stamp.clone()));
+    assert_eq!(stamp_of(handle, b"k3")?, Some(batch_stamp));
+
+    // The batch committed (one fsync'd committed-root marker is present).
+    assert!(
+        DurableWal::read_file(&shard.wal_path)?
+            .committed_root()
+            .is_some(),
+        "a successful batch must have committed a root marker"
+    );
+
+    scheduler.shutdown();
+    Ok(())
+}
+
+/// GATE 2 — the fence rejects the WHOLE batch. With `promised = (5, X)`, a batch
+/// stamped at `(3, Y)` (below promised) writes NONE of its keys and returns
+/// `Fenced`.
+///
+/// Non-vacuous: it asserts EVERY key of a multi-key batch is still absent AND no
+/// committed-root marker exists. A regression that fenced only the first key, or
+/// applied the batch before checking the fence, would leave at least one key
+/// present (or a marker) and fail.
+#[test]
+fn batch_fence_rejects_whole_batch_writing_nothing() -> Result<(), Box<dyn Error>> {
+    let scheduler = test_scheduler()?;
+    let shard = TestShard::spawn(&scheduler, "batch-fence")?;
+    let handle = &shard.handle;
+
+    promise(handle, ballot(5, "X"))?;
+
+    let result = handle.apply_durable_batch(
+        vec![
+            (b"k1".to_vec(), None, b"v1".to_vec(), None),
+            (b"k2".to_vec(), None, b"v2".to_vec(), None),
+            (b"k3".to_vec(), None, b"v3".to_vec(), None),
+        ],
+        Stamp::new(ballot(3, "Y"), 0),
+        TIMEOUT,
+    );
+    assert!(
+        matches!(
+            result,
+            Err(ShardError::Fenced { ref promised, ref attempted })
+                if *promised == ballot(5, "X") && *attempted == ballot(3, "Y")
+        ),
+        "a below-promised batch must be Fenced, got {result:?}"
+    );
+
+    // NONE of the keys were written, and no committed-root marker exists.
+    assert_eq!(get(handle, b"k1")?, None, "fenced batch must write nothing");
+    assert_eq!(get(handle, b"k2")?, None, "fenced batch must write nothing");
+    assert_eq!(get(handle, b"k3")?, None, "fenced batch must write nothing");
+    assert_eq!(
+        DurableWal::read_file(&shard.wal_path)?.committed_root(),
+        None,
+        "a fenced batch must not have committed anything"
+    );
+
+    scheduler.shutdown();
+    Ok(())
+}
+
+/// GATE 3 — a per-key CAS mismatch rejects the WHOLE batch (all-or-nothing, never
+/// partial). Pre-seed `k2` so a batch that requires `k2` absent (`expected =
+/// None`) mismatches on `k2` while `k1`/`k3` would have matched. The batch must
+/// return the mismatch and leave `k1`/`k3` un-applied — proving the apply is
+/// all-or-nothing, not a partial write of the keys that did match.
+///
+/// Non-vacuous: it asserts `k1` and `k3` (the keys whose CAS WOULD have passed)
+/// are still absent. A regression that buffered each key as its CAS passed and
+/// only failed on `k2` would leave `k1` present and fail this assertion.
+#[test]
+fn batch_cas_mismatch_rejects_whole_batch_no_partial_apply() -> Result<(), Box<dyn Error>> {
+    let scheduler = test_scheduler()?;
+    let shard = TestShard::spawn(&scheduler, "batch-cas")?;
+    let handle = &shard.handle;
+
+    // Pre-seed k2 with a committed value so an expect-absent CAS on k2 mismatches.
+    handle.apply_durable(
+        b"k2".to_vec(),
+        None,
+        b"already-here".to_vec(),
+        None,
+        Stamp::new(ballot(1, "owner"), 0),
+        TIMEOUT,
+    )?;
+    let seeded = stamp_of(handle, b"k2")?;
+
+    // Batch: k1 (expect-absent: WOULD match), k2 (expect-absent: MISMATCHES, it is
+    // present), k3 (expect-absent: WOULD match). The whole batch must be rejected.
+    let result = handle.apply_durable_batch(
+        vec![
+            (b"k1".to_vec(), None, b"v1".to_vec(), None),
+            (b"k2".to_vec(), None, b"v2".to_vec(), None),
+            (b"k3".to_vec(), None, b"v3".to_vec(), None),
+        ],
+        Stamp::new(ballot(2, "owner"), 0),
+        TIMEOUT,
+    );
+    assert!(
+        matches!(
+            result,
+            Err(ShardError::CasHashMismatch { expected, actual })
+                if expected.is_none() && actual == Some(Hash::of(b"already-here"))
+        ),
+        "a per-key CAS mismatch must reject the whole batch, got {result:?}"
+    );
+
+    // ALL-OR-NOTHING: the keys whose CAS WOULD have passed were NOT applied.
+    assert_eq!(get(handle, b"k1")?, None, "k1 must NOT be applied (no partial write)");
+    assert_eq!(get(handle, b"k3")?, None, "k3 must NOT be applied (no partial write)");
+    // k2 is unchanged — still the seeded value with its seeded stamp.
+    assert_eq!(get(handle, b"k2")?, Some(b"already-here".to_vec()));
+    assert_eq!(stamp_of(handle, b"k2")?, seeded, "k2 must be untouched by the rejected batch");
+
+    scheduler.shutdown();
+    Ok(())
+}
+
+/// GATE 4 — an applied batch survives crash recovery. After a multi-key batch is
+/// applied + committed, a crash (kill) + re-spawn must reload EVERY key AND the
+/// shared stamp from the fsync'd WAL marker.
+///
+/// Non-vacuous: it reads each key and decodes its stamp from the RE-SPAWNED
+/// process (fresh recovery from disk, not retained memory). A regression that
+/// only committed to the page cache, or lost the stamp on reload, would fail.
+#[test]
+fn batch_survives_crash_recovery_with_shared_stamp() -> Result<(), Box<dyn Error>> {
+    let scheduler = test_scheduler()?;
+    let shard = TestShard::spawn(&scheduler, "batch-crash")?;
+
+    let batch_stamp = Stamp::new(ballot(6, "owner"), 2);
+    shard.handle.apply_durable_batch(
+        vec![
+            (b"k1".to_vec(), None, b"v1".to_vec(), None),
+            (b"k2".to_vec(), None, b"v2".to_vec(), None),
+            (b"k3".to_vec(), None, b"v3".to_vec(), None),
+        ],
+        batch_stamp.clone(),
+        TIMEOUT,
+    )?;
+
+    // CRASH: kill the process and re-spawn against the SAME store/WAL.
+    scheduler.exit_signal(0, shard.handle.pid(), ExitReason::Kill)?;
+    let recovered = shard.respawn(&scheduler)?;
+    assert_ne!(recovered.pid(), shard.handle.pid());
+
+    // Every key + the shared stamp reload from the WAL marker.
+    assert_eq!(get(&recovered, b"k1")?, Some(b"v1".to_vec()));
+    assert_eq!(get(&recovered, b"k2")?, Some(b"v2".to_vec()));
+    assert_eq!(get(&recovered, b"k3")?, Some(b"v3".to_vec()));
+    assert_eq!(stamp_of(&recovered, b"k1")?, Some(batch_stamp.clone()));
+    assert_eq!(stamp_of(&recovered, b"k2")?, Some(batch_stamp.clone()));
+    assert_eq!(stamp_of(&recovered, b"k3")?, Some(batch_stamp));
+
+    scheduler.shutdown();
+    Ok(())
+}

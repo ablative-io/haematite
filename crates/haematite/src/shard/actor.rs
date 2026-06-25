@@ -570,6 +570,99 @@ impl ShardActor {
         }
     }
 
+    /// Conditionally + durably apply a BATCH of value puts under ONE shared
+    /// `stamp`, ALL-OR-NOTHING, in ONE WAL commit/fsync (A1a — the actor-level
+    /// foundation for a future replicated multi-key append).
+    ///
+    /// This is the multi-key generalisation of [`Self::apply_durable`]: the same
+    /// epoch fence + per-key CAS (over the stamp-excluded LOGICAL value hash) +
+    /// stamped commit, but the WHOLE batch is validated BEFORE anything is
+    /// mutated, and every key is stored with the IDENTICAL `stamp` in a SINGLE
+    /// atomic tree commit. Each item is `(key, expected, value, ttl)`: `expected`
+    /// is that key's own CAS precondition (`None` = expect-absent).
+    ///
+    /// # All-or-nothing ordering (CRITICAL)
+    ///
+    /// 1. **Epoch fence ONCE for the whole batch** (§2.3): if `stamp.epoch <
+    ///    self.promised` the ENTIRE batch is rejected with [`HashCasError::Fenced`]
+    ///    and NOTHING is written — checked before any CAS read, in this same actor
+    ///    slice, so there is no TOCTOU (R8). As on the single-key path, an admitted
+    ///    `>=` write does NOT raise `self.promised` (R2).
+    /// 2. **Per-key CAS, all checked BEFORE any buffering**: for EACH item the
+    ///    current logical value hash (`current_value_hash`, stamp- AND TTL-stripped)
+    ///    is compared against that item's `expected`. The FIRST mismatch rejects the
+    ///    ENTIRE batch with [`HashCasError::HashMismatch`]; no key is buffered, so
+    ///    there is no partial application.
+    /// 3. **Single commit**: only after EVERY fence + CAS check passes is each key's
+    ///    stamped put buffered, then [`Self::commit`] is called ONCE — so the whole
+    ///    batch lands in one `batch_mutate` + one fsync'd committed-root marker. On a
+    ///    commit error the buffer is rolled back to its pre-batch snapshot.
+    ///
+    /// An empty batch is a no-op: the fence is still checked (a stale owner is
+    /// fenced even with nothing to write), but no commit is issued.
+    ///
+    /// Value puts only (the append use is write-once event puts + a seq-counter
+    /// put). Batch deletes/tombstones are out of scope for this increment.
+    fn apply_durable_batch<S>(
+        &mut self,
+        items: Vec<handle::BatchItem>,
+        stamp: Stamp,
+        store: &mut S,
+    ) -> Result<(), HashCasError>
+    where
+        S: NodeStore + ?Sized,
+    {
+        // --- (1) Epoch fence ONCE, BEFORE any CAS read, same actor slice. -------
+        // A stale/deposed owner is fenced for the WHOLE batch; write NOTHING. We do
+        // NOT raise `self.promised` on the accept path (R2): only `record_promise`
+        // (a Prepare) advances it.
+        if stamp.epoch < self.promised {
+            return Err(HashCasError::Fenced {
+                promised: self.promised.clone(),
+                attempted: stamp.epoch,
+            });
+        }
+
+        // --- (2) Per-key CAS, ALL checked before ANY mutation. ------------------
+        // The CAS is over the LOGICAL value hash (stamp/TTL excluded). The FIRST
+        // mismatch rejects the ENTIRE batch — nothing is buffered, so the apply is
+        // strictly all-or-nothing (no partial writes).
+        for (key, expected, _value, _ttl) in &items {
+            let actual = self.current_value_hash(key, store)?;
+            if actual != *expected {
+                return Err(HashCasError::HashMismatch {
+                    expected: *expected,
+                    actual,
+                });
+            }
+        }
+
+        // --- (3) Only after ALL checks pass: buffer every key + commit ONCE. ----
+        // Every key is stored with the IDENTICAL stamp, in a single atomic
+        // (one `batch_mutate` + one fsync) tree commit via `commit`.
+        if items.is_empty() {
+            return Ok(());
+        }
+        let previous_buffer = self.buffer.clone();
+        for (key, _expected, value, ttl) in items {
+            let encoded = match encode_stamped_optional_ttl(value, stamp.clone(), ttl) {
+                Ok(encoded) => encoded,
+                Err(error) => {
+                    self.buffer = previous_buffer;
+                    return Err(tree_error(error).into());
+                }
+            };
+            self.buffer.put(key, encoded);
+        }
+        match self.commit(store) {
+            Ok(_root) => Ok(()),
+            Err(error) => {
+                self.buffer = previous_buffer;
+                Err(HashCasError::from(error))
+            }
+        }
+    }
+
     /// Snapshot this shard's election-relevant state in ONE in-slice read
     /// (AA-3-2). Used by the candidate to compute the mint floor and by the
     /// acceptor to populate a Promise's `accepted_epoch`/`committed_root`. Reading
