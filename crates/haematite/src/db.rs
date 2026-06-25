@@ -34,7 +34,8 @@ use config::{read_config, validate_database_config, write_config};
 
 pub use helpers::run_indexed_parallel;
 use helpers::{
-    event_range_end, event_range_start, map_shard_error, map_spawn_error, range_on_handle,
+    event_range_end, event_range_start, event_sequence_key, map_shard_error, map_spawn_error,
+    range_on_handle,
 };
 
 const CONFIG_FILE: &str = "config.json";
@@ -676,13 +677,6 @@ fn map_sync_scheduler_error(error: SyncSchedulerError) -> DatabaseError {
         SyncSchedulerError::Spawn(message) => DatabaseError::SyncSchedulerSpawn(message),
         other => DatabaseError::SyncSchedulerError(other.to_string()),
     }
-}
-
-fn event_sequence_key(key: &[u8]) -> Vec<u8> {
-    let mut encoded = Vec::with_capacity(key.len().saturating_add(4));
-    encoded.extend_from_slice(key);
-    encoded.extend_from_slice(&[0xff, b's', b'e', b'q']);
-    encoded
 }
 
 fn shard_dir(data_dir: &Path, index: usize) -> PathBuf {

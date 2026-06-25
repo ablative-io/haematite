@@ -105,6 +105,21 @@ pub(super) fn event_range_end(key: &[u8]) -> Vec<u8> {
     encoded
 }
 
+/// The per-stream sequence-counter key: `key || 0xff "seq"`.
+///
+/// This is byte-identical to the shard actor's `sequence_key` (its `SEQ_SUFFIX`)
+/// and to the legacy `db::event_sequence_key`; it is the metadata key whose 8-byte
+/// big-endian value is the stream's next-sequence. The single shared definition so
+/// the local `append`, `read_stream_next_seq`, and the replicated
+/// [`replicate_append`](crate::db::Database::replicate_append) all address the SAME
+/// key (§ event-store layout).
+pub(super) fn event_sequence_key(key: &[u8]) -> Vec<u8> {
+    let mut encoded = Vec::with_capacity(key.len().saturating_add(4));
+    encoded.extend_from_slice(key);
+    encoded.extend_from_slice(&[0xff, b's', b'e', b'q']);
+    encoded
+}
+
 pub fn run_indexed_parallel<Item, Output, Work>(
     items: Vec<Item>,
     work: Work,
