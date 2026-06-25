@@ -165,6 +165,17 @@ impl From<StoreError> for ShardError {
 /// One stream's decoded sequence metadata: `(stream_key, next_seq)`.
 pub(super) type StreamSeq = (Vec<u8>, u64);
 
+/// Result of an [`ShardHandle::export_reachable`] catch-up export (AA-3-4): the
+/// source shard's current committed root plus every content-addressed node
+/// reachable from it, ordered children-before-parents.
+pub type ShardSyncExport = (Option<Hash>, Vec<crate::sync::NodeTransfer>);
+
+/// One promiser's contribution to a handoff merge (AA-3-4d): the promiser's
+/// committed `root` (`None` if it had no committed data) plus the full reachable
+/// node set exported from it. The actor `put`s the transfers then folds
+/// `merge_committed_union(acc, root)` over every promiser.
+pub type PromiserContribution = (Option<Hash>, Vec<crate::sync::NodeTransfer>);
+
 /// Reply channel payload for a `scan_sequences` request.
 pub(super) type ScanReply = SyncSender<Result<Vec<StreamSeq>, ShardError>>;
 
@@ -255,6 +266,14 @@ pub(super) enum ShardCommandKind {
     },
     ReadPromiseState {
         reply: SyncSender<Result<PromiseState, ShardError>>,
+    },
+    ExportReachable {
+        shard_id: crate::branch::ShardId,
+        reply: SyncSender<Result<ShardSyncExport, ShardError>>,
+    },
+    MergeAdopt {
+        promisers: Vec<PromiserContribution>,
+        reply: SyncSender<Result<Option<Hash>, ShardError>>,
     },
     ScanSequences {
         reply: ScanReply,
@@ -660,6 +679,49 @@ impl ShardHandle {
     pub fn read_promise_state(&self, timeout: Duration) -> Result<PromiseState, ShardError> {
         let (reply, response) = mpsc::sync_channel(1);
         self.enqueue(ShardCommandKind::ReadPromiseState { reply })?;
+        recv(&response, self.pid, timeout)?
+    }
+
+    /// Export every content-addressed node reachable from this shard's committed
+    /// root (AA-3-4 handoff state-sync, SOURCE side). Returns the source's current
+    /// committed root plus the full reachable node set (children-before-parents),
+    /// for a freshly-elected owner to catch up before serving (§2.4).
+    ///
+    /// # Errors
+    /// Returns a [`ShardError`] as for [`Self::get`].
+    pub fn export_reachable(
+        &self,
+        shard_id: crate::branch::ShardId,
+        timeout: Duration,
+    ) -> Result<ShardSyncExport, ShardError> {
+        let (reply, response) = mpsc::sync_channel(1);
+        self.enqueue(ShardCommandKind::ExportReachable { shard_id, reply })?;
+        recv(&response, self.pid, timeout)?
+    }
+
+    /// Merge a promise majority's committed states into the local committed
+    /// baseline and durably adopt the result (AA-3-4d handoff merge, TARGET side).
+    ///
+    /// For every promiser contribution: hash-verify and idempotently `put` its
+    /// transfer nodes into the local store, then fold
+    /// `merge_committed_union(acc, promiser_root)` — starting from the LOCAL
+    /// committed root — over ALL promisers. The merged root (ancestor-free union +
+    /// per-key max-stamp, §2.4) is committed durably (fsync'd marker) BEFORE the
+    /// reply, so the new owner is caught up to a LOSSLESS committed baseline before
+    /// it begins serving. Returns the adopted root. With no promiser contributions
+    /// and an empty local tree the result is the local committed root unchanged.
+    ///
+    /// # Errors
+    /// Returns a [`ShardError`] as for [`Self::get`]; a node hash mismatch or a
+    /// merge invariant violation (e.g. a duplicate stamp) fails the whole call so
+    /// the node stays elected-but-not-live.
+    pub fn merge_adopt(
+        &self,
+        promisers: Vec<PromiserContribution>,
+        timeout: Duration,
+    ) -> Result<Option<Hash>, ShardError> {
+        let (reply, response) = mpsc::sync_channel(1);
+        self.enqueue(ShardCommandKind::MergeAdopt { promisers, reply })?;
         recv(&response, self.pid, timeout)?
     }
 

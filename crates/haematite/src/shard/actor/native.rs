@@ -187,7 +187,9 @@ impl ShardState {
             | ShardCommandKind::ApplyDurableTombstone { .. }
             | ShardCommandKind::RecordPromise { .. }
             | ShardCommandKind::RecordOwnerEpoch { .. }
-            | ShardCommandKind::ReserveMinted { .. }) => self.execute_extra(extra),
+            | ShardCommandKind::ReserveMinted { .. }
+            | ShardCommandKind::ExportReachable { .. }
+            | ShardCommandKind::MergeAdopt { .. }) => self.execute_extra(extra),
             ShardCommandKind::ScanSequences { reply } => {
                 drop(reply.send(self.scan_sequences()));
                 None
@@ -255,6 +257,20 @@ impl ShardState {
             }
             ShardCommandKind::ReserveMinted { counter, reply } => {
                 let result = self.actor.reserve_minted(counter).map_err(ShardError::from);
+                drop(reply.send(result));
+            }
+            ShardCommandKind::ExportReachable { shard_id, reply } => {
+                let result = self
+                    .actor
+                    .export_reachable(shard_id, &self.store)
+                    .map_err(ShardError::from);
+                drop(reply.send(result));
+            }
+            ShardCommandKind::MergeAdopt { promisers, reply } => {
+                let result = self
+                    .actor
+                    .merge_adopt(&promisers, &mut self.store)
+                    .map_err(ShardError::from);
                 drop(reply.send(result));
             }
             _ => {}

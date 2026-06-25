@@ -584,6 +584,28 @@ fn nack_round_trips() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 #[test]
+fn shard_sync_request_round_trips_with_and_without_root()
+-> Result<(), Box<dyn std::error::Error>> {
+    let root = sample_hash(b"catch", b"up")?;
+    let messages = [
+        // No from_root (source has no committed data).
+        SyncMessage::ShardSyncRequest(ShardSyncRequest::new(0, SyncNodeId::from("requester-a"), None)),
+        // from_root present, multibyte requester, max shard id.
+        SyncMessage::ShardSyncRequest(ShardSyncRequest::new(
+            usize::MAX,
+            SyncNodeId::from("requester-\u{1f600}"),
+            Some(root),
+        )),
+        // Empty requester id (boundary on the length-prefixed string).
+        SyncMessage::ShardSyncRequest(ShardSyncRequest::new(7, SyncNodeId::from(""), Some(root))),
+    ];
+    for message in &messages {
+        assert_message_round_trips(message)?;
+    }
+    Ok(())
+}
+
+#[test]
 fn ballot_round_trips_for_multibyte_and_empty_node()
 -> Result<(), Box<dyn std::error::Error>> {
     // Multi-byte UTF-8 node id and the empty-string bottom ballot both survive

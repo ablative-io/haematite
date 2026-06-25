@@ -698,6 +698,105 @@ impl ShardActor {
                 .map_err(|_| WalError::TreeError("invalid sequence metadata".to_owned()))
         })
     }
+
+    /// Export every content-addressed node reachable from this shard's committed
+    /// root (AA-3-4 handoff merge, SOURCE side).
+    ///
+    /// Reuses the existing pull primitive
+    /// [`find_missing_nodes`](crate::sync::find_missing_nodes) against an EMPTY
+    /// target (`target_root = None`), so it returns the FULL reachable node set,
+    /// ordered children-before-parents (a crash during the remote apply never makes
+    /// a parent visible without its descendants). The requester then idempotently
+    /// `put`s only the nodes it lacks and folds this shard's committed root into its
+    /// handoff merge (§2.4). Returns `(source_root, transfers)`.
+    pub fn export_reachable<S>(
+        &self,
+        shard_id: crate::branch::ShardId,
+        store: &S,
+    ) -> Result<(Option<Hash>, Vec<crate::sync::NodeTransfer>), WalError>
+    where
+        S: NodeStore + ?Sized,
+    {
+        let source_root = self.committed_root;
+        let missing =
+            crate::sync::find_missing_nodes(store, &EmptyTarget, shard_id, source_root, None)
+                .map_err(|error| WalError::TreeError(error.to_string()))?;
+        Ok((source_root, missing.transfers))
+    }
+
+    /// Merge a promise majority's committed states into the local committed
+    /// baseline and durably adopt the merged root (AA-3-4d handoff merge, §2.4,
+    /// TARGET side). This is the LOSSLESS reconstruction step a freshly-elected
+    /// owner runs BEFORE serving.
+    ///
+    /// For each promiser contribution `(promiser_root, transfers)`:
+    /// 1. Hash-verify every transfer node and idempotently `put` it into the local
+    ///    store (content-addressed; a node already held is a no-op). A mismatch
+    ///    fails the whole call — the node stays elected-but-not-live (fail-closed).
+    /// 2. Fold `acc = merge_committed_union(acc, promiser_root, store)` — the
+    ///    ancestor-free union + per-key max-stamp merge — starting from `acc =`
+    ///    this shard's LOCAL committed root. `merge_committed_union` is commutative,
+    ///    associative, and idempotent over the total order `(epoch, seq)`, so the
+    ///    fold over all promisers (in any order) is order-independent and keeps
+    ///    every committed write/delete from every promiser (the chain tip per key).
+    ///
+    /// The merged root is then committed DURABLY: the live buffer is discarded (a
+    /// freshly-elected owner has no client-acked local buffer to keep — any prior
+    /// buffer was either committed, hence reachable from a root, or in-doubt and not
+    /// acked, §2.0) and the committed-root marker is fsync'd via
+    /// [`DurableWal::commit`] so the adopted baseline survives a crash. Returns the
+    /// adopted root.
+    ///
+    /// `seq` needs NO recovery from the merge: the owner's `live_epoch` (from
+    /// `acquire_shard`) strictly exceeds every merged write's epoch, so the owner's
+    /// first write `(live_epoch, 0)` dominates every merged entry (R-LE, §2.4).
+    pub fn merge_adopt<S>(
+        &mut self,
+        promisers: &[(Option<Hash>, Vec<crate::sync::NodeTransfer>)],
+        store: &mut S,
+    ) -> Result<Option<Hash>, WalError>
+    where
+        S: NodeStore + ?Sized,
+    {
+        // acc starts at the LOCAL committed root: the local node is itself part of
+        // the promise majority, so its own committed writes must never be dropped.
+        let mut acc = self.committed_root;
+
+        for (promiser_root, transfers) in promisers {
+            // Step 1: pull this promiser's committed tree nodes into the local store.
+            for transfer in transfers {
+                let actual = transfer.node.hash();
+                if actual != transfer.hash {
+                    return Err(WalError::TreeError(format!(
+                        "handoff node hash mismatch: expected {:?}, actual {actual:?}",
+                        transfer.hash
+                    )));
+                }
+                let stored = store.put(&transfer.node).map_err(tree_error)?;
+                if stored != transfer.hash {
+                    return Err(WalError::TreeError(format!(
+                        "handoff store wrote {stored:?}, expected {:?}",
+                        transfer.hash
+                    )));
+                }
+            }
+
+            // Step 2: fold this promiser's committed root into the running union.
+            acc = crate::sync::merge_committed_union(acc, *promiser_root, store)
+                .map_err(|error| WalError::TreeError(error.to_string()))?;
+        }
+
+        // Adopt the merged union as the durable committed baseline. Discard the
+        // buffer so commit re-roots cleanly; a None merge (no committed data
+        // anywhere) leaves the committed root untouched.
+        let Some(root) = acc else {
+            return Ok(self.committed_root);
+        };
+        self.buffer = WalBuffer::new();
+        self.wal.commit(root)?;
+        self.committed_root = Some(root);
+        Ok(Some(root))
+    }
 }
 
 fn buffer_mutation(buffer: &mut WalBuffer, mutation: Mutation) {
@@ -772,6 +871,24 @@ fn visible_ttl_value(value: &[u8]) -> Result<Option<Vec<u8>>, WalError> {
 
 fn tree_error(error: impl std::fmt::Display) -> WalError {
     WalError::TreeError(error.to_string())
+}
+
+/// A target-node reader that reports EVERY node as absent (AA-3-4).
+///
+/// Driving [`find_missing_nodes`](crate::sync::find_missing_nodes) against this
+/// makes the source export the FULL reachable set from its committed root, which
+/// is exactly what handoff merge wants (§2.4): the new owner pulls every
+/// promiser's complete committed tree and folds them, rather than computing a
+/// divergence-aware diff.
+struct EmptyTarget;
+
+impl crate::sync::TargetNodeReader for EmptyTarget {
+    fn read_target_node(
+        &self,
+        _hash: Hash,
+    ) -> Result<Option<crate::sync::TargetNodeSummary>, crate::sync::SyncError> {
+        Ok(None)
+    }
 }
 
 #[cfg(test)]

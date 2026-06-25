@@ -471,3 +471,99 @@ fn fence_admits_ge_without_ever_raising_promised() -> Result<(), Box<dyn Error>>
     scheduler.shutdown();
     Ok(())
 }
+
+/// Build a committed, stamped entry for `key=value` at `stamp` on a fresh shard
+/// (the merge requires stamped envelopes — `apply_durable` writes them). Returns
+/// the exported `(committed_root, transfers)`.
+fn export_committed(
+    scheduler: &Arc<Scheduler>,
+    name: &str,
+    key: &[u8],
+    value: &[u8],
+    stamp: Stamp,
+) -> Result<(Option<Hash>, Vec<crate::sync::NodeTransfer>), Box<dyn Error>> {
+    let shard = TestShard::spawn(scheduler, name)?;
+    shard
+        .handle
+        .apply_durable(key.to_vec(), None, value.to_vec(), None, stamp, TIMEOUT)?;
+    let export = shard.handle.export_reachable(0, TIMEOUT)?;
+    Ok(export)
+}
+
+/// AA-3-4d actor-level FORKED-state merge: two promisers hold DIFFERENT committed
+/// keys (`k2` on one, `k3` on the other). `merge_adopt` over BOTH must leave the
+/// target serving BOTH — the union, no committed write dropped.
+///
+/// Falsifiability control: folding only ONE promiser (single-root adoption) serves
+/// only that promiser's key and DROPS the other — proving the union over ALL
+/// promisers is load-bearing.
+#[test]
+fn merge_adopt_unions_forked_promiser_state() -> Result<(), Box<dyn Error>> {
+    let scheduler = test_scheduler()?;
+
+    // Promiser B holds {k3}; promiser C holds {k2}. Different keys, different
+    // committed roots (an incomparable fork under one owner, §2.4).
+    let b = export_committed(&scheduler, "fork-b", b"k3", b"v3", Stamp::new(ballot(2, "A"), 1))?;
+    let c = export_committed(&scheduler, "fork-c", b"k2", b"v2", Stamp::new(ballot(2, "A"), 0))?;
+
+    // MERGE path: fold BOTH promisers into a fresh target.
+    let target = TestShard::spawn(&scheduler, "fork-target")?;
+    target.handle.merge_adopt(vec![b, c.clone()], TIMEOUT)?;
+    assert_eq!(
+        get(&target.handle, b"k2")?,
+        Some(b"v2".to_vec()),
+        "merge over ALL promisers must serve k2 (from C)"
+    );
+    assert_eq!(
+        get(&target.handle, b"k3")?,
+        Some(b"v3".to_vec()),
+        "merge over ALL promisers must serve k3 (from B)"
+    );
+
+    // CONTROL: fold only ONE promiser (single-root adoption). It serves that
+    // promiser's key and DROPS the other — the property fails without the union.
+    let single = TestShard::spawn(&scheduler, "fork-single")?;
+    single.handle.merge_adopt(vec![c], TIMEOUT)?;
+    assert_eq!(
+        get(&single.handle, b"k2")?,
+        Some(b"v2".to_vec()),
+        "single-root adoption serves the one promiser's key"
+    );
+    assert_eq!(
+        get(&single.handle, b"k3")?,
+        None,
+        "single-root adoption DROPS the forked write — proves the union is load-bearing"
+    );
+
+    scheduler.shutdown();
+    Ok(())
+}
+
+/// AA-3-4d actor-level: `merge_adopt` durably adopts the merged root — it survives
+/// a crash. The merged committed state must reload from the WAL marker on respawn.
+#[test]
+fn merge_adopt_root_survives_crash_recovery() -> Result<(), Box<dyn Error>> {
+    let scheduler = test_scheduler()?;
+
+    let b = export_committed(&scheduler, "durable-b", b"k3", b"v3", Stamp::new(ballot(2, "A"), 1))?;
+    let c = export_committed(&scheduler, "durable-c", b"k2", b"v2", Stamp::new(ballot(2, "A"), 0))?;
+
+    let target = TestShard::spawn(&scheduler, "durable-target")?;
+    target.handle.merge_adopt(vec![b, c], TIMEOUT)?;
+
+    // CRASH: drop + respawn against the same store/WAL.
+    let recovered = target.respawn(&scheduler)?;
+    assert_eq!(
+        get(&recovered, b"k2")?,
+        Some(b"v2".to_vec()),
+        "merged k2 must survive crash recovery (fsync'd marker)"
+    );
+    assert_eq!(
+        get(&recovered, b"k3")?,
+        Some(b"v3".to_vec()),
+        "merged k3 must survive crash recovery"
+    );
+
+    scheduler.shutdown();
+    Ok(())
+}
