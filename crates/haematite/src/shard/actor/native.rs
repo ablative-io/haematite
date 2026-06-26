@@ -390,7 +390,14 @@ fn merge_range(
     tree_entries: &[(Vec<u8>, Vec<u8>)],
     buffer_entries: &[&Mutation],
 ) -> Result<Vec<RangeItem>, ShardError> {
-    let mut items = Vec::new();
+    // Upper bound: every tree entry plus every buffered mutation can yield at
+    // most one item, plus the trailing `Done` sentinel. Both counts are local
+    // (not attacker-controlled), so this single allocation never reallocates.
+    let capacity = tree_entries
+        .len()
+        .saturating_add(buffer_entries.len())
+        .saturating_add(1);
+    let mut items = Vec::with_capacity(capacity);
     let mut tree_index = 0;
     let mut buffer_index = 0;
     loop {

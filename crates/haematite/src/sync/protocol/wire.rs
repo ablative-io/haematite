@@ -39,6 +39,25 @@ const MESSAGE_BATCH_WRITE_ACK: u8 = 14;
 const ACK_OUTCOME_APPLIED: u8 = 0;
 const ACK_OUTCOME_REJECTED: u8 = 1;
 
+/// Width of a `usize`/length field on the wire (encoded as a big-endian `u64`).
+const WIRE_USIZE_BYTES: usize = 8;
+
+/// Smallest on-wire size of one `NodeTransfer`: a 32-byte content hash plus a
+/// u64 node-length prefix (the node body itself may be a single tag byte, but
+/// the hash + length prefix alone bound how many transfers a hostile
+/// `transfer_count` could describe in the remaining bytes).
+const MIN_TRANSFER_BYTES: usize = 32 + WIRE_USIZE_BYTES;
+
+/// Bound a wire-supplied element count by what the remaining bytes could hold,
+/// so a hostile length never triggers an unbounded pre-allocation. Returns the
+/// smaller of `count` and the maximum number of `min_element_bytes`-sized
+/// elements that could physically fit in `remaining`; the decode loop still
+/// grows the Vec normally if the genuine count exceeds the clamp.
+fn clamp_capacity(count: usize, remaining: usize, min_element_bytes: usize) -> usize {
+    let max_possible = remaining / min_element_bytes.max(1);
+    count.min(max_possible)
+}
+
 /// Sync protocol messages that can be framed over beamr distribution links.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SyncMessage {
@@ -273,7 +292,12 @@ pub fn decode_sync_message(bytes: &[u8]) -> Result<SyncMessage, SyncError> {
 
 /// Encode a complete beamr distribution control frame for a sync message.
 pub fn encode_beamr_sync_frame(message: &SyncMessage) -> Result<Vec<u8>, SyncError> {
-    let payload = encode_sync_message(message)?;
+    wrap_beamr_sync_frame(&encode_sync_message(message)?)
+}
+
+/// Wrap an already-encoded sync-message payload in the beamr control-frame
+/// header (control-tag length, payload length, control tag, payload).
+fn wrap_beamr_sync_frame(payload: &[u8]) -> Result<Vec<u8>, SyncError> {
     let control_len =
         u32::try_from(SYNC_CONTROL_FRAME.len()).map_err(|_error| SyncError::MessageTooLarge {
             len: SYNC_CONTROL_FRAME.len(),
@@ -285,8 +309,20 @@ pub fn encode_beamr_sync_frame(message: &SyncMessage) -> Result<Vec<u8>, SyncErr
     frame.extend_from_slice(&control_len.to_be_bytes());
     frame.extend_from_slice(&payload_len.to_be_bytes());
     frame.extend_from_slice(SYNC_CONTROL_FRAME);
-    frame.extend_from_slice(&payload);
+    frame.extend_from_slice(payload);
     Ok(frame)
+}
+
+/// Encode a [`PushResponse`] frame directly from a borrow.
+///
+/// `PushResponse` carries the whole transfer set, so cloning it just to wrap it
+/// in an owned [`SyncMessage`] for the generic encode path is expensive on the
+/// failover/catch-up hot path. This encodes the same bytes by reference.
+fn encode_beamr_push_response_frame(response: &PushResponse) -> Result<Vec<u8>, SyncError> {
+    let mut payload = Vec::new();
+    payload.push(SYNC_PROTOCOL_VERSION);
+    encode_push_response(response, &mut payload);
+    wrap_beamr_sync_frame(&payload)
 }
 
 /// Decode a complete beamr distribution control frame produced by
@@ -387,12 +423,13 @@ pub fn send_push_response_via_beamr<F>(
 where
     F: FnOnce(Arc<DistConnection>, Vec<u8>) -> Result<(), SyncError>,
 {
-    send_sync_message_via_beamr(
-        manager,
-        remote,
-        &SyncMessage::PushResponse(response.clone()),
-        write_frame,
-    )
+    // Encode the (potentially large) PushResponse by reference rather than
+    // cloning it into an owned `SyncMessage` just to feed the generic path.
+    let connection = manager
+        .get_connection(remote)
+        .ok_or(SyncError::TransportConnectionUnavailable)?;
+    let frame = encode_beamr_push_response_frame(response)?;
+    write_frame(connection, frame)
 }
 
 pub fn send_shard_sync_request_via_beamr<F>(
@@ -557,7 +594,12 @@ pub fn send_nack_via_beamr<F>(
 where
     F: FnOnce(Arc<DistConnection>, Vec<u8>) -> Result<(), SyncError>,
 {
-    send_sync_message_via_beamr(manager, remote, &SyncMessage::Nack(nack.clone()), write_frame)
+    send_sync_message_via_beamr(
+        manager,
+        remote,
+        &SyncMessage::Nack(nack.clone()),
+        write_frame,
+    )
 }
 
 /// Register a beamr control-frame handler for haematite sync messages.
@@ -591,20 +633,33 @@ fn decode_push_response(cursor: &mut MessageCursor<'_>) -> Result<SyncMessage, S
     let source_root = cursor.read_optional_hash()?;
     let target_root = cursor.read_optional_hash()?;
     let transfer_count = cursor.read_usize()?;
-    let mut transfers = Vec::new();
+    // `transfer_count` is attacker-controlled; clamp the pre-allocation to what
+    // the remaining bytes could possibly hold (each transfer needs >= a hash and
+    // a u64 node-length prefix). The loop still grows the Vec if the bound holds.
+    let mut transfers = Vec::with_capacity(clamp_capacity(
+        transfer_count,
+        cursor.remaining(),
+        MIN_TRANSFER_BYTES,
+    ));
+    // Accumulate the serialised byte total from the on-wire length prefix as we
+    // go: the length is already framed, so re-serialising each node a third time
+    // (after deserialise + the hash-verify in `from_parts`) just to measure it is
+    // pure waste.
+    let mut bytes_transferred = 0_usize;
     for _ in 0..transfer_count {
         let hash = cursor.read_hash()?;
         let node_len = cursor.read_usize()?;
         let node_bytes = cursor.read_exact(node_len)?;
         let node = Node::deserialise(node_bytes).map_err(|_error| SyncError::InvalidNodePayload)?;
         transfers.push(NodeTransfer::from_parts(hash, node)?);
+        bytes_transferred = bytes_transferred.saturating_add(node_len);
     }
     let stats = SyncStats {
         nodes_transferred: transfers.len(),
-        bytes_transferred: transfers.iter().map(NodeTransfer::byte_len).sum(),
+        bytes_transferred,
         ..SyncStats::default()
     };
-    Ok(SyncMessage::PushResponse(PushResponse::new(
+    Ok(SyncMessage::PushResponse(PushResponse::with_stats(
         shard_id,
         source_root,
         target_root,
@@ -714,6 +769,12 @@ impl<'a> MessageCursor<'a> {
         Self { bytes, position: 0 }
     }
 
+    /// Bytes not yet consumed — used to bound pre-allocation against a hostile
+    /// element count.
+    const fn remaining(&self) -> usize {
+        self.bytes.len().saturating_sub(self.position)
+    }
+
     fn read_u8(&mut self) -> Result<u8, SyncError> {
         let bytes = self.read_exact(1)?;
         bytes.first().copied().ok_or(SyncError::InvalidMessage)
@@ -775,7 +836,14 @@ impl<'a> MessageCursor<'a> {
             1 => Ok(Some(TargetNodeSummary::Leaf)),
             2 => {
                 let child_count = self.read_usize()?;
-                let mut children = Vec::new();
+                // `child_count` is attacker-controlled; clamp the pre-allocation
+                // to what the remaining bytes could hold (each child needs >= a
+                // u64 separator-length prefix and a 32-byte hash).
+                let mut children = Vec::with_capacity(clamp_capacity(
+                    child_count,
+                    self.remaining(),
+                    WIRE_USIZE_BYTES + 32,
+                ));
                 for _ in 0..child_count {
                     let separator = self.read_len_prefixed_bytes()?;
                     let hash = self.read_hash()?;

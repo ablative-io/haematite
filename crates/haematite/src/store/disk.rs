@@ -90,14 +90,17 @@ impl DiskStore {
     }
 
     fn write_node(&self, node: &Node) -> Result<Hash, StoreError> {
-        let hash = node.hash();
+        // Serialise ONCE: `serialise_and_hash` yields the content hash and the
+        // exact bytes we hand to compression, so a node is no longer serialised
+        // twice per write (previously `hash()` serialised-then-dropped the bytes,
+        // and the compress step serialised again).
+        let (serialised, hash) = node.serialise_and_hash();
         let path = self.node_path(&hash);
         if path_exists(&path)? {
             self.cache_put(hash, Arc::new(node.clone()));
             return Ok(hash);
         }
 
-        let serialised = node.serialise();
         let compressed = compress_node(&serialised)?;
         if let Some(parent_dir) = write_compressed_node(&path, &compressed)? {
             // Record the subdirectory that received this node so the commit-path
