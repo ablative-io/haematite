@@ -24,7 +24,9 @@
 use std::cmp::Ordering;
 use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, MutexGuard};
+use std::sync::Arc;
+use std::sync::MutexGuard;
+use std::sync::mpsc::SyncSender;
 
 use beamr::process::ExitReason;
 use beamr::{NativeContext, NativeHandler, NativeOutcome};
@@ -38,6 +40,11 @@ use crate::wal::{DurableWal, FsyncPolicy, Mutation, WalRecovery};
 use super::handle::{
     CommandQueue, RangeItem, ShardCommand, ShardCommandKind, ShardError, StreamSeq,
 };
+use super::{GroupOutcome, GroupWrite};
+
+/// The reply channel shared by every groupable durable write (`Cas`,
+/// `ApplyDurable`, `ApplyDurableTombstone` all reply `Result<(), ShardError>`).
+type GroupReply = SyncSender<Result<(), ShardError>>;
 
 /// The wrapped-storage state plus the bridge queue, run as a beamr process.
 ///
@@ -96,15 +103,153 @@ impl ShardNativeHandler {
         Ok(ShardState { actor, store })
     }
 
-    /// Pop and run exactly one queued command, replying over its channel.
-    /// Returns a stop outcome when the command requested process shutdown.
+    /// Drain the next unit of work for one mailbox token, replying over each
+    /// command's channel. Returns a stop outcome when a command requested process
+    /// shutdown.
+    ///
+    /// Group commit (audit E): if the front of the queue is a groupable durable
+    /// WRITE (`Cas` / `ApplyDurable` / `ApplyDurableTombstone`), a maximal run of
+    /// consecutive such commands is popped under ONE tight lock and committed in
+    /// ONE fsync via [`ShardActor::apply_group`], collapsing N fsyncs to one.
+    /// Otherwise exactly one command is popped and run as before. (A group of K
+    /// commands consumes K queued items but only this one token; the K-1 surplus
+    /// tokens later find an empty queue — the existing `QueueEmpty` = spurious
+    /// case — so no work is lost or double-run.)
     fn pop_and_execute(state: &mut ShardState, commands: &CommandQueue) -> Option<NativeOutcome> {
-        let command = pop_command(commands)?;
-        state.execute(command)
+        match pop_next_unit(commands)? {
+            DrainUnit::Group(group) => {
+                state.run_group(group);
+                None
+            }
+            DrainUnit::Single(command) => state.execute(command),
+        }
+    }
+}
+
+/// One unit of work drained for a single mailbox token: either a coalesced run of
+/// groupable durable writes, or one non-groupable command run on its own.
+enum DrainUnit {
+    Group(Vec<(GroupWrite, GroupReply)>),
+    Single(ShardCommand),
+}
+
+/// Pop the next unit of work under a TIGHT lock (spec Landmine 4): the queue mutex
+/// is held ONLY for the peek/pop here and released before any storage op or fsync.
+///
+/// If the front command is a groupable durable write, pop the maximal CONSECUTIVE
+/// run of them (stopping at the first non-groupable command, which is left on the
+/// queue and handled on its own next time). Otherwise pop exactly one command.
+fn pop_next_unit(commands: &CommandQueue) -> Option<DrainUnit> {
+    let mut queue = lock_queue(commands);
+    if !queue
+        .front()
+        .is_some_and(|command| is_groupable(&command.kind))
+    {
+        return queue.pop_front().map(DrainUnit::Single);
+    }
+    let mut group = Vec::new();
+    while queue
+        .front()
+        .is_some_and(|command| is_groupable(&command.kind))
+    {
+        // The front is groupable, so `pop_front` yields it and `into_group_write`
+        // returns `Some` — but never `unwrap`: a (logically impossible) `None`
+        // simply ends the run rather than panicking.
+        if let Some(command) = queue.pop_front()
+            && let Some(entry) = into_group_write(command.kind)
+        {
+            group.push(entry);
+        }
+    }
+    Some(DrainUnit::Group(group))
+}
+
+/// Whether a command is a groupable durable WRITE that may be coalesced into a
+/// group commit. ONLY single-key CAS / stamped value apply / stamped tombstone
+/// apply qualify — they each fsync one root today. Everything else (promise-state
+/// mutators, `Prepare`/`merge_adopt`, the all-or-nothing `ApplyDurableBatch`,
+/// `Append`, reads, `Commit`, `Shutdown`) is NOT groupable and keeps its own
+/// semantics and ordering.
+const fn is_groupable(kind: &ShardCommandKind) -> bool {
+    matches!(
+        kind,
+        ShardCommandKind::Cas { .. }
+            | ShardCommandKind::ApplyDurable { .. }
+            | ShardCommandKind::ApplyDurableTombstone { .. }
+    )
+}
+
+/// Convert a groupable command kind into its [`GroupWrite`] descriptor plus reply
+/// channel. Returns `None` for any non-groupable kind (the caller only ever passes
+/// kinds for which [`is_groupable`] is true, so `None` never occurs in practice).
+fn into_group_write(kind: ShardCommandKind) -> Option<(GroupWrite, GroupReply)> {
+    match kind {
+        ShardCommandKind::Cas {
+            key,
+            expected,
+            new,
+            reply,
+        } => Some((GroupWrite::Cas { key, expected, new }, reply)),
+        ShardCommandKind::ApplyDurable {
+            key,
+            expected,
+            value,
+            ttl,
+            stamp,
+            reply,
+        } => Some((
+            GroupWrite::ApplyValue {
+                key,
+                expected,
+                value,
+                ttl,
+                stamp,
+            },
+            reply,
+        )),
+        ShardCommandKind::ApplyDurableTombstone {
+            key,
+            expected,
+            stamp,
+            reply,
+        } => Some((
+            GroupWrite::ApplyTombstone {
+                key,
+                expected,
+                stamp,
+            },
+            reply,
+        )),
+        _ => None,
     }
 }
 
 impl ShardState {
+    /// Run a coalesced group of durable writes in ONE group commit and fan the
+    /// per-write outcome to each command's reply channel (audit E).
+    ///
+    /// The writes are split from their reply senders, staged + committed once by
+    /// [`ShardActor::apply_group`] (which returns one outcome per write, in order),
+    /// then each outcome is mapped back to its sender: a survivor gets `Ok(())`, a
+    /// rejected write gets its own CAS/fence error, and — if the shared commit
+    /// failed — every survivor gets the retryable commit error.
+    fn run_group(&mut self, group: Vec<(GroupWrite, GroupReply)>) {
+        let mut writes = Vec::with_capacity(group.len());
+        let mut replies = Vec::with_capacity(group.len());
+        for (write, reply) in group {
+            writes.push(write);
+            replies.push(reply);
+        }
+        let outcomes = self.actor.apply_group(writes, &mut self.store);
+        for (reply, outcome) in replies.into_iter().zip(outcomes) {
+            let result = match outcome {
+                GroupOutcome::Committed => Ok(()),
+                GroupOutcome::Rejected(error) | GroupOutcome::CommitFailed(error) => Err(error),
+            };
+            drop(reply.send(result));
+        }
+    }
+
     /// Run one command against the wrapped storage and send the reply.
     fn execute(&mut self, command: ShardCommand) -> Option<NativeOutcome> {
         match command.kind {
@@ -594,6 +739,131 @@ mod boot_failure_tests {
             commands.lock().map_err(|_| "queue poisoned")?.is_empty(),
             "queue fully drained"
         );
+        Ok(())
+    }
+}
+
+/// Group commit (audit E): the native drain loop's grouping/forwarding logic,
+/// tested against a hand-built queue (deterministic, no scheduler race). These
+/// prove `pop_next_unit` coalesces a CONSECUTIVE run of groupable writes and STOPS
+/// at the first non-groupable command — so promise-state mutators (`RecordPromise`)
+/// and friends are never swallowed into a group and keep their own slice.
+#[cfg(test)]
+mod group_drain_tests {
+    use super::{DrainUnit, lock_queue, pop_next_unit};
+    use crate::shard::actor::handle::{CommandQueue, ShardCommand, ShardCommandKind};
+    use crate::sync::ballot::{Ballot, Stamp};
+    use crate::sync::topology::SyncNodeId;
+    use std::collections::VecDeque;
+    use std::error::Error;
+    use std::sync::mpsc;
+    use std::sync::{Arc, Mutex};
+
+    fn stamp() -> Stamp {
+        Stamp::new(Ballot::new(1, SyncNodeId::new("owner")), 0)
+    }
+
+    fn apply_command(id: u64, key: &[u8]) -> ShardCommand {
+        let (reply, _rx) = mpsc::sync_channel(1);
+        ShardCommand {
+            id,
+            kind: ShardCommandKind::ApplyDurable {
+                key: key.to_vec(),
+                expected: None,
+                value: b"v".to_vec(),
+                ttl: None,
+                stamp: stamp(),
+                reply,
+            },
+        }
+    }
+
+    fn cas_command(id: u64, key: &[u8]) -> ShardCommand {
+        let (reply, _rx) = mpsc::sync_channel(1);
+        ShardCommand {
+            id,
+            kind: ShardCommandKind::Cas {
+                key: key.to_vec(),
+                expected: None,
+                new: 1,
+                reply,
+            },
+        }
+    }
+
+    fn promise_command(id: u64) -> ShardCommand {
+        let (reply, _rx) = mpsc::sync_channel(1);
+        ShardCommand {
+            id,
+            kind: ShardCommandKind::RecordPromise {
+                ballot: Ballot::new(2, SyncNodeId::new("owner")),
+                reply,
+            },
+        }
+    }
+
+    /// A consecutive run of groupable writes is coalesced into ONE group, the run
+    /// STOPS at the non-groupable `RecordPromise` (which is left on the queue and
+    /// drained on its own next), and the trailing groupable write forms its own
+    /// group. This is the wiring-level proof that Prepare/promise are NOT coalesced.
+    #[test]
+    fn drain_groups_consecutive_writes_and_stops_at_non_groupable() -> Result<(), Box<dyn Error>> {
+        let commands: CommandQueue = Arc::new(Mutex::new(VecDeque::new()));
+        {
+            let mut queue = lock_queue(&commands);
+            queue.push_back(apply_command(1, b"a")); // groupable
+            queue.push_back(cas_command(2, b"b")); // groupable
+            queue.push_back(promise_command(3)); // NOT groupable — stops the run
+            queue.push_back(apply_command(4, b"c")); // groupable (own group)
+        }
+
+        // First unit: a group of exactly the first TWO groupable writes.
+        match pop_next_unit(&commands).ok_or("expected a first unit")? {
+            DrainUnit::Group(group) => assert_eq!(group.len(), 2, "coalesce the leading run"),
+            DrainUnit::Single(_) => return Err("expected a group, got a single".into()),
+        }
+
+        // Second unit: the non-groupable RecordPromise, on its own (NOT coalesced).
+        match pop_next_unit(&commands).ok_or("expected a second unit")? {
+            DrainUnit::Single(command) => assert!(
+                matches!(command.kind, ShardCommandKind::RecordPromise { .. }),
+                "RecordPromise must be handled as a single, never grouped"
+            ),
+            DrainUnit::Group(_) => return Err("RecordPromise must not be grouped".into()),
+        }
+
+        // Third unit: the trailing groupable write as its own group of one.
+        match pop_next_unit(&commands).ok_or("expected a third unit")? {
+            DrainUnit::Group(group) => assert_eq!(group.len(), 1, "trailing write groups alone"),
+            DrainUnit::Single(_) => return Err("expected a trailing group".into()),
+        }
+
+        // Queue is now empty.
+        assert!(pop_next_unit(&commands).is_none(), "queue fully drained");
+        Ok(())
+    }
+
+    /// A non-groupable command at the FRONT is popped as a single, never wrapped in
+    /// a group — even when groupable writes follow it.
+    #[test]
+    fn non_groupable_front_is_single_even_with_groupable_behind() -> Result<(), Box<dyn Error>> {
+        let commands: CommandQueue = Arc::new(Mutex::new(VecDeque::new()));
+        {
+            let mut queue = lock_queue(&commands);
+            queue.push_back(promise_command(1)); // NOT groupable, at the front
+            queue.push_back(apply_command(2, b"a")); // groupable, behind it
+        }
+        match pop_next_unit(&commands).ok_or("expected a unit")? {
+            DrainUnit::Single(command) => assert!(matches!(
+                command.kind,
+                ShardCommandKind::RecordPromise { .. }
+            )),
+            DrainUnit::Group(_) => return Err("front non-groupable must be single".into()),
+        }
+        match pop_next_unit(&commands).ok_or("expected a unit")? {
+            DrainUnit::Group(group) => assert_eq!(group.len(), 1),
+            DrainUnit::Single(_) => return Err("trailing write should group".into()),
+        }
         Ok(())
     }
 }

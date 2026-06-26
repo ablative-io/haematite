@@ -75,7 +75,8 @@ fn bench_single_shard(c: &mut Criterion) {
         b.iter(|| {
             let key = format!("k:{counter:016}").into_bytes();
             counter += 1;
-            db.put(black_box(key), black_box(b"value".to_vec())).expect("put");
+            db.put(black_box(key), black_box(b"value".to_vec()))
+                .expect("put");
         });
     });
 
@@ -161,7 +162,8 @@ fn bench_single_shard(c: &mut Criterion) {
         let (db, dir) = fresh_db();
         // Seed 32 keys under one prefix that all live on shard 0 (single-shard store).
         for i in 0..32_u64 {
-            db.put(format!("r:{i:016}").into_bytes(), b"v".to_vec()).expect("put");
+            db.put(format!("r:{i:016}").into_bytes(), b"v".to_vec())
+                .expect("put");
         }
         db.commit().expect("commit");
         let from = b"r:".to_vec();
@@ -173,7 +175,49 @@ fn bench_single_shard(c: &mut Criterion) {
         drop(dir);
     });
 
+    // -- concurrent same-shard writers: the GROUP COMMIT win (audit E) ----------
+    // N client threads each issue ONE durable CAS against the SAME single-shard
+    // store at once, so several groupable writes are QUEUED before the shard actor
+    // drains them. With group commit the actor coalesces a queued run into ONE
+    // fsync instead of one fsync per write — the win only shows under concurrent
+    // queueing, which the blocking single-op benches above never produce. We time
+    // the wall-clock for all N writes to complete. Before group commit this was
+    // ~N × one fsync; after, it trends toward ~one fsync per drained group.
+    bench_concurrent_writers(&mut group, 8);
+    bench_concurrent_writers(&mut group, 32);
+
     group.finish();
+}
+
+/// Time `writers` client threads each committing one durable CAS to the SAME
+/// single-shard store concurrently, so the writes queue and the shard coalesces
+/// them into group commits.
+fn bench_concurrent_writers(
+    group: &mut criterion::BenchmarkGroup<'_, criterion::measurement::WallTime>,
+    writers: usize,
+) {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    group.bench_function(format!("concurrent_writers_{writers}"), |b| {
+        let (db, _dir) = fresh_db();
+        let db = Arc::new(db);
+        // A monotonic key counter so every CAS targets a distinct (always-absent)
+        // key on the one shard and therefore always matches `expected = None`.
+        let next_key = AtomicU64::new(0);
+        b.iter(|| {
+            std::thread::scope(|scope| {
+                for _ in 0..writers {
+                    let db = Arc::clone(&db);
+                    let id = next_key.fetch_add(1, Ordering::Relaxed);
+                    scope.spawn(move || {
+                        let key = format!("cw:{id:016}").into_bytes();
+                        db.cas(black_box(key), None, 1).expect("cas");
+                    });
+                }
+            });
+        });
+    });
 }
 
 criterion_group! {
