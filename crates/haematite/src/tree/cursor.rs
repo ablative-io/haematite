@@ -74,7 +74,7 @@ pub struct RangeIter<'a, S: NodeStore + ?Sized> {
     from: Vec<u8>,
     to: Vec<u8>,
     stack: Vec<RangeFrame>,
-    leaf_entries: Vec<(Vec<u8>, Vec<u8>)>,
+    leaf: Option<Arc<Node>>,
     leaf_index: usize,
     started: bool,
     finished: bool,
@@ -88,7 +88,7 @@ impl<'a, S: NodeStore + ?Sized> RangeIter<'a, S> {
             from: from.to_vec(),
             to: to.to_vec(),
             stack: Vec::new(),
-            leaf_entries: Vec::new(),
+            leaf: None,
             leaf_index: 0,
             started: false,
             finished: to <= from,
@@ -104,22 +104,22 @@ impl<'a, S: NodeStore + ?Sized> RangeIter<'a, S> {
         let mut next_hash = hash;
 
         loop {
-            match &*load_node(self.store, next_hash)? {
+            let node = load_node(self.store, next_hash)?;
+            match &*node {
                 Node::Leaf(leaf) => {
-                    self.leaf_entries = leaf.entries().to_vec();
-                    self.leaf_index =
-                        lower_bound(self.leaf_entries.as_slice(), self.from.as_slice());
+                    self.leaf_index = lower_bound(leaf.entries(), self.from.as_slice());
+                    self.leaf = Some(Arc::clone(&node));
                     return Ok(());
                 }
                 Node::Internal(internal) => {
-                    let children = internal.children().to_vec();
-                    let index = child_index_for_key(children.as_slice(), self.from.as_slice())?;
+                    let children = internal.children();
+                    let index = child_index_for_key(children, self.from.as_slice())?;
                     let Some((_separator, child_hash)) = children.get(index) else {
                         return Err(TreeError::InvalidNode);
                     };
                     next_hash = *child_hash;
                     self.stack.push(RangeFrame {
-                        children,
+                        node: Arc::clone(&node),
                         next_index: index.saturating_add(1),
                     });
                 }
@@ -131,20 +131,20 @@ impl<'a, S: NodeStore + ?Sized> RangeIter<'a, S> {
         let mut next_hash = hash;
 
         loop {
-            match &*load_node(self.store, next_hash)? {
-                Node::Leaf(leaf) => {
-                    self.leaf_entries = leaf.entries().to_vec();
+            let node = load_node(self.store, next_hash)?;
+            match &*node {
+                Node::Leaf(_leaf) => {
                     self.leaf_index = 0;
+                    self.leaf = Some(Arc::clone(&node));
                     return Ok(());
                 }
                 Node::Internal(internal) => {
-                    let children = internal.children().to_vec();
-                    let Some((_separator, child_hash)) = children.first() else {
+                    let Some((_separator, child_hash)) = internal.children().first() else {
                         return Err(TreeError::InvalidNode);
                     };
                     next_hash = *child_hash;
                     self.stack.push(RangeFrame {
-                        children,
+                        node: Arc::clone(&node),
                         next_index: 1,
                     });
                 }
@@ -154,16 +154,18 @@ impl<'a, S: NodeStore + ?Sized> RangeIter<'a, S> {
 
     fn advance_to_next_leaf(&mut self) -> Result<(), TreeError> {
         while let Some(mut frame) = self.stack.pop() {
-            if frame.next_index < frame.children.len() {
-                let Some((separator, child_hash)) = frame.children.get(frame.next_index).cloned()
-                else {
+            let children = frame_children(&frame.node)?;
+            if frame.next_index < children.len() {
+                let Some((separator, child_hash)) = children.get(frame.next_index) else {
                     return Err(TreeError::InvalidNode);
                 };
+                let separator_at_or_past_end = separator.as_slice() >= self.to.as_slice();
+                let child_hash = *child_hash;
 
                 frame.next_index = frame.next_index.saturating_add(1);
                 self.stack.push(frame);
 
-                if separator.as_slice() >= self.to.as_slice() {
+                if separator_at_or_past_end {
                     self.finished = true;
                     return Ok(());
                 }
@@ -196,19 +198,24 @@ impl<S: NodeStore + ?Sized> Iterator for RangeIter<'_, S> {
         }
 
         loop {
-            while let Some((key, value)) = self.leaf_entries.get(self.leaf_index) {
-                self.leaf_index = self.leaf_index.saturating_add(1);
+            if let Some(node) = self.leaf.clone()
+                && let Node::Leaf(leaf) = &*node
+            {
+                let entries = leaf.entries();
+                while let Some((key, value)) = entries.get(self.leaf_index) {
+                    self.leaf_index = self.leaf_index.saturating_add(1);
 
-                if key.as_slice() < self.from.as_slice() {
-                    continue;
+                    if key.as_slice() < self.from.as_slice() {
+                        continue;
+                    }
+
+                    if key.as_slice() >= self.to.as_slice() {
+                        self.finished = true;
+                        return None;
+                    }
+
+                    return Some(Ok((key.clone(), value.clone())));
                 }
-
-                if key.as_slice() >= self.to.as_slice() {
-                    self.finished = true;
-                    return None;
-                }
-
-                return Some(Ok((key.clone(), value.clone())));
             }
 
             if let Err(error) = self.advance_to_next_leaf() {
@@ -225,8 +232,15 @@ impl<S: NodeStore + ?Sized> Iterator for RangeIter<'_, S> {
 
 #[derive(Debug, Clone)]
 struct RangeFrame {
-    children: Vec<(Vec<u8>, Hash)>,
+    node: Arc<Node>,
     next_index: usize,
+}
+
+fn frame_children(node: &Node) -> Result<&[(Vec<u8>, Hash)], TreeError> {
+    match node {
+        Node::Internal(internal) => Ok(internal.children()),
+        Node::Leaf(_leaf) => Err(TreeError::InvalidNode),
+    }
 }
 
 pub(crate) fn load_node<S: NodeStore + ?Sized>(
