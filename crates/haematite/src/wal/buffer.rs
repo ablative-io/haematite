@@ -6,7 +6,7 @@ use std::fmt;
 use std::io;
 
 use crate::store::NodeStore;
-use crate::tree::{Hash, batch_mutate};
+use crate::tree::{Hash, batch_mutate_owned};
 
 /// A single buffered write against the store.
 ///
@@ -188,6 +188,34 @@ impl WalBuffer {
         self.mutations.insert(key.clone(), Mutation::Delete { key });
     }
 
+    /// Snapshot the buffer's current entry for a single key (PERF-003).
+    ///
+    /// Returns the buffered [`Mutation`] for `key` if one is present, or `None`
+    /// when the key is unbuffered. Paired with [`Self::restore_entry`] this lets a
+    /// single-key write roll back by restoring ONLY the affected key, instead of
+    /// cloning the entire buffer up front.
+    #[must_use]
+    pub fn snapshot_entry(&self, key: &[u8]) -> Option<Mutation> {
+        self.mutations.get(key).cloned()
+    }
+
+    /// Restore a single key to a prior state captured by [`Self::snapshot_entry`].
+    ///
+    /// `prior` is the entry that was buffered for `key` before the failed write
+    /// (`None` means the key was absent). The current entry for `key` is replaced
+    /// by `prior`, or removed when `prior` is `None` — a targeted inverse of the
+    /// failed single-key mutation that touches no other key.
+    pub fn restore_entry(&mut self, key: &[u8], prior: Option<Mutation>) {
+        match prior {
+            Some(mutation) => {
+                self.mutations.insert(key.to_vec(), mutation);
+            }
+            None => {
+                self.mutations.remove(key);
+            }
+        }
+    }
+
     /// Look up a key in the buffer without touching the tree (CN6).
     pub fn get<K: AsRef<[u8]>>(&self, key: K) -> LookupResult {
         match self.mutations.get(key.as_ref()) {
@@ -224,8 +252,12 @@ impl WalBuffer {
     where
         S: NodeStore + ?Sized,
     {
-        let batch: Vec<(Vec<u8>, Option<Vec<u8>>)> = self
-            .mutations
+        // Move the buffered mutations out and drain them BY VALUE into the batch —
+        // one materialisation (PERF-003). `batch_mutate_owned` then MOVES this
+        // `Vec` through normalisation instead of re-cloning it. On a tree failure
+        // the untouched buffer is put back so the caller can retry (R5).
+        let drained = std::mem::take(&mut self.mutations);
+        let batch: Vec<(Vec<u8>, Option<Vec<u8>>)> = drained
             .values()
             .map(|mutation| match mutation {
                 Mutation::Put { key, value } => (key.clone(), Some(value.clone())),
@@ -233,11 +265,13 @@ impl WalBuffer {
             })
             .collect();
 
-        let new_root = batch_mutate(store, tree_root, batch.as_slice())
-            .map_err(|error| WalError::TreeError(error.to_string()))?;
-
-        self.mutations.clear();
-        Ok(new_root)
+        match batch_mutate_owned(store, tree_root, batch) {
+            Ok(new_root) => Ok(new_root),
+            Err(error) => {
+                self.mutations = drained;
+                Err(WalError::TreeError(error.to_string()))
+            }
+        }
     }
 }
 
@@ -482,6 +516,43 @@ mod tests {
         let result = buffer.commit(root, &mut store);
         assert!(matches!(result, Err(WalError::TreeError(_))));
         assert_eq!(buffer.len(), 50);
+    }
+
+    #[test]
+    fn restore_entry_returns_prior_value_on_single_key_rollback() {
+        // A put over an existing key, rolled back, restores the PRIOR value only.
+        let mut buffer = WalBuffer::new();
+        buffer.put(b"k", b"old");
+        let prior = buffer.snapshot_entry(b"k");
+        buffer.put(b"k", b"new");
+        assert_eq!(
+            buffer.get(b"k"),
+            LookupResult::BufferedValue(b"new".to_vec())
+        );
+        buffer.restore_entry(b"k", prior);
+        assert_eq!(
+            buffer.get(b"k"),
+            LookupResult::BufferedValue(b"old".to_vec())
+        );
+        assert_eq!(buffer.len(), 1);
+    }
+
+    #[test]
+    fn restore_entry_removes_key_that_was_absent_before() {
+        // A put over an ABSENT key, rolled back, leaves the key absent again and
+        // does not disturb any other buffered key.
+        let mut buffer = WalBuffer::new();
+        buffer.put(b"other", b"keep");
+        let prior = buffer.snapshot_entry(b"k");
+        assert!(prior.is_none());
+        buffer.put(b"k", b"new");
+        buffer.restore_entry(b"k", prior);
+        assert_eq!(buffer.get(b"k"), LookupResult::NotBuffered);
+        assert_eq!(
+            buffer.get(b"other"),
+            LookupResult::BufferedValue(b"keep".to_vec())
+        );
+        assert_eq!(buffer.len(), 1);
     }
 
     #[test]

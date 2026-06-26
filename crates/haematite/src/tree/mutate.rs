@@ -19,8 +19,8 @@ where
     K: AsRef<[u8]>,
     V: AsRef<[u8]>,
 {
-    let mutations = [(key.as_ref().to_vec(), Some(value.as_ref().to_vec()))];
-    batch_mutate(store, root_hash, mutations.as_slice())
+    let mutations = vec![(key.as_ref().to_vec(), Some(value.as_ref().to_vec()))];
+    batch_mutate_owned(store, root_hash, mutations)
 }
 
 pub fn delete<S, K>(store: &mut S, root_hash: Hash, key: K) -> Result<Hash, TreeError>
@@ -28,8 +28,8 @@ where
     S: NodeStore + ?Sized,
     K: AsRef<[u8]>,
 {
-    let mutations = [(key.as_ref().to_vec(), None)];
-    batch_mutate(store, root_hash, mutations.as_slice())
+    let mutations = vec![(key.as_ref().to_vec(), None)];
+    batch_mutate_owned(store, root_hash, mutations)
 }
 
 /// Apply a batch of put/delete mutations and return the new root hash.
@@ -44,6 +44,21 @@ pub fn batch_mutate<S: NodeStore + ?Sized>(
     store: &mut S,
     root_hash: Hash,
     mutations: &[(Vec<u8>, Option<Vec<u8>>)],
+) -> Result<Hash, TreeError> {
+    batch_mutate_owned(store, root_hash, mutations.to_vec())
+}
+
+/// Owned-input twin of [`batch_mutate`] for the durable-commit path.
+///
+/// The committed write set is already an owned `Vec` drained out of the WAL
+/// buffer, so it is MOVED through normalisation rather than re-cloned (PERF-003,
+/// audit item F). The resulting tree, root hash, and durability are identical to
+/// [`batch_mutate`] for the same final key->value set — this is a pure
+/// allocation/CPU optimisation, not a behavioural change.
+pub fn batch_mutate_owned<S: NodeStore + ?Sized>(
+    store: &mut S,
+    root_hash: Hash,
+    mutations: Vec<(Vec<u8>, Option<Vec<u8>>)>,
 ) -> Result<Hash, TreeError> {
     if mutations.is_empty() {
         return Ok(root_hash);
@@ -69,17 +84,14 @@ pub fn batch_mutate<S: NodeStore + ?Sized>(
     finish_root(store, rebuilt)
 }
 
-fn normalise_mutations(mutations: &[(Vec<u8>, Option<Vec<u8>>)]) -> Vec<Mutation> {
+fn normalise_mutations(mutations: Vec<(Vec<u8>, Option<Vec<u8>>)>) -> Vec<Mutation> {
     let mut normalised: Vec<Mutation> = Vec::new();
 
     for (key, value) in mutations {
-        if let Some(last) = normalised.last_mut().filter(|last| last.key == *key) {
-            last.value.clone_from(value);
+        if let Some(last) = normalised.last_mut().filter(|last| last.key == key) {
+            last.value = value;
         } else {
-            normalised.push(Mutation {
-                key: key.clone(),
-                value: value.clone(),
-            });
+            normalised.push(Mutation { key, value });
         }
     }
 

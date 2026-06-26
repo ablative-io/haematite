@@ -9,5 +9,5 @@ pub mod node;
 pub use boundary::BoundaryDetector;
 pub use cursor::{Cursor, RangeIter, TreeError};
 pub use diff::{DiffEntry, DiffError, diff};
-pub use mutate::{batch_mutate, delete, insert};
+pub use mutate::{batch_mutate, batch_mutate_owned, delete, insert};
 pub use node::{Hash, InternalNode, LeafNode, Node, NodeError};
