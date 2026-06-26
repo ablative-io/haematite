@@ -4,6 +4,7 @@ use std::time::Duration;
 
 mod errors;
 pub mod handle;
+mod liveness;
 pub mod native;
 mod scan;
 mod startup;
@@ -114,7 +115,10 @@ impl ShardActor {
     #[must_use]
     pub fn from_recovered(mut wal: DurableWal, recovered: RecoveredWal) -> Self {
         let committed_root = recovered.committed_root();
-        let promise = recovered.promise().cloned().unwrap_or_else(PromiseRecord::initial);
+        let promise = recovered
+            .promise()
+            .cloned()
+            .unwrap_or_else(PromiseRecord::initial);
         wal.seed_promise(promise.clone());
         let PromiseRecord {
             promised,
@@ -1140,8 +1144,15 @@ mod storage_tests {
         let decoded = crate::ttl::entry::StampedEntry::decode(&raw)
             .map_err(|error| WalError::TreeError(error.to_string()))?
             .ok_or_else(|| WalError::TreeError("tombstone is not a stamped entry".to_owned()))?;
-        assert!(decoded.is_tombstone(), "the swept-over entry is still a tombstone");
-        assert_eq!(decoded.stamp(), &stamp, "the tombstone's stamp is intact after the sweep");
+        assert!(
+            decoded.is_tombstone(),
+            "the swept-over entry is still a tombstone"
+        );
+        assert_eq!(
+            decoded.stamp(),
+            &stamp,
+            "the tombstone's stamp is intact after the sweep"
+        );
         assert_eq!(actor.get(b"tomb", &store)?, None, "still reads as None");
 
         // CONTRAST — an actually-expired VALUE alongside it IS swept (local GC).
@@ -1384,7 +1395,11 @@ mod promise_recovery_tests {
         );
 
         // A lower request never lowers the floor (idempotent max).
-        assert_eq!(recovered.reserve_minted(4)?, 7, "lower request keeps the floor");
+        assert_eq!(
+            recovered.reserve_minted(4)?,
+            7,
+            "lower request keeps the floor"
+        );
         assert_eq!(recovered.persisted_max_minted(), 7);
 
         // The NEXT mint floor strictly exceeds the persisted value: minting
@@ -1397,7 +1412,11 @@ mod promise_recovery_tests {
         );
         drop(recovered);
         let again = reopen(&temp.path)?;
-        assert_eq!(again.persisted_max_minted(), 8, "advance persisted across crash");
+        assert_eq!(
+            again.persisted_max_minted(),
+            8,
+            "advance persisted across crash"
+        );
         Ok(())
     }
 

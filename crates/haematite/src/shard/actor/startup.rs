@@ -21,7 +21,8 @@ pub(super) fn reply_startup_error(command: ShardCommand, message: &str) {
         ShardCommandKind::Get { reply, .. } | ShardCommandKind::GetRaw { reply, .. } => {
             send_get(&reply, error);
         }
-        ShardCommandKind::DeleteIfExpired { reply, .. } => send_bool(&reply, error),
+        ShardCommandKind::DeleteIfExpired { reply, .. }
+        | ShardCommandKind::HasLiveInRange(_, _, reply) => send_bool(&reply, error),
         ShardCommandKind::Put { reply, .. }
         | ShardCommandKind::Delete { reply, .. }
         | ShardCommandKind::Cas { reply, .. }
@@ -75,10 +76,7 @@ fn send_scan(reply: &ScanReply, error: ShardError) {
     drop(reply.send(Err(error)));
 }
 
-fn send_promise(
-    reply: &SyncSender<Result<RecordPromiseOutcome, ShardError>>,
-    error: ShardError,
-) {
+fn send_promise(reply: &SyncSender<Result<RecordPromiseOutcome, ShardError>>, error: ShardError) {
     drop(reply.send(Err(error)));
 }
 
