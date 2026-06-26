@@ -64,6 +64,54 @@ enum ApplyKind {
     Tombstone,
 }
 
+/// One groupable durable WRITE to coalesce under a single group commit (audit E).
+///
+/// These are exactly the consecutive single-key durable writes that today each
+/// fsync on their own: a scalar CAS, a stamped value apply, and a stamped
+/// tombstone apply. Each carries its OWN precondition and (for the apply kinds)
+/// its OWN stamp, so each gets its own monotonic stamp in queue order — the group
+/// commit changes only HOW MANY fsyncs back the batch (one, not N), never the
+/// per-write semantics. Promise-state mutators / `merge_adopt` are deliberately
+/// NOT representable here: they fsync and/or raise `promised` and must keep their
+/// individual ordering, so the driver stops the group at the first such command.
+pub(super) enum GroupWrite {
+    /// A scalar compare-and-swap (`ShardCommandKind::Cas`).
+    Cas {
+        key: Vec<u8>,
+        expected: Option<u64>,
+        new: u64,
+    },
+    /// A stamped value apply (`ShardCommandKind::ApplyDurable`).
+    ApplyValue {
+        key: Vec<u8>,
+        expected: Option<Hash>,
+        value: Vec<u8>,
+        ttl: Option<Duration>,
+        stamp: Stamp,
+    },
+    /// A stamped tombstone apply (`ShardCommandKind::ApplyDurableTombstone`).
+    ApplyTombstone {
+        key: Vec<u8>,
+        expected: Option<Hash>,
+        stamp: Stamp,
+    },
+}
+
+/// Per-write outcome of [`ShardActor::apply_group`], aligned 1:1 with the input
+/// `writes` so the driver can fan each result to its own reply channel.
+#[derive(Debug)]
+pub(super) enum GroupOutcome {
+    /// The write was staged AND the group commit succeeded: reply `Ok(())`.
+    Committed,
+    /// The write's own precondition (CAS/fence) failed: reply this error. Its key
+    /// was never buffered, so the rest of the group was unaffected.
+    Rejected(ShardError),
+    /// The write staged cleanly but the SHARED group commit failed; its key was
+    /// rolled back. Reply this commit error so the caller retries (the write is
+    /// not durable).
+    CommitFailed(ShardError),
+}
+
 /// Outcome of [`ShardActor::record_promise`]: a Prepare promise is durably
 /// accepted only if it strictly exceeds the persisted `promised` ballot.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -472,15 +520,10 @@ impl ShardActor {
     where
         S: NodeStore + ?Sized,
     {
-        let actual = self.read_value(key, store)?;
-        if actual != expected {
-            return Err(CasError::Mismatch { expected, actual });
-        }
-        // Targeted single-key rollback (PERF-003): remember only this key's prior
-        // entry rather than cloning the whole buffer. `cas` buffers exactly one
-        // key, so restoring that one entry is a complete inverse on failure.
-        let prior = self.buffer.snapshot_entry(key);
-        self.buffer.put(key, new.to_be_bytes());
+        // Targeted single-key rollback (PERF-003): `stage_cas` buffers exactly one
+        // key and returns that key's prior entry, so restoring it is a complete
+        // inverse on a commit failure.
+        let prior = self.stage_cas(key, expected, new, store)?;
         match self.commit(store) {
             Ok(_root) => Ok(()),
             Err(error) => {
@@ -488,6 +531,34 @@ impl ShardActor {
                 Err(CasError::from(error))
             }
         }
+    }
+
+    /// Stage a CAS into the buffer WITHOUT committing (group-commit, audit E).
+    ///
+    /// Runs the read-compare against `expected` through the live buffer+tree (so a
+    /// CAS staged earlier in the same group is observed), and on a match buffers
+    /// the new value. Returns that key's PRIOR buffered entry so the caller can
+    /// roll back just this key. On a mismatch NOTHING is buffered and
+    /// [`CasError::Mismatch`] is returned — the key is left exactly as it was, so a
+    /// failed CAS in a group never disturbs the other writes (partial-failure =
+    /// independent, NOT all-or-nothing).
+    fn stage_cas<S>(
+        &mut self,
+        key: &[u8],
+        expected: Option<u64>,
+        new: u64,
+        store: &S,
+    ) -> Result<Option<Mutation>, CasError>
+    where
+        S: NodeStore + ?Sized,
+    {
+        let actual = self.read_value(key, store)?;
+        if actual != expected {
+            return Err(CasError::Mismatch { expected, actual });
+        }
+        let prior = self.buffer.snapshot_entry(key);
+        self.buffer.put(key, new.to_be_bytes());
+        Ok(prior)
     }
 
     /// Conditionally and DURABLY apply a replicated write (active-active 2a-4).
@@ -582,6 +653,41 @@ impl ShardActor {
     where
         S: NodeStore + ?Sized,
     {
+        // Targeted single-key rollback (PERF-003): `stage_apply_kind` buffers
+        // exactly one key and returns its prior entry, a complete inverse on a
+        // commit failure — no whole-buffer clone needed.
+        let prior = self.stage_apply_kind(key, expected, kind, stamp, store)?;
+        match self.commit(store) {
+            Ok(_root) => Ok(()),
+            Err(error) => {
+                self.buffer.restore_entry(key, prior);
+                Err(HashCasError::from(error))
+            }
+        }
+    }
+
+    /// Stage a fence-checked, CAS-checked stamped value/tombstone apply into the
+    /// buffer WITHOUT committing (group-commit, audit E).
+    ///
+    /// Runs the epoch fence (§2.3) and then the CAS over the LOGICAL value hash
+    /// through the live buffer+tree (so a write staged earlier in the same group is
+    /// observed), and on a match buffers the stamped envelope. Returns that key's
+    /// PRIOR buffered entry for a single-key rollback. On a fence or CAS rejection
+    /// NOTHING is buffered and the error is returned — the key is left untouched, so
+    /// a failed apply in a group never disturbs the other writes (partial-failure =
+    /// independent, NOT all-or-nothing). As on the single-key path an admitted `>=`
+    /// write does NOT raise `self.promised` (R2).
+    fn stage_apply_kind<S>(
+        &mut self,
+        key: &[u8],
+        expected: Option<Hash>,
+        kind: ApplyKind,
+        stamp: Stamp,
+        store: &S,
+    ) -> Result<Option<Mutation>, HashCasError>
+    where
+        S: NodeStore + ?Sized,
+    {
         // --- Epoch fence (§2.3), BEFORE the CAS read, same actor slice. ---------
         // Reject a stale owner whose epoch is below what we have promised. We do
         // NOT raise `self.promised` on the accept path (R2): only `record_promise`
@@ -599,9 +705,6 @@ impl ShardActor {
         if actual != expected {
             return Err(HashCasError::HashMismatch { expected, actual });
         }
-        // Targeted single-key rollback (PERF-003): a value/tombstone apply buffers
-        // exactly one key, so remembering only that key's prior entry is a complete
-        // inverse on failure — no whole-buffer clone needed.
         let prior = self.buffer.snapshot_entry(key);
         let encoded = match kind {
             ApplyKind::Value { value, ttl } => {
@@ -610,13 +713,7 @@ impl ShardActor {
             ApplyKind::Tombstone => encode_stamped_tombstone(stamp),
         };
         self.buffer.put(key, encoded);
-        match self.commit(store) {
-            Ok(_root) => Ok(()),
-            Err(error) => {
-                self.buffer.restore_entry(key, prior);
-                Err(HashCasError::from(error))
-            }
-        }
+        Ok(prior)
     }
 
     /// Conditionally + durably apply a BATCH of value puts under ONE shared
@@ -708,6 +805,137 @@ impl ShardActor {
             Err(error) => {
                 self.buffer = previous_buffer;
                 Err(HashCasError::from(error))
+            }
+        }
+    }
+
+    /// Coalesce a run of groupable durable WRITES into ONE group commit (audit E,
+    /// the fsync-amplification collapse).
+    ///
+    /// Each write in `writes` is staged into the buffer IN ORDER — its own
+    /// precondition (CAS/fence) is checked through the live buffer+tree, so a write
+    /// to a key staged earlier in the same group observes that earlier write,
+    /// exactly as if the writes had run sequentially (each with its own monotonic
+    /// stamp). Then ONE [`Self::commit`] fsyncs the whole group's final root, and
+    /// the result is fanned to every survivor.
+    ///
+    /// # Partial failure is INDEPENDENT, not all-or-nothing
+    ///
+    /// A write whose CAS precondition mismatches (or whose stamp is fenced) buffers
+    /// NOTHING and is recorded as [`GroupOutcome::Rejected`]; it does NOT abort the
+    /// rest of the group. The survivors are committed together. This is explicitly
+    /// different from [`Self::apply_durable_batch`]'s all-or-nothing abort.
+    ///
+    /// # Linearization + recovery
+    ///
+    /// The single [`Self::commit`] is the ONE WAL marker for the group: a crash
+    /// BEFORE it leaves none of the group durable (they retry); a crash AFTER it
+    /// leaves every survivor durable, at the one committed root. If the commit
+    /// itself fails, every staged survivor's key is rolled back to its pre-group
+    /// state (in reverse stage order, so the earliest snapshot — the true pre-group
+    /// value — wins) and each survivor is told [`GroupOutcome::CommitFailed`], so no
+    /// caller is told `Ok` for a write that is not durable.
+    ///
+    /// Returns one [`GroupOutcome`] per input write, in the SAME order.
+    pub(super) fn apply_group<S>(
+        &mut self,
+        writes: Vec<GroupWrite>,
+        store: &mut S,
+    ) -> Vec<GroupOutcome>
+    where
+        S: NodeStore + ?Sized,
+    {
+        // Stage each write; remember survivors as (input_index, key, prior) so a
+        // commit failure can roll back exactly the keys that were buffered.
+        let mut outcomes: Vec<Option<GroupOutcome>> = Vec::with_capacity(writes.len());
+        let mut staged: Vec<(usize, Vec<u8>, Option<Mutation>)> = Vec::with_capacity(writes.len());
+        for write in writes {
+            let index = outcomes.len();
+            match self.stage_group_write(write, store) {
+                Ok((key, prior)) => {
+                    staged.push((index, key, prior));
+                    outcomes.push(None); // filled in after the group commit.
+                }
+                Err(error) => outcomes.push(Some(GroupOutcome::Rejected(error))),
+            }
+        }
+
+        // No survivor staged anything ⇒ no commit (no fsync at all). Every slot is
+        // already a Rejected; finalise and return.
+        if staged.is_empty() {
+            return finalise_group_outcomes(outcomes);
+        }
+
+        // ONE commit/fsync for the whole group's final root.
+        match self.commit(store) {
+            Ok(_root) => {
+                for (index, _key, _prior) in staged {
+                    outcomes[index] = Some(GroupOutcome::Committed);
+                }
+            }
+            Err(error) => {
+                // A shared group-commit fault must reach EVERY staged survivor, but
+                // the underlying `WalError` is not `Clone` (it can wrap an
+                // `io::Error`). Render it ONCE to a message and fan that message to
+                // each survivor as a WAL error — every survivor learns the commit
+                // failed and retries (none is told `Ok`). The original error's
+                // display string is preserved; only its variant is generalised to
+                // `TreeError`, which is acceptable for a retryable group-commit
+                // fault that the caller surfaces through `ShardError::Wal` either way.
+                let message = error.to_string();
+                // Roll back every staged key in REVERSE stage order, so the earliest
+                // snapshot (the true pre-group value for a key written more than once
+                // in the group) is restored last and wins.
+                for (index, key, prior) in staged.into_iter().rev() {
+                    self.buffer.restore_entry(&key, prior);
+                    outcomes[index] = Some(GroupOutcome::CommitFailed(ShardError::Wal(
+                        WalError::TreeError(message.clone()),
+                    )));
+                }
+            }
+        }
+        finalise_group_outcomes(outcomes)
+    }
+
+    /// Stage one [`GroupWrite`] into the buffer (no commit), returning the touched
+    /// key and its prior entry for rollback, or the precondition error.
+    fn stage_group_write<S>(
+        &mut self,
+        write: GroupWrite,
+        store: &S,
+    ) -> Result<(Vec<u8>, Option<Mutation>), ShardError>
+    where
+        S: NodeStore + ?Sized,
+    {
+        match write {
+            GroupWrite::Cas { key, expected, new } => {
+                let prior = self.stage_cas(&key, expected, new, store)?;
+                Ok((key, prior))
+            }
+            GroupWrite::ApplyValue {
+                key,
+                expected,
+                value,
+                ttl,
+                stamp,
+            } => {
+                let prior = self.stage_apply_kind(
+                    &key,
+                    expected,
+                    ApplyKind::Value { value, ttl },
+                    stamp,
+                    store,
+                )?;
+                Ok((key, prior))
+            }
+            GroupWrite::ApplyTombstone {
+                key,
+                expected,
+                stamp,
+            } => {
+                let prior =
+                    self.stage_apply_kind(&key, expected, ApplyKind::Tombstone, stamp, store)?;
+                Ok((key, prior))
             }
         }
     }
@@ -962,6 +1190,26 @@ impl ShardActor {
         self.stream_index_errors = stream_index.errors;
         Ok(Some(root))
     }
+}
+
+/// Resolve the per-write outcome slots into a dense result vector.
+///
+/// Every slot is `Some` by construction (each write is either rejected at staging
+/// or finalised by the group commit), but the type is `Option` so the slots can be
+/// filled out of order. A `None` slot would be an internal logic error rather than
+/// a real durability outcome; rather than `unwrap`/`panic` (forbidden), it is
+/// mapped to a retryable WAL error so the caller never reads it as `Ok`.
+fn finalise_group_outcomes(outcomes: Vec<Option<GroupOutcome>>) -> Vec<GroupOutcome> {
+    outcomes
+        .into_iter()
+        .map(|slot| {
+            slot.unwrap_or_else(|| {
+                GroupOutcome::CommitFailed(ShardError::Wal(WalError::TreeError(
+                    "group-commit outcome was not resolved".to_owned(),
+                )))
+            })
+        })
+        .collect()
 }
 
 fn buffer_mutation(buffer: &mut WalBuffer, mutation: Mutation) {
@@ -1826,6 +2074,483 @@ mod promise_recovery_tests {
             &ballot(9, "Z"),
             "promise must survive a commit truncation + crash (re-emit after marker)"
         );
+        Ok(())
+    }
+}
+
+/// Group commit (haematite hot-path audit item E): coalescing, INDEPENDENT
+/// partial-failure, and crash-injection atomicity tests for [`ShardActor::apply_group`].
+///
+/// These drive the actor directly (not the beamr process), because the group
+/// commit's correctness lives in the actor: `apply_group` stages each write into
+/// the buffer in order (CAS reading through the buffer), does ONE `commit`/fsync
+/// for the survivors, and fans the outcome to each write. The native handler only
+/// pops the consecutive run and forwards each outcome to its reply channel.
+#[cfg(test)]
+mod group_commit_tests {
+    use super::{GroupOutcome, GroupWrite, ShardActor};
+    use crate::shard::actor::handle::ShardError;
+    use crate::store::{DiskStore, MemoryStore, NodeStore};
+    use crate::sync::ballot::{Ballot, Stamp};
+    use crate::sync::topology::SyncNodeId;
+    use crate::tree::{Hash, LeafNode, Node};
+    use crate::wal::{DurableWal, FsyncPolicy, WalError, WalRecovery};
+    use std::cell::Cell;
+    use std::path::{Path, PathBuf};
+    use std::sync::Arc;
+
+    /// A `NodeStore` wrapper that counts how many times the commit barrier
+    /// (`sync_dirty_dirs`) runs — exactly ONCE per [`ShardActor::commit`], strictly
+    /// before the WAL marker — so a test can assert N writes coalesced into ONE
+    /// commit. The inner store is a real [`MemoryStore`] so reads/writes behave
+    /// normally.
+    #[derive(Debug)]
+    struct CommitCountingStore {
+        inner: MemoryStore,
+        commits: Cell<usize>,
+    }
+
+    impl CommitCountingStore {
+        fn new() -> Self {
+            Self {
+                inner: MemoryStore::new(),
+                commits: Cell::new(0),
+            }
+        }
+
+        fn commit_count(&self) -> usize {
+            self.commits.get()
+        }
+    }
+
+    impl NodeStore for CommitCountingStore {
+        type Error = std::convert::Infallible;
+
+        fn get(&self, hash: &Hash) -> Result<Option<Arc<Node>>, Self::Error> {
+            Ok(self.inner.get(hash))
+        }
+
+        fn put(&mut self, node: &Node) -> Result<Hash, Self::Error> {
+            Ok(self.inner.put(node))
+        }
+
+        fn sync_dirty_dirs(&self) -> Result<(), Self::Error> {
+            self.commits.set(self.commits.get().saturating_add(1));
+            Ok(())
+        }
+    }
+
+    fn stamp(counter: u64, node: &str, seq: u64) -> Stamp {
+        Stamp::new(Ballot::new(counter, SyncNodeId::new(node)), seq)
+    }
+
+    fn apply_value(key: &[u8], expected: Option<Hash>, value: &[u8], stamp: Stamp) -> GroupWrite {
+        GroupWrite::ApplyValue {
+            key: key.to_vec(),
+            expected,
+            value: value.to_vec(),
+            ttl: None,
+            stamp,
+        }
+    }
+
+    /// COALESCING: N consecutive same-shard durable writes go through ONE commit
+    /// (one barrier/fsync), every write replies `Committed`, and every value is
+    /// readable at the single committed root.
+    ///
+    /// Non-vacuous: it asserts the commit count is exactly 1 for a 3-write group —
+    /// the pre-group behaviour (commit-per-write) would record 3. It also reads all
+    /// three values back, and proves the LAST-staged write to a repeated key wins
+    /// (CAS-through-buffer ordering), which a regression that committed each write
+    /// independently or reordered the group would break.
+    #[test]
+    fn group_of_writes_coalesces_into_one_commit_all_readable() -> Result<(), WalError> {
+        let dir = tempfile::tempdir()?;
+        let wal = DurableWal::new(dir.path().join("group.wal"), FsyncPolicy::CommitOnly)?;
+        let mut actor = ShardActor::new(wal);
+        let mut store = CommitCountingStore::new();
+
+        // Four writes, two of them to the SAME key (k1) so the second must observe
+        // the first through the buffer and win.
+        let writes = vec![
+            apply_value(b"k1", None, b"first", stamp(1, "owner", 0)),
+            apply_value(b"k2", None, b"v2", stamp(1, "owner", 1)),
+            GroupWrite::Cas {
+                key: b"counter".to_vec(),
+                expected: None,
+                new: 7,
+            },
+            // k1 again: expects the in-group value's hash, then overwrites it.
+            apply_value(
+                b"k1",
+                Some(Hash::of(b"first")),
+                b"second",
+                stamp(1, "owner", 2),
+            ),
+        ];
+        let outcomes = actor.apply_group(writes, &mut store);
+
+        assert_eq!(outcomes.len(), 4);
+        for outcome in &outcomes {
+            assert!(
+                matches!(outcome, GroupOutcome::Committed),
+                "every write in a clean group must commit, got {outcome:?}"
+            );
+        }
+        // THE coalescing assertion: ONE commit for the whole group.
+        assert_eq!(
+            store.commit_count(),
+            1,
+            "N grouped writes must produce exactly ONE commit/fsync"
+        );
+
+        // All values are readable at the single committed root; the repeated-key
+        // write that ran last (CAS-through-buffer) won.
+        assert_eq!(actor.get(b"k1", &store)?, Some(b"second".to_vec()));
+        assert_eq!(actor.get(b"k2", &store)?, Some(b"v2".to_vec()));
+        assert_eq!(actor.read_value(b"counter", &store)?, Some(7));
+        assert!(
+            actor.committed_root().is_some(),
+            "the group committed a root"
+        );
+        assert!(actor.buffer().is_empty(), "commit cleared the buffer");
+        Ok(())
+    }
+
+    /// PARTIAL FAILURE is INDEPENDENT, not all-or-nothing: a group where ONE write
+    /// has a failing CAS precondition replies `Err` to ONLY that write; the others
+    /// commit and are readable, and the failed key is unchanged.
+    ///
+    /// Non-vacuous: it pre-seeds `mid` so the middle write's expect-absent CAS
+    /// mismatches, then asserts the FIRST and LAST writes (whose CAS passes) ARE
+    /// committed and readable while `mid` keeps its seeded value. A regression that
+    /// reused the all-or-nothing batch abort would leave the survivors absent.
+    #[test]
+    fn partial_failure_commits_survivors_and_leaves_failed_key_unchanged() -> Result<(), WalError> {
+        let dir = tempfile::tempdir()?;
+        let wal = DurableWal::new(dir.path().join("partial.wal"), FsyncPolicy::CommitOnly)?;
+        let mut actor = ShardActor::new(wal);
+        let mut store = CommitCountingStore::new();
+
+        // Pre-seed `mid` with a committed value (its own commit) so an expect-absent
+        // CAS on it inside the group mismatches.
+        let seeded = actor.apply_group(
+            vec![apply_value(b"mid", None, b"seeded", stamp(1, "owner", 0))],
+            &mut store,
+        );
+        assert!(matches!(seeded.as_slice(), [GroupOutcome::Committed]));
+        let commits_after_seed = store.commit_count();
+
+        // Group: ok1 (expect-absent: passes), mid (expect-absent: MISMATCHES, it is
+        // present), ok2 (expect-absent: passes). Only `mid` must fail.
+        let writes = vec![
+            apply_value(b"ok1", None, b"a", stamp(2, "owner", 0)),
+            apply_value(b"mid", None, b"should-not-apply", stamp(2, "owner", 1)),
+            apply_value(b"ok2", None, b"b", stamp(2, "owner", 2)),
+        ];
+        let outcomes = actor.apply_group(writes, &mut store);
+
+        assert!(
+            matches!(outcomes[0], GroupOutcome::Committed),
+            "survivor ok1 must commit, got {:?}",
+            outcomes[0]
+        );
+        assert!(
+            matches!(
+                &outcomes[1],
+                GroupOutcome::Rejected(ShardError::CasHashMismatch { expected, actual })
+                    if expected.is_none() && *actual == Some(Hash::of(b"seeded"))
+            ),
+            "only the failed CAS write is Rejected, got {:?}",
+            outcomes[1]
+        );
+        assert!(
+            matches!(outcomes[2], GroupOutcome::Committed),
+            "survivor ok2 must commit, got {:?}",
+            outcomes[2]
+        );
+
+        // The survivors committed together in ONE commit (not one each, not zero).
+        assert_eq!(
+            store.commit_count(),
+            commits_after_seed.saturating_add(1),
+            "the survivors share exactly one group commit"
+        );
+
+        // Survivors readable; the failed key UNCHANGED (still the seeded value).
+        assert_eq!(actor.get(b"ok1", &store)?, Some(b"a".to_vec()));
+        assert_eq!(actor.get(b"ok2", &store)?, Some(b"b".to_vec()));
+        assert_eq!(
+            actor.get(b"mid", &store)?,
+            Some(b"seeded".to_vec()),
+            "a failed CAS must leave the buffer as if that write never happened"
+        );
+        Ok(())
+    }
+
+    /// PARTIAL FAILURE where EVERY write fails: no survivor, so NO commit (no fsync
+    /// at all), and every write is Rejected. Proves the group never commits an empty
+    /// survivor set.
+    #[test]
+    fn all_writes_fail_means_no_commit_at_all() -> Result<(), WalError> {
+        let dir = tempfile::tempdir()?;
+        let wal = DurableWal::new(dir.path().join("allfail.wal"), FsyncPolicy::CommitOnly)?;
+        let mut actor = ShardActor::new(wal);
+        let mut store = CommitCountingStore::new();
+
+        // Seed both keys so two expect-absent CAS writes both mismatch.
+        actor.apply_group(
+            vec![
+                apply_value(b"a", None, b"x", stamp(1, "owner", 0)),
+                apply_value(b"b", None, b"y", stamp(1, "owner", 1)),
+            ],
+            &mut store,
+        );
+        let commits_after_seed = store.commit_count();
+
+        let outcomes = actor.apply_group(
+            vec![
+                apply_value(b"a", None, b"nope", stamp(2, "owner", 0)),
+                apply_value(b"b", None, b"nope", stamp(2, "owner", 1)),
+            ],
+            &mut store,
+        );
+        assert!(outcomes.iter().all(|o| matches!(
+            o,
+            GroupOutcome::Rejected(ShardError::CasHashMismatch { .. })
+        )));
+        assert_eq!(
+            store.commit_count(),
+            commits_after_seed,
+            "an all-rejected group must not commit (no fsync)"
+        );
+        Ok(())
+    }
+
+    // --- Crash injection: a group commit is ONE atomic WAL marker. ---------------
+    //
+    // Reuses the `CrashWindowStore` design from `node_dir_fsync_tests`: every node
+    // `put` goes to a real inner `DiskStore`, and the `sync_dirty_dirs` barrier is
+    // either LOSSY (deletes the just-written node files, modelling lost directory
+    // entries — the on-disk state after a crash that lost the unsynced renames) or
+    // DURABLE (delegates to the real fsync). The group commit calls the barrier
+    // ONCE, strictly before the single WAL marker, so this models a crash in the
+    // one-marker window for the WHOLE group.
+
+    #[derive(Debug)]
+    struct CrashWindowStore {
+        inner: DiskStore,
+        lossy: bool,
+        pending: std::cell::RefCell<Vec<PathBuf>>,
+        dir: PathBuf,
+    }
+
+    impl CrashWindowStore {
+        fn new(dir: PathBuf, lossy: bool) -> Result<Self, WalError> {
+            let inner =
+                DiskStore::new(&dir).map_err(|error| WalError::TreeError(error.to_string()))?;
+            Ok(Self {
+                inner,
+                lossy,
+                pending: std::cell::RefCell::new(Vec::new()),
+                dir,
+            })
+        }
+
+        fn node_path(&self, hash: &Hash) -> PathBuf {
+            let hex = hash.to_string();
+            let (prefix, file_name) = hex.split_at(2);
+            self.dir.join(prefix).join(file_name)
+        }
+    }
+
+    impl NodeStore for CrashWindowStore {
+        type Error = crate::store::StoreError;
+
+        fn get(&self, hash: &Hash) -> Result<Option<Arc<Node>>, Self::Error> {
+            self.inner.get(hash)
+        }
+
+        fn put(&mut self, node: &Node) -> Result<Hash, Self::Error> {
+            let hash = self.inner.put(node)?;
+            self.pending.borrow_mut().push(self.node_path(&hash));
+            Ok(hash)
+        }
+
+        fn sync_dirty_dirs(&self) -> Result<(), Self::Error> {
+            let pending = std::mem::take(&mut *self.pending.borrow_mut());
+            if self.lossy {
+                for path in pending {
+                    match std::fs::remove_file(&path) {
+                        Ok(()) => {}
+                        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                        Err(error) => return Err(crate::store::StoreError::Io(error)),
+                    }
+                }
+                Ok(())
+            } else {
+                self.inner.sync_dirty_dirs()
+            }
+        }
+    }
+
+    fn empty_root(store: &mut CrashWindowStore) -> Result<Hash, WalError> {
+        let leaf =
+            LeafNode::new(Vec::new()).map_err(|error| WalError::TreeError(error.to_string()))?;
+        store
+            .put(&Node::Leaf(leaf))
+            .map_err(|error| WalError::TreeError(error.to_string()))
+    }
+
+    /// Apply a 3-write group, then re-open from the SAME WAL path with a FRESH
+    /// cold-cache `DiskStore` over the SAME node dir — the faithful crash-recovery
+    /// shape. Returns the cold store and the recovery result.
+    fn group_then_recover(
+        store: &mut CrashWindowStore,
+        wal_path: &Path,
+        nodes_dir: &Path,
+    ) -> Result<(DiskStore, Result<ShardActor, WalError>), WalError> {
+        let wal = DurableWal::new(wal_path, FsyncPolicy::CommitOnly)?;
+        let mut actor = ShardActor::new(wal);
+        let outcomes = actor.apply_group(
+            vec![
+                apply_value(b"g1", None, b"v1", stamp(1, "owner", 0)),
+                apply_value(b"g2", None, b"v2", stamp(1, "owner", 1)),
+                apply_value(b"g3", None, b"v3", stamp(1, "owner", 2)),
+            ],
+            store,
+        );
+        assert!(
+            outcomes
+                .iter()
+                .all(|o| matches!(o, GroupOutcome::Committed)),
+            "the group must have committed before the crash"
+        );
+        drop(actor); // close the WAL file: the "crash" boundary.
+
+        let cold = DiskStore::new(nodes_dir).map_err(|e| WalError::TreeError(e.to_string()))?;
+        let actor = match WalRecovery::recover_path(wal_path, &cold) {
+            Ok(recovered) => {
+                let wal = DurableWal::new(wal_path, FsyncPolicy::CommitOnly)?;
+                ShardActor::from_recovered(wal, recovered, &cold)
+            }
+            Err(error) => Err(error),
+        };
+        Ok((cold, actor))
+    }
+
+    /// FALSIFIER (crash BEFORE the durable marker window closes): a LOSSY barrier
+    /// loses the group's node directory entries, so the single committed-root marker
+    /// references nodes whose files are gone and recovery MUST reject with
+    /// `MissingCommittedRoot` — recovery never sees a torn/partial group root.
+    #[test]
+    fn group_commit_with_lossy_barrier_is_rejected_never_partial() -> Result<(), WalError> {
+        let dir = tempfile::tempdir()?;
+        let wal = tempfile::tempdir()?;
+        let wal_path = wal.path().join("group.wal");
+        let nodes_dir = dir.path().join("nodes");
+        let mut store = CrashWindowStore::new(nodes_dir.clone(), true)?;
+        empty_root(&mut store)?;
+
+        let (_cold, recovered) = group_then_recover(&mut store, &wal_path, &nodes_dir)?;
+        match recovered {
+            Err(WalError::MissingCommittedRoot { .. }) => Ok(()),
+            Err(other) => Err(other),
+            Ok(_actor) => Err(WalError::TreeError(
+                "expected MissingCommittedRoot when the group's node dir entries are lost, \
+                 but recovery succeeded"
+                    .to_owned(),
+            )),
+        }
+    }
+
+    /// THE FIX (crash AFTER the marker is durable): a DURABLE barrier keeps every
+    /// group node, so recovery from the SAME WAL succeeds and reads back ALL the
+    /// group's survivors FROM DISK — all-or-none, never a subset.
+    #[test]
+    fn group_commit_with_durable_barrier_recovers_all_survivors() -> Result<(), WalError> {
+        let dir = tempfile::tempdir()?;
+        let wal = tempfile::tempdir()?;
+        let wal_path = wal.path().join("group.wal");
+        let nodes_dir = dir.path().join("nodes");
+        let mut store = CrashWindowStore::new(nodes_dir.clone(), false)?;
+        empty_root(&mut store)?;
+
+        let (cold, recovered) = group_then_recover(&mut store, &wal_path, &nodes_dir)?;
+        let actor = recovered?;
+        assert_eq!(actor.get(b"g1", &cold)?, Some(b"v1".to_vec()));
+        assert_eq!(actor.get(b"g2", &cold)?, Some(b"v2".to_vec()));
+        assert_eq!(actor.get(b"g3", &cold)?, Some(b"v3".to_vec()));
+        Ok(())
+    }
+
+    /// COMMIT-FAILURE rollback: when the shared group commit fails, every staged
+    /// survivor's key is rolled back (buffer left as pre-group) and each survivor is
+    /// told the commit failed — none is told `Ok`. Modelled with a store whose
+    /// `put` fails on the Nth node so `commit`'s `batch_mutate` errors.
+    #[test]
+    fn group_commit_failure_rolls_back_all_survivors() -> Result<(), WalError> {
+        /// A store that returns an error from `put` once it has been called
+        /// `fail_after` times, to force a `commit` failure mid-batch.
+        #[derive(Debug)]
+        struct FailingStore {
+            inner: MemoryStore,
+            puts: Cell<usize>,
+            fail_after: usize,
+        }
+
+        impl NodeStore for FailingStore {
+            type Error = crate::store::StoreError;
+
+            fn get(&self, hash: &Hash) -> Result<Option<Arc<Node>>, Self::Error> {
+                Ok(self.inner.get(hash))
+            }
+
+            fn put(&mut self, node: &Node) -> Result<Hash, Self::Error> {
+                let count = self.puts.get().saturating_add(1);
+                self.puts.set(count);
+                if count > self.fail_after {
+                    return Err(crate::store::StoreError::Io(std::io::Error::other(
+                        "injected commit failure",
+                    )));
+                }
+                Ok(self.inner.put(node))
+            }
+        }
+
+        let dir = tempfile::tempdir()?;
+        let wal = DurableWal::new(dir.path().join("fail.wal"), FsyncPolicy::CommitOnly)?;
+        let mut actor = ShardActor::new(wal);
+        // Allow the empty-root put; fail the first tree-building put in commit.
+        let mut store = FailingStore {
+            inner: MemoryStore::new(),
+            puts: Cell::new(0),
+            fail_after: 0,
+        };
+
+        let outcomes = actor.apply_group(
+            vec![
+                apply_value(b"x", None, b"vx", stamp(1, "owner", 0)),
+                apply_value(b"y", None, b"vy", stamp(1, "owner", 1)),
+            ],
+            &mut store,
+        );
+        // Both staged cleanly (their CAS passed) but the SHARED commit failed, so
+        // both are CommitFailed — never Committed.
+        assert_eq!(outcomes.len(), 2);
+        for outcome in &outcomes {
+            assert!(
+                matches!(outcome, GroupOutcome::CommitFailed(_)),
+                "a failed group commit must tell every survivor CommitFailed, got {outcome:?}"
+            );
+        }
+        // The buffer was rolled back to its pre-group (empty) state, so a later read
+        // through a healthy store sees nothing committed.
+        assert!(
+            actor.buffer().is_empty(),
+            "a failed group commit rolls back every staged survivor's key"
+        );
+        assert_eq!(actor.committed_root(), None, "nothing was committed");
         Ok(())
     }
 }
