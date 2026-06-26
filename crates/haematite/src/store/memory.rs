@@ -2,6 +2,7 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 use std::convert::Infallible;
 use std::fmt::Debug;
+use std::sync::Arc;
 
 use crate::tree::{Hash, Node};
 
@@ -10,7 +11,7 @@ use super::DeleteNode;
 pub trait NodeStore: Debug {
     type Error: std::error::Error;
 
-    fn get(&self, hash: &Hash) -> Result<Option<Node>, Self::Error>;
+    fn get(&self, hash: &Hash) -> Result<Option<Arc<Node>>, Self::Error>;
 
     fn put(&mut self, node: &Node) -> Result<Hash, Self::Error>;
 }
@@ -25,11 +26,12 @@ impl MemoryStore {
         Self::default()
     }
 
-    pub fn get(&self, hash: &Hash) -> Option<Node> {
+    pub fn get(&self, hash: &Hash) -> Option<Arc<Node>> {
         self.nodes
             .borrow()
             .get(hash)
             .and_then(|serialised| Node::deserialise(serialised).ok())
+            .map(Arc::new)
     }
 
     pub fn put(&mut self, node: &Node) -> Hash {
@@ -46,7 +48,7 @@ impl MemoryStore {
 impl NodeStore for MemoryStore {
     type Error = Infallible;
 
-    fn get(&self, hash: &Hash) -> Result<Option<Node>, Self::Error> {
+    fn get(&self, hash: &Hash) -> Result<Option<Arc<Node>>, Self::Error> {
         Ok(Self::get(self, hash))
     }
 
@@ -66,6 +68,8 @@ impl DeleteNode for MemoryStore {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
     use super::MemoryStore;
     use crate::tree::{Hash, LeafNode, Node, NodeError};
 
@@ -80,7 +84,7 @@ mod tests {
         let hash = store.put(&node);
 
         assert_eq!(hash, node.hash());
-        assert_eq!(store.get(&hash), Some(node));
+        assert_eq!(store.get(&hash), Some(Arc::new(node)));
         Ok(())
     }
 

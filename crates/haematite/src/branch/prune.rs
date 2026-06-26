@@ -2,6 +2,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::fmt;
+use std::sync::Arc;
 
 use crate::store::{DeleteNode, NodeStore};
 use crate::tree::{Hash, Node};
@@ -166,7 +167,7 @@ where
 
         let node = load_node(store, hash)?;
         let serialised_len = node.serialise().len();
-        if let Node::Internal(internal) = &node {
+        if let Node::Internal(internal) = &*node {
             stack.extend(
                 internal
                     .children()
@@ -180,7 +181,7 @@ where
     Ok(reachable)
 }
 
-fn load_node<S>(store: &S, hash: Hash) -> Result<Node, PruneError>
+fn load_node<S>(store: &S, hash: Hash) -> Result<Arc<Node>, PruneError>
 where
     S: NodeStore + ?Sized,
 {
@@ -339,11 +340,23 @@ mod tests {
         assert_eq!(snapshots.get("keep"), Some(snapshot_root_hash));
         assert_eq!(store.get(&pruned_root_hash), None);
         assert_eq!(store.get(&pruned_only_hash), None);
-        assert_eq!(store.get(&shared_hash), Some(shared));
-        assert_eq!(store.get(&branch_root_hash), Some(branch_root));
-        assert_eq!(store.get(&branch_only_hash), Some(branch_only));
-        assert_eq!(store.get(&snapshot_root_hash), Some(snapshot_root));
-        assert_eq!(store.get(&snapshot_only_hash), Some(snapshot_only));
+        assert_eq!(store.get(&shared_hash), Some(std::sync::Arc::new(shared)));
+        assert_eq!(
+            store.get(&branch_root_hash),
+            Some(std::sync::Arc::new(branch_root))
+        );
+        assert_eq!(
+            store.get(&branch_only_hash),
+            Some(std::sync::Arc::new(branch_only))
+        );
+        assert_eq!(
+            store.get(&snapshot_root_hash),
+            Some(std::sync::Arc::new(snapshot_root))
+        );
+        assert_eq!(
+            store.get(&snapshot_only_hash),
+            Some(std::sync::Arc::new(snapshot_only))
+        );
         Ok(())
     }
 
@@ -372,8 +385,8 @@ mod tests {
         ));
         // Still named (retryable) and nothing it referenced was deleted.
         assert_eq!(snapshots.get("broken"), Some(root_hash));
-        assert_eq!(store.get(&root_hash), Some(root_node));
-        assert_eq!(store.get(&present_hash), Some(present));
+        assert_eq!(store.get(&root_hash), Some(std::sync::Arc::new(root_node)));
+        assert_eq!(store.get(&present_hash), Some(std::sync::Arc::new(present)));
         Ok(())
     }
 

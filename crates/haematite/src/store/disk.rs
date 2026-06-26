@@ -3,6 +3,7 @@ use std::fmt;
 use std::fs;
 use std::io::{ErrorKind, Write};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use crate::store::NodeStore;
 use crate::store::cache::{CacheError, LruCache};
@@ -44,7 +45,7 @@ impl DiskStore {
         self.cache.borrow().capacity()
     }
 
-    pub fn get(&self, hash: &Hash) -> Result<Option<Node>, StoreError> {
+    pub fn get(&self, hash: &Hash) -> Result<Option<Arc<Node>>, StoreError> {
         self.read_node(hash)
     }
 
@@ -56,7 +57,7 @@ impl DiskStore {
         self.delete_node(hash)
     }
 
-    fn read_node(&self, hash: &Hash) -> Result<Option<Node>, StoreError> {
+    fn read_node(&self, hash: &Hash) -> Result<Option<Arc<Node>>, StoreError> {
         if let Some(node) = self.cache_get(hash) {
             return Ok(Some(node));
         }
@@ -68,9 +69,11 @@ impl DiskStore {
             Err(error) => return Err(StoreError::Io(error)),
         };
         let serialised = decompress_node(&compressed)?;
-        let node = Node::deserialise(&serialised)
-            .map_err(|error| StoreError::Deserialise(error.to_string()))?;
-        self.cache_put(*hash, node.clone());
+        let node = Arc::new(
+            Node::deserialise(&serialised)
+                .map_err(|error| StoreError::Deserialise(error.to_string()))?,
+        );
+        self.cache_put(*hash, Arc::clone(&node));
         Ok(Some(node))
     }
 
@@ -78,14 +81,14 @@ impl DiskStore {
         let hash = node.hash();
         let path = self.node_path(&hash);
         if path_exists(&path)? {
-            self.cache_put(hash, node.clone());
+            self.cache_put(hash, Arc::new(node.clone()));
             return Ok(hash);
         }
 
         let serialised = node.serialise();
         let compressed = compress_node(&serialised)?;
         write_compressed_node(&path, &compressed)?;
-        self.cache_put(hash, node.clone());
+        self.cache_put(hash, Arc::new(node.clone()));
         Ok(hash)
     }
 
@@ -104,15 +107,15 @@ impl DiskStore {
         self.dir.join(prefix).join(file_name)
     }
 
-    fn cache_get(&self, hash: &Hash) -> Option<Node> {
+    fn cache_get(&self, hash: &Hash) -> Option<Arc<Node>> {
         self.cache.borrow_mut().get(hash)
     }
 
-    fn cache_put(&self, hash: Hash, node: Node) {
+    fn cache_put(&self, hash: Hash, node: Arc<Node>) {
         self.cache.borrow_mut().put(hash, node);
     }
 
-    fn cache_remove(&self, hash: &Hash) -> Option<Node> {
+    fn cache_remove(&self, hash: &Hash) -> Option<Arc<Node>> {
         self.cache.borrow_mut().remove(hash)
     }
 }
@@ -120,7 +123,7 @@ impl DiskStore {
 impl NodeStore for DiskStore {
     type Error = StoreError;
 
-    fn get(&self, hash: &Hash) -> Result<Option<Node>, Self::Error> {
+    fn get(&self, hash: &Hash) -> Result<Option<Arc<Node>>, Self::Error> {
         self.read_node(hash)
     }
 

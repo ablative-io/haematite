@@ -1,5 +1,6 @@
 use std::cmp::Ordering;
 use std::fmt;
+use std::sync::Arc;
 
 use crate::store::NodeStore;
 
@@ -47,8 +48,8 @@ impl<'a, S: NodeStore + ?Sized> Cursor<'a, S> {
         let mut next_hash = self.root_hash;
 
         loop {
-            match load_node(self.store, next_hash)? {
-                Node::Leaf(leaf) => return leaf_value(&leaf, key),
+            match &*load_node(self.store, next_hash)? {
+                Node::Leaf(leaf) => return leaf_value(leaf, key),
                 Node::Internal(internal) => {
                     let children = internal.children();
                     let index = child_index_for_key(children, key)?;
@@ -103,7 +104,7 @@ impl<'a, S: NodeStore + ?Sized> RangeIter<'a, S> {
         let mut next_hash = hash;
 
         loop {
-            match load_node(self.store, next_hash)? {
+            match &*load_node(self.store, next_hash)? {
                 Node::Leaf(leaf) => {
                     self.leaf_entries = leaf.entries().to_vec();
                     self.leaf_index =
@@ -130,7 +131,7 @@ impl<'a, S: NodeStore + ?Sized> RangeIter<'a, S> {
         let mut next_hash = hash;
 
         loop {
-            match load_node(self.store, next_hash)? {
+            match &*load_node(self.store, next_hash)? {
                 Node::Leaf(leaf) => {
                     self.leaf_entries = leaf.entries().to_vec();
                     self.leaf_index = 0;
@@ -228,7 +229,10 @@ struct RangeFrame {
     next_index: usize,
 }
 
-pub(crate) fn load_node<S: NodeStore + ?Sized>(store: &S, hash: Hash) -> Result<Node, TreeError> {
+pub(crate) fn load_node<S: NodeStore + ?Sized>(
+    store: &S,
+    hash: Hash,
+) -> Result<Arc<Node>, TreeError> {
     store
         .get(&hash)
         .map_err(|_| TreeError::MissingNode { hash })?

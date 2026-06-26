@@ -30,8 +30,8 @@ pub use wire::{
     send_promise_via_beamr, send_pull_request_via_beamr, send_push_response_via_beamr,
     send_root_exchange_request_via_beamr, send_root_exchange_response_via_beamr,
     send_shard_sync_request_via_beamr, send_sync_message_via_beamr,
-    send_target_node_request_via_beamr, send_target_node_response_via_beamr, send_write_ack_via_beamr,
-    send_write_proposal_via_beamr,
+    send_target_node_request_via_beamr, send_target_node_response_via_beamr,
+    send_write_ack_via_beamr, send_write_proposal_via_beamr,
 };
 
 /// Decision made by the root-hash exchange for one shard.
@@ -494,11 +494,7 @@ pub struct ShardSyncRequest {
 
 impl ShardSyncRequest {
     #[must_use]
-    pub const fn new(
-        shard_id: ShardId,
-        requester: SyncNodeId,
-        from_root: Option<Hash>,
-    ) -> Self {
+    pub const fn new(shard_id: ShardId, requester: SyncNodeId, from_root: Option<Hash>) -> Self {
         Self {
             shard_id,
             requester,
@@ -687,7 +683,7 @@ where
         None => None,
     };
 
-    if let Node::Internal(internal) = &source_node {
+    if let Node::Internal(internal) = &*source_node {
         for (separator, child_hash) in internal.children() {
             let target_child_hash = target_node
                 .as_ref()
@@ -704,7 +700,7 @@ where
         }
     }
 
-    let transfer = NodeTransfer::from_parts(source_hash, source_node)?;
+    let transfer = NodeTransfer::from_parts(source_hash, Node::clone(&source_node))?;
     stats.record_transfer_bytes(transfer.byte_len());
     transfers.push(transfer);
     Ok(())

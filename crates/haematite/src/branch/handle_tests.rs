@@ -238,10 +238,10 @@ impl CountingStore {
 impl NodeStore for CountingStore {
     type Error = Infallible;
 
-    fn get(&self, hash: &Hash) -> Result<Option<Node>, Self::Error> {
+    fn get(&self, hash: &Hash) -> Result<Option<std::sync::Arc<Node>>, Self::Error> {
         self.gets.set(self.gets.get().saturating_add(1));
         if *hash == self.root {
-            Ok(Some(self.node.clone()))
+            Ok(Some(std::sync::Arc::new(self.node.clone())))
         } else {
             Ok(None)
         }

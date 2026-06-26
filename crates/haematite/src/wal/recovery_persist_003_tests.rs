@@ -40,7 +40,7 @@ impl fmt::Debug for BlockingStore {
 impl NodeStore for BlockingStore {
     type Error = std::convert::Infallible;
 
-    fn get(&self, hash: &Hash) -> Result<Option<Node>, Self::Error> {
+    fn get(&self, hash: &Hash) -> Result<Option<std::sync::Arc<Node>>, Self::Error> {
         if *hash == self.expected_root && self.entered.send(()).is_ok() {
             assert!(self.release.recv().is_ok());
         }

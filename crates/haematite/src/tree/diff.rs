@@ -1,5 +1,6 @@
 use std::cmp::Ordering;
 use std::fmt;
+use std::sync::Arc;
 
 use crate::store::NodeStore;
 
@@ -73,7 +74,7 @@ fn diff_node_range<S: NodeStore + ?Sized>(
     let node_a = load_diff_node(store, hash_a)?;
     let node_b = load_diff_node(store, hash_b)?;
 
-    match (node_a, node_b) {
+    match (&*node_a, &*node_b) {
         (Node::Leaf(leaf_a), Node::Leaf(leaf_b)) => {
             diff_leaf_entries_range(leaf_a.entries(), leaf_b.entries(), lower, upper, output);
             Ok(())
@@ -87,10 +88,10 @@ fn diff_node_range<S: NodeStore + ?Sized>(
             output,
         ),
         (Node::Leaf(leaf_a), Node::Internal(internal_b)) => {
-            diff_leaf_against_internal(store, &leaf_a, &internal_b, lower, upper, output)
+            diff_leaf_against_internal(store, leaf_a, internal_b, lower, upper, output)
         }
         (Node::Internal(internal_a), Node::Leaf(leaf_b)) => {
-            diff_internal_against_leaf(store, &internal_a, &leaf_b, lower, upper, output)
+            diff_internal_against_leaf(store, internal_a, leaf_b, lower, upper, output)
         }
     }
 }
@@ -181,7 +182,7 @@ fn collect_entries_range<S: NodeStore + ?Sized>(
         return Ok(());
     }
 
-    match load_diff_node(store, hash)? {
+    match &*load_diff_node(store, hash)? {
         Node::Leaf(leaf) => {
             let start = lower_bound_entries(leaf.entries(), lower);
             let end = upper_bound_entries(leaf.entries(), upper);
@@ -308,7 +309,7 @@ where
     }
 }
 
-fn load_diff_node<S: NodeStore + ?Sized>(store: &S, hash: Hash) -> Result<Node, DiffError> {
+fn load_diff_node<S: NodeStore + ?Sized>(store: &S, hash: Hash) -> Result<Arc<Node>, DiffError> {
     store
         .get(&hash)
         .map_err(|_error| DiffError::StoreRead)?

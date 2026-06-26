@@ -111,6 +111,6 @@ where
     fn read_target_node(&self, hash: Hash) -> Result<Option<TargetNodeSummary>, SyncError> {
         self.get(&hash)
             .map_err(|_error| SyncError::TargetStoreRead { hash })
-            .map(|node| node.as_ref().map(TargetNodeSummary::from_node))
+            .map(|node| node.as_deref().map(TargetNodeSummary::from_node))
     }
 }

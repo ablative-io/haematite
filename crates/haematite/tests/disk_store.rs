@@ -40,7 +40,7 @@ fn require_store_error(
 }
 
 fn require_get_error(
-    result: Result<Option<Node>, StoreError>,
+    result: Result<Option<std::sync::Arc<Node>>, StoreError>,
 ) -> Result<StoreError, Box<dyn std::error::Error>> {
     match result {
         Ok(_node) => Err(boxed_error("expected DiskStore::get to fail")),
@@ -158,10 +158,10 @@ fn get_reads_missing_disk_and_cached_nodes_correctly() -> TestResult {
     let hash = writer.put(&node)?;
 
     let reader = DiskStore::with_cache_capacity(temp_dir.path(), 2)?;
-    assert_eq!(reader.get(&hash)?, Some(node.clone()));
+    assert_eq!(reader.get(&hash)?, Some(std::sync::Arc::new(node.clone())));
 
     fs::remove_file(node_path(temp_dir.path(), &hash))?;
-    assert_eq!(reader.get(&hash)?, Some(node));
+    assert_eq!(reader.get(&hash)?, Some(std::sync::Arc::new(node)));
     Ok(())
 }
 
@@ -174,12 +174,15 @@ fn capacity_one_cache_evicts_the_least_recently_used_node_without_losing_disk_da
     let first_hash = store.put(&first)?;
     let second_hash = store.put(&second)?;
 
-    assert_eq!(store.get(&first_hash)?, Some(first.clone()));
+    assert_eq!(
+        store.get(&first_hash)?,
+        Some(std::sync::Arc::new(first.clone()))
+    );
 
     fs::remove_file(node_path(temp_dir.path(), &first_hash))?;
     fs::remove_file(node_path(temp_dir.path(), &second_hash))?;
     assert_eq!(store.get(&second_hash)?, None);
-    assert_eq!(store.get(&first_hash)?, Some(first));
+    assert_eq!(store.get(&first_hash)?, Some(std::sync::Arc::new(first)));
     Ok(())
 }
 
@@ -192,7 +195,10 @@ fn disk_store_implements_fallible_node_store_trait() -> TestResult {
     let hash = NodeStore::put(&mut store, &node)?;
 
     assert_eq!(hash, node.hash());
-    assert_eq!(NodeStore::get(&store, &hash)?, Some(node));
+    assert_eq!(
+        NodeStore::get(&store, &hash)?,
+        Some(std::sync::Arc::new(node))
+    );
     Ok(())
 }
 
@@ -203,7 +209,7 @@ fn delete_removes_file_evicts_cache_and_is_idempotent() -> TestResult {
     let node = leaf_node(b"delete", b"cached")?;
     let hash = store.put(&node)?;
 
-    assert_eq!(store.get(&hash)?, Some(node));
+    assert_eq!(store.get(&hash)?, Some(std::sync::Arc::new(node)));
     assert!(node_path(temp_dir.path(), &hash).is_file());
 
     store.delete(&hash)?;

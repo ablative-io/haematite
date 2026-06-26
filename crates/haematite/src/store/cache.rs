@@ -1,4 +1,5 @@
 use std::num::NonZeroUsize;
+use std::sync::Arc;
 
 use lru::LruCache as InnerLruCache;
 
@@ -6,7 +7,7 @@ use crate::tree::{Hash, Node};
 
 #[derive(Debug)]
 pub struct LruCache {
-    nodes: InnerLruCache<Hash, Node>,
+    nodes: InnerLruCache<Hash, Arc<Node>>,
 }
 
 impl LruCache {
@@ -17,15 +18,15 @@ impl LruCache {
         })
     }
 
-    pub fn get(&mut self, hash: &Hash) -> Option<Node> {
+    pub fn get(&mut self, hash: &Hash) -> Option<Arc<Node>> {
         self.nodes.get(hash).cloned()
     }
 
-    pub fn put(&mut self, hash: Hash, node: Node) {
+    pub fn put(&mut self, hash: Hash, node: Arc<Node>) {
         self.nodes.put(hash, node);
     }
 
-    pub fn remove(&mut self, hash: &Hash) -> Option<Node> {
+    pub fn remove(&mut self, hash: &Hash) -> Option<Arc<Node>> {
         self.nodes.pop(hash)
     }
 
@@ -59,11 +60,15 @@ impl std::error::Error for CacheError {}
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
     use super::{CacheError, LruCache};
     use crate::tree::{Hash, LeafNode, Node, NodeError};
 
-    fn node(key: u8, value: &[u8]) -> Result<Node, NodeError> {
-        LeafNode::new(vec![(vec![key], value.to_vec())]).map(Node::Leaf)
+    fn node(key: u8, value: &[u8]) -> Result<Arc<Node>, NodeError> {
+        LeafNode::new(vec![(vec![key], value.to_vec())])
+            .map(Node::Leaf)
+            .map(Arc::new)
     }
 
     #[test]
