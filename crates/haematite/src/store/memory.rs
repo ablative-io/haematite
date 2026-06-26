@@ -14,6 +14,23 @@ pub trait NodeStore: Debug {
     fn get(&self, hash: &Hash) -> Result<Option<Arc<Node>>, Self::Error>;
 
     fn put(&mut self, node: &Node) -> Result<Hash, Self::Error>;
+
+    /// Make durable the directory entries of every node written since the last
+    /// barrier (Tier-0 durability fix).
+    ///
+    /// A node `put` syncs the node file's DATA but NOT the parent directory, so
+    /// the atomic rename that publishes the file can be lost on power loss even
+    /// though the bytes are durable. The commit path calls this AFTER all of a
+    /// commit's nodes are persisted and STRICTLY BEFORE the WAL committed-root
+    /// marker is written, so recovery can never observe a marker for nodes whose
+    /// directory entries are not yet durable (which would surface as
+    /// `MissingCommittedRoot`/`MissingNode`).
+    ///
+    /// The default is a no-op: in-memory and browser-backed stores have no POSIX
+    /// directory entry to fence. Only [`crate::store::DiskStore`] overrides it.
+    fn sync_dirty_dirs(&self) -> Result<(), Self::Error> {
+        Ok(())
+    }
 }
 
 #[derive(Debug, Default, Clone)]

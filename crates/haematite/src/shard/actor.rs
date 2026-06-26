@@ -352,6 +352,14 @@ impl ShardActor {
         let batch = buffered_batch(&self.buffer);
         let new_root = batch_mutate_owned(store, baseline_root, batch).map_err(tree_error)?;
 
+        // Tier-0 durability barrier (node-rename fsync fix): the nodes for this
+        // commit are now persisted (each file's DATA was fsync'd), but their
+        // parent-directory entries are not yet durable. fsync each distinct
+        // subdirectory that received a node STRICTLY BEFORE the WAL marker, so a
+        // power loss can never leave a committed-root marker referencing nodes
+        // whose directory entries are gone (which recovery rejects as
+        // `MissingCommittedRoot`). In-memory stores make this a no-op.
+        store.sync_dirty_dirs().map_err(tree_error)?;
         self.wal.commit(new_root)?;
         stream_index::apply_committed_buffer(
             &mut self.live_streams,
@@ -942,6 +950,12 @@ impl ShardActor {
         };
         self.buffer = WalBuffer::new();
         let stream_index = stream_index::rebuild(store, Some(root)).map_err(tree_error)?;
+        // Tier-0 durability barrier (node-rename fsync fix): the pulled handoff
+        // nodes and any union-merge nodes were just persisted; fsync their
+        // distinct parent directories STRICTLY BEFORE the WAL marker so a crash
+        // cannot leave the adopted committed root referencing nodes whose
+        // directory entries are not durable. In-memory stores make this a no-op.
+        store.sync_dirty_dirs().map_err(tree_error)?;
         self.wal.commit(root)?;
         self.committed_root = Some(root);
         self.live_streams = stream_index.live;
@@ -1329,6 +1343,266 @@ mod storage_tests {
         );
         assert_eq!(committed_uncrashed_root, uncrashed_root);
         assert_eq!(recovered_root, committed_uncrashed_root);
+        Ok(())
+    }
+}
+
+/// Node-rename fsync durability fix: crash-injection tests for the parent-dir
+/// barrier (Tier-0 correctness, found in the perf/durability audit).
+///
+/// The bug: `DiskStore` syncs each node file's DATA before the atomic rename that
+/// publishes it, but never fsync'd the parent DIRECTORY. On power loss the
+/// rename's directory entry can be lost even though the WAL marker (written
+/// after) says the commit is durable, so recovery walks the committed root and
+/// hits a node whose file is unreachable.
+///
+/// The fix: `ShardActor::commit` invokes `store.sync_dirty_dirs()` — fsyncing
+/// each DISTINCT subdir that received a node this commit — STRICTLY BEFORE
+/// `wal.commit` writes the marker.
+///
+/// HONEST scope: a true kernel power-loss can't be reproduced in a unit test, so
+/// these tests simulate the precise failure window with a wrapper store. The
+/// barrier seam is `sync_dirty_dirs`; the wrapper makes that seam either LOSSY
+/// (drops the just-written node files, modelling lost directory entries) or
+/// DURABLE (delegates to the real `DiskStore`). The pair proves the causal chain
+/// the fix closes: a marker published over non-durable node dir entries makes
+/// recovery fail, and the real barrier prevents exactly that.
+#[cfg(test)]
+mod node_dir_fsync_tests {
+    use super::ShardActor;
+    use crate::store::{DiskStore, MemoryStore, NodeStore};
+    use crate::tree::{Hash, Node};
+    use crate::wal::{DurableWal, FsyncPolicy, WalError, WalRecovery};
+    use std::cell::RefCell;
+    use std::path::PathBuf;
+    use std::sync::Arc;
+
+    /// A `DiskStore` wrapper whose `sync_dirty_dirs` barrier is configurable, used
+    /// to model the power-loss window where node FILES are persisted but their
+    /// parent DIRECTORY ENTRIES are not yet durable.
+    ///
+    /// Every `put` is forwarded to the real inner `DiskStore` (so the node bytes
+    /// are genuinely written and content-addressed), and the node's path is
+    /// recorded as "pending" since the last barrier. The barrier then either:
+    ///
+    /// * `lossy = true`: DELETES every pending node file — exactly the on-disk
+    ///   state after a crash that lost the unsynced rename directory entries —
+    ///   and does NOT call the real barrier. The marker the actor writes next
+    ///   therefore references nodes that are not durably linked.
+    /// * `lossy = false`: delegates to the real `DiskStore::sync_dirty_dirs`,
+    ///   fsyncing the directory entries (the fix), so nothing is lost.
+    #[derive(Debug)]
+    struct CrashWindowStore {
+        inner: DiskStore,
+        lossy: bool,
+        pending: RefCell<Vec<PathBuf>>,
+        dir: PathBuf,
+    }
+
+    impl CrashWindowStore {
+        fn new(dir: PathBuf, lossy: bool) -> Result<Self, WalError> {
+            let inner =
+                DiskStore::new(&dir).map_err(|error| WalError::TreeError(error.to_string()))?;
+            Ok(Self {
+                inner,
+                lossy,
+                pending: RefCell::new(Vec::new()),
+                dir,
+            })
+        }
+
+        fn node_path(&self, hash: &Hash) -> PathBuf {
+            let hex = hash.to_string();
+            let (prefix, file_name) = hex.split_at(2);
+            self.dir.join(prefix).join(file_name)
+        }
+    }
+
+    impl NodeStore for CrashWindowStore {
+        type Error = crate::store::StoreError;
+
+        fn get(&self, hash: &Hash) -> Result<Option<Arc<Node>>, Self::Error> {
+            self.inner.get(hash)
+        }
+
+        fn put(&mut self, node: &Node) -> Result<Hash, Self::Error> {
+            let hash = self.inner.put(node)?;
+            self.pending.borrow_mut().push(self.node_path(&hash));
+            Ok(hash)
+        }
+
+        fn sync_dirty_dirs(&self) -> Result<(), Self::Error> {
+            let pending = std::mem::take(&mut *self.pending.borrow_mut());
+            if self.lossy {
+                // Model the lost directory entries: the files written this commit
+                // become unreachable, as if their renames never reached disk.
+                for path in pending {
+                    match std::fs::remove_file(&path) {
+                        Ok(()) => {}
+                        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                        Err(error) => return Err(crate::store::StoreError::Io(error)),
+                    }
+                }
+                Ok(())
+            } else {
+                // The fix: fsync the real directory entries.
+                self.inner.sync_dirty_dirs()
+            }
+        }
+    }
+
+    /// Build an actor over a fresh on-disk WAL and the given store, commit one
+    /// write, then re-open from the SAME WAL path with a FRESH COLD-CACHE
+    /// `DiskStore` over the SAME node directory — the faithful crash-recovery
+    /// shape: a new process reads only what is on disk, never a warm in-memory
+    /// cache. Returns the committed root plus the recovery result (and the cold
+    /// store, so the caller can read committed values back).
+    fn commit_then_recover(
+        store: &mut CrashWindowStore,
+        wal_path: &std::path::Path,
+        nodes_dir: &std::path::Path,
+    ) -> Result<(Hash, DiskStore, Result<ShardActor, WalError>), WalError> {
+        let wal = DurableWal::new(wal_path, FsyncPolicy::CommitOnly)?;
+        let mut actor = ShardActor::new(wal);
+        actor.put(b"durable-key".to_vec(), b"durable-value".to_vec())?;
+        let committed_root = actor.commit(store)?;
+        drop(actor); // close the WAL file: the "crash" boundary.
+
+        // Recover through a COLD store over the same node dir: a warm cache would
+        // mask a lost file, so this is what a real restarted process observes.
+        // `recover_path` VERIFIES the committed root is present in the store — the
+        // bug surfaces here as `MissingCommittedRoot`. We return THIS result (not
+        // an unwrapped one) so the caller can assert the rejection.
+        let cold = DiskStore::new(nodes_dir).map_err(|e| WalError::TreeError(e.to_string()))?;
+        let actor = match WalRecovery::recover_path(wal_path, &cold) {
+            Ok(recovered) => {
+                let wal = DurableWal::new(wal_path, FsyncPolicy::CommitOnly)?;
+                ShardActor::from_recovered(wal, recovered, &cold)
+            }
+            Err(error) => Err(error),
+        };
+        Ok((committed_root, cold, actor))
+    }
+
+    /// FALSIFIER: with a LOSSY barrier (directory entries lost on the simulated
+    /// crash) the committed-root marker references nodes whose files are gone, so
+    /// recovery MUST reject with `MissingCommittedRoot`. This is the bug the fix
+    /// closes; if `commit` did not fsync the directory entries, production would
+    /// behave exactly like this.
+    #[test]
+    fn lossy_dir_barrier_makes_recovery_reject_missing_committed_root() -> Result<(), WalError> {
+        let dir = tempfile::tempdir()?;
+        let wal = tempfile::tempdir()?;
+        let wal_path = wal.path().join("shard.wal");
+        let nodes_dir = dir.path().join("nodes");
+        let mut store = CrashWindowStore::new(nodes_dir.clone(), true)?;
+
+        let (committed_root, _cold, recovered) =
+            commit_then_recover(&mut store, &wal_path, &nodes_dir)?;
+
+        match recovered {
+            Err(WalError::MissingCommittedRoot { root }) => {
+                assert_eq!(
+                    root, committed_root,
+                    "recovery must name the marker's now-unreachable root"
+                );
+                Ok(())
+            }
+            Err(other) => Err(other),
+            Ok(_actor) => Err(WalError::TreeError(
+                "expected MissingCommittedRoot when the dir barrier loses node files, \
+                 but recovery succeeded"
+                    .to_owned(),
+            )),
+        }
+    }
+
+    /// THE FIX: with the DURABLE barrier (`sync_dirty_dirs` fsyncs the real
+    /// directory entries) the node files survive the simulated crash, so recovery
+    /// from the SAME WAL succeeds and reads the committed value back FROM DISK.
+    #[test]
+    fn durable_dir_barrier_lets_recovery_read_committed_value() -> Result<(), WalError> {
+        let dir = tempfile::tempdir()?;
+        let wal = tempfile::tempdir()?;
+        let wal_path = wal.path().join("shard.wal");
+        let nodes_dir = dir.path().join("nodes");
+        let mut store = CrashWindowStore::new(nodes_dir.clone(), false)?;
+
+        let (committed_root, cold, recovered) =
+            commit_then_recover(&mut store, &wal_path, &nodes_dir)?;
+        let actor = recovered?;
+
+        assert_eq!(actor.committed_root(), Some(committed_root));
+        assert_eq!(
+            actor.get(b"durable-key", &cold)?,
+            Some(b"durable-value".to_vec()),
+            "the committed value must be readable from disk after recovery"
+        );
+        Ok(())
+    }
+
+    /// ORDERING: the barrier is invoked BEFORE the WAL marker. A store whose
+    /// `sync_dirty_dirs` records the marker state at barrier time proves the
+    /// directory fsync happens while the marker is still ABSENT, so a crash can
+    /// never publish a marker over un-fenced directory entries.
+    #[test]
+    fn barrier_runs_strictly_before_the_wal_marker() -> Result<(), WalError> {
+        /// Records whether the on-disk WAL already carried a committed-root marker
+        /// at the instant the barrier ran. Correct ordering ⇒ no marker yet.
+        #[derive(Debug)]
+        struct OrderingStore {
+            inner: MemoryStore,
+            wal_path: PathBuf,
+            marker_present_at_barrier: RefCell<Option<bool>>,
+        }
+
+        impl NodeStore for OrderingStore {
+            type Error = std::convert::Infallible;
+
+            fn get(&self, hash: &Hash) -> Result<Option<Arc<Node>>, Self::Error> {
+                Ok(self.inner.get(hash))
+            }
+
+            fn put(&mut self, node: &Node) -> Result<Hash, Self::Error> {
+                Ok(self.inner.put(node))
+            }
+
+            fn sync_dirty_dirs(&self) -> Result<(), Self::Error> {
+                // Read the on-disk WAL as it stands at barrier time. If ordering
+                // is correct the marker has NOT been written yet.
+                let present = DurableWal::read_file(&self.wal_path)
+                    .ok()
+                    .and_then(|contents| contents.committed_root())
+                    .is_some();
+                *self.marker_present_at_barrier.borrow_mut() = Some(present);
+                Ok(())
+            }
+        }
+
+        let wal_dir = tempfile::tempdir()?;
+        let wal_path = wal_dir.path().join("shard.wal");
+        let mut store = OrderingStore {
+            inner: MemoryStore::new(),
+            wal_path: wal_path.clone(),
+            marker_present_at_barrier: RefCell::new(None),
+        };
+        let wal = DurableWal::new(&wal_path, FsyncPolicy::CommitOnly)?;
+        let mut actor = ShardActor::new(wal);
+        actor.put(b"k".to_vec(), b"v".to_vec())?;
+        actor.commit(&mut store)?;
+
+        let observed = *store.marker_present_at_barrier.borrow();
+        assert_eq!(
+            observed,
+            Some(false),
+            "the dir-sync barrier must run while the WAL marker is still absent \
+             (strictly before wal.commit)"
+        );
+        // And after commit the marker IS present — proving the barrier preceded it.
+        assert!(
+            DurableWal::read_file(&wal_path)?.committed_root().is_some(),
+            "the marker must be written by commit (after the barrier)"
+        );
         Ok(())
     }
 }
