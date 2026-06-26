@@ -37,7 +37,7 @@ impl CountingStore {
 impl NodeStore for CountingStore {
     type Error = std::convert::Infallible;
 
-    fn get(&self, hash: &Hash) -> Result<Option<Node>, Self::Error> {
+    fn get(&self, hash: &Hash) -> Result<Option<std::sync::Arc<Node>>, Self::Error> {
         self.reads.set(self.reads.get().saturating_add(1));
         Ok(self.inner.get(hash))
     }
@@ -256,7 +256,8 @@ fn insert_rewrites_immutably_splits_roots_and_is_history_independent() -> Result
         Some(b"second".to_vec())
     );
 
-    let Some(Node::Internal(internal)) = store.get(&split) else {
+    let split_node = store.get(&split);
+    let Some(Node::Internal(internal)) = split_node.as_deref() else {
         return Err("split root was not an internal node".into());
     };
     // A boundary key followed by its successor splits into two leaves, so the root
@@ -304,7 +305,8 @@ fn insert_rewrites_immutably_splits_roots_and_is_history_independent() -> Result
     let right = store_leaf(&mut sibling_store, &[(b"m", b"two")])?;
     let manual_root = store_internal(&mut sibling_store, vec![(b"a", left), (b"m", right)])?;
     let rewritten = insert(&mut sibling_store, manual_root, b"b", b"inserted")?;
-    let Some(Node::Leaf(leaf)) = sibling_store.get(&rewritten) else {
+    let rewritten_node = sibling_store.get(&rewritten);
+    let Some(Node::Leaf(leaf)) = rewritten_node.as_deref() else {
         return Err("rewritten root was not the canonical single leaf".into());
     };
     assert_eq!(
@@ -331,7 +333,8 @@ fn assert_multi_boundary_split_is_history_independent() -> Result<(), Box<dyn Er
     for key in &split_keys {
         split_root = insert(&mut split_store, split_root, key.as_slice(), b"value")?;
     }
-    let Some(Node::Internal(internal)) = split_store.get(&split_root) else {
+    let split_root_node = split_store.get(&split_root);
+    let Some(Node::Internal(internal)) = split_root_node.as_deref() else {
         return Err("multi-boundary split root was not an internal node".into());
     };
     // Each key is its own boundary, so every separator is a boundary one level up
@@ -408,7 +411,7 @@ fn delete_is_idempotent_collapses_empty_nodes_and_preserves_canonical_roots()
     let single = insert(&mut single_store, single, b"only", b"value")?;
     let empty = delete(&mut single_store, single, b"only")?;
     assert!(
-        matches!(single_store.get(&empty), Some(Node::Leaf(ref leaf)) if leaf.entries().is_empty())
+        matches!(single_store.get(&empty).as_deref(), Some(Node::Leaf(leaf)) if leaf.entries().is_empty())
     );
 
     let mut parent_store = MemoryStore::new();
@@ -420,7 +423,8 @@ fn delete_is_idempotent_collapses_empty_nodes_and_preserves_canonical_roots()
         vec![(b"a", left), (b"m", middle), (b"z", right)],
     )?;
     let without_middle = delete(&mut parent_store, root, b"m")?;
-    let Some(Node::Internal(internal)) = parent_store.get(&without_middle) else {
+    let without_middle_node = parent_store.get(&without_middle);
+    let Some(Node::Internal(internal)) = without_middle_node.as_deref() else {
         return Err("root after middle delete was not internal".into());
     };
     assert_eq!(

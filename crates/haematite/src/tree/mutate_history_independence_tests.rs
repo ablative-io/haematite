@@ -82,7 +82,7 @@ fn walk(
     out: &mut BTreeMap<Vec<u8>, Vec<u8>>,
     leaf_count: &mut usize,
 ) {
-    match load_node(store, hash).unwrap() {
+    match &*load_node(store, hash).unwrap() {
         Node::Leaf(leaf) => {
             *leaf_count += 1;
             for (k, v) in leaf.entries() {
@@ -107,7 +107,7 @@ fn root_is_multi_leaf(target_size: usize, ops: &[(Vec<u8>, Option<Vec<u8>>)]) ->
         root = batch_mutate(&mut store, root, &mutation).unwrap();
     }
     let result =
-        matches!(load_node(&store, root).unwrap(), Node::Internal(i) if i.children().len() > 1);
+        matches!(&*load_node(&store, root).unwrap(), Node::Internal(i) if i.children().len() > 1);
     set_test_target_size(None);
     result
 }

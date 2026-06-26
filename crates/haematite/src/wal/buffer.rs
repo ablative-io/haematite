@@ -269,11 +269,12 @@ mod tests {
     impl NodeStore for CountingStore {
         type Error = Infallible;
 
-        fn get(&self, hash: &Hash) -> Result<Option<Node>, Self::Error> {
+        fn get(&self, hash: &Hash) -> Result<Option<std::sync::Arc<Node>>, Self::Error> {
             Ok(self
                 .nodes
                 .get(hash)
-                .and_then(|bytes| Node::deserialise(bytes).ok()))
+                .and_then(|bytes| Node::deserialise(bytes).ok())
+                .map(std::sync::Arc::new))
         }
 
         fn put(&mut self, node: &Node) -> Result<Hash, Self::Error> {
@@ -463,7 +464,7 @@ mod tests {
 
         impl NodeStore for MissingRootStore {
             type Error = NeverHappens;
-            fn get(&self, hash: &Hash) -> Result<Option<Node>, Self::Error> {
+            fn get(&self, hash: &Hash) -> Result<Option<std::sync::Arc<Node>>, Self::Error> {
                 debug_assert_eq!(hash.as_bytes().len(), 32);
                 Ok(None)
             }

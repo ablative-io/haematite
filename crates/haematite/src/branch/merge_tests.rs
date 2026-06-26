@@ -23,13 +23,14 @@ struct CountingStore {
 impl NodeStore for CountingStore {
     type Error = Infallible;
 
-    fn get(&self, hash: &Hash) -> Result<Option<Node>, Self::Error> {
+    fn get(&self, hash: &Hash) -> Result<Option<std::sync::Arc<Node>>, Self::Error> {
         self.gets.set(self.gets.get().saturating_add(1));
         let node = self
             .nodes
             .get(hash)
-            .and_then(|serialised| Node::deserialise(serialised).ok());
-        if matches!(node, Some(Node::Leaf(_))) {
+            .and_then(|serialised| Node::deserialise(serialised).ok())
+            .map(std::sync::Arc::new);
+        if matches!(node.as_deref(), Some(Node::Leaf(_))) {
             self.leaf_gets.set(self.leaf_gets.get().saturating_add(1));
         }
         Ok(node)

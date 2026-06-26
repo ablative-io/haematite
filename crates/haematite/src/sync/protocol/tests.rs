@@ -30,7 +30,7 @@ impl<'a> CountingStore<'a> {
 impl NodeStore for CountingStore<'_> {
     type Error = Infallible;
 
-    fn get(&self, hash: &Hash) -> Result<Option<Node>, Self::Error> {
+    fn get(&self, hash: &Hash) -> Result<Option<std::sync::Arc<Node>>, Self::Error> {
         self.reads.set(self.reads.get().saturating_add(1));
         Ok(self.inner.get(hash))
     }
@@ -311,8 +311,7 @@ fn assert_message_round_trips(message: &SyncMessage) -> Result<(), Box<dyn std::
 }
 
 #[test]
-fn write_proposal_round_trips_across_field_variations()
--> Result<(), Box<dyn std::error::Error>> {
+fn write_proposal_round_trips_across_field_variations() -> Result<(), Box<dyn std::error::Error>> {
     let expected = sample_hash(b"prev", b"old")?;
     let write_id = WriteId::new("node-origin-name", 7, 42);
 
@@ -508,8 +507,8 @@ fn batch_write_ack_round_trips_for_every_outcome() -> Result<(), Box<dyn std::er
 }
 
 #[test]
-fn truncated_batch_write_messages_decode_to_clean_error()
--> Result<(), Box<dyn std::error::Error>> {
+fn truncated_batch_write_messages_decode_to_clean_error() -> Result<(), Box<dyn std::error::Error>>
+{
     use super::{BatchWriteAck, BatchWriteEntry, BatchWriteProposal};
     use crate::sync::ballot::Stamp;
 
@@ -616,8 +615,7 @@ fn denormalized_duration_nanos_decode_to_error() -> Result<(), Box<dyn std::erro
     // The subsec-nanos field sits just before the 16-byte trailing epoch, the
     // 8-byte trailing seq, and the 1-byte tombstone flag; force it out of range to
     // prove the decoder rejects a denormalized duration.
-    let nanos_start =
-        payload.len() - EPOCH_BOTTOM_WIRE_LEN - SEQ_WIRE_LEN - TOMBSTONE_WIRE_LEN - 4;
+    let nanos_start = payload.len() - EPOCH_BOTTOM_WIRE_LEN - SEQ_WIRE_LEN - TOMBSTONE_WIRE_LEN - 4;
     payload[nanos_start..nanos_start + 4].copy_from_slice(&1_000_000_000_u32.to_be_bytes());
     assert!(matches!(
         decode_sync_message(&payload),
@@ -627,8 +625,8 @@ fn denormalized_duration_nanos_decode_to_error() -> Result<(), Box<dyn std::erro
 }
 
 #[test]
-fn write_proposal_epoch_field_truncation_is_clean_error()
--> Result<(), Box<dyn std::error::Error>> {
+fn write_proposal_epoch_field_truncation_is_clean_error() -> Result<(), Box<dyn std::error::Error>>
+{
     // AA-3-3: a WriteProposal carrying a real (non-bottom) epoch must round-trip,
     // and any truncation that lands INSIDE the trailing epoch field — its 8-byte
     // counter or its length-prefixed node id — must decode to a clean Err, never a
@@ -696,8 +694,7 @@ fn prepare_round_trips() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 #[test]
-fn promise_round_trips_with_and_without_options()
--> Result<(), Box<dyn std::error::Error>> {
+fn promise_round_trips_with_and_without_options() -> Result<(), Box<dyn std::error::Error>> {
     let root = sample_hash(b"committed", b"root")?;
     let messages = [
         // both options absent
@@ -758,12 +755,16 @@ fn nack_round_trips() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 #[test]
-fn shard_sync_request_round_trips_with_and_without_root()
--> Result<(), Box<dyn std::error::Error>> {
+fn shard_sync_request_round_trips_with_and_without_root() -> Result<(), Box<dyn std::error::Error>>
+{
     let root = sample_hash(b"catch", b"up")?;
     let messages = [
         // No from_root (source has no committed data).
-        SyncMessage::ShardSyncRequest(ShardSyncRequest::new(0, SyncNodeId::from("requester-a"), None)),
+        SyncMessage::ShardSyncRequest(ShardSyncRequest::new(
+            0,
+            SyncNodeId::from("requester-a"),
+            None,
+        )),
         // from_root present, multibyte requester, max shard id.
         SyncMessage::ShardSyncRequest(ShardSyncRequest::new(
             usize::MAX,
@@ -780,8 +781,7 @@ fn shard_sync_request_round_trips_with_and_without_root()
 }
 
 #[test]
-fn ballot_round_trips_for_multibyte_and_empty_node()
--> Result<(), Box<dyn std::error::Error>> {
+fn ballot_round_trips_for_multibyte_and_empty_node() -> Result<(), Box<dyn std::error::Error>> {
     // Multi-byte UTF-8 node id and the empty-string bottom ballot both survive
     // a Prepare round-trip (the ballot is exercised inside the message codec).
     let messages = [
@@ -805,8 +805,7 @@ fn ballot_round_trips_for_multibyte_and_empty_node()
 }
 
 #[test]
-fn truncated_election_messages_decode_to_clean_error()
--> Result<(), Box<dyn std::error::Error>> {
+fn truncated_election_messages_decode_to_clean_error() -> Result<(), Box<dyn std::error::Error>> {
     let root = sample_hash(b"c", b"r")?;
     let messages = [
         // Prepare: cuts land inside shard, inside ballot counter, inside the
@@ -852,8 +851,7 @@ fn truncated_election_messages_decode_to_clean_error()
 }
 
 #[test]
-fn election_ballot_node_length_overflow_is_rejected()
--> Result<(), Box<dyn std::error::Error>> {
+fn election_ballot_node_length_overflow_is_rejected() -> Result<(), Box<dyn std::error::Error>> {
     // A node-length prefix claiming more bytes than remain must error (the DoS
     // guard), never over-allocate or panic. Encode a Prepare, then overwrite the
     // 8-byte node-length prefix (which follows the version+tag+shard+counter)
@@ -874,8 +872,8 @@ fn election_ballot_node_length_overflow_is_rejected()
 }
 
 #[test]
-fn election_optional_ballot_bad_presence_tag_is_rejected()
--> Result<(), Box<dyn std::error::Error>> {
+fn election_optional_ballot_bad_presence_tag_is_rejected() -> Result<(), Box<dyn std::error::Error>>
+{
     // The accepted_epoch presence tag must be 0 or 1; anything else is a clean
     // error rather than a misread.
     let message = SyncMessage::Promise(Promise {
@@ -899,8 +897,7 @@ fn election_optional_ballot_bad_presence_tag_is_rejected()
 }
 
 #[test]
-fn election_messages_round_trip_through_beamr_frame()
--> Result<(), Box<dyn std::error::Error>> {
+fn election_messages_round_trip_through_beamr_frame() -> Result<(), Box<dyn std::error::Error>> {
     let root = sample_hash(b"c", b"r")?;
     let messages = [
         SyncMessage::Prepare(Prepare {

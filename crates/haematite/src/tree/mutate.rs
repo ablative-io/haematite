@@ -117,7 +117,7 @@ fn tree_height<S: NodeStore + ?Sized>(store: &S, root_hash: Hash) -> Result<usiz
     let mut height = 0;
     let mut hash = root_hash;
     loop {
-        match load_node(store, hash)? {
+        match &*load_node(store, hash)? {
             Node::Leaf(_leaf) => return Ok(height),
             Node::Internal(internal) => {
                 let Some((_separator, child_hash)) = internal.children().first() else {
@@ -139,7 +139,8 @@ fn collect_leaf_refs_inner<S: NodeStore + ?Sized>(
     levels_above_leaves: usize,
     leaves: &mut Vec<ChildRef>,
 ) -> Result<(), TreeError> {
-    let Node::Internal(internal) = load_node(store, hash)? else {
+    let node = load_node(store, hash)?;
+    let Node::Internal(internal) = &*node else {
         return Err(TreeError::InvalidNode);
     };
 
@@ -261,7 +262,7 @@ fn load_entries<S: NodeStore + ?Sized>(
 ) -> Result<Vec<Entry>, TreeError> {
     let mut entries = Vec::new();
     for (_separator, hash) in leaves {
-        match load_node(store, *hash)? {
+        match &*load_node(store, *hash)? {
             Node::Leaf(leaf) => entries.extend_from_slice(leaf.entries()),
             Node::Internal(_internal) => return Err(TreeError::InvalidNode),
         }

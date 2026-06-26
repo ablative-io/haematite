@@ -1,6 +1,7 @@
 // API-003: read-only store + WAL recovery used by the sweep pass.
 
 use std::collections::BTreeMap;
+use std::sync::Arc;
 
 use crate::store::{DiskStore, NodeStore};
 use crate::tree::{Hash, Node, TreeError};
@@ -33,7 +34,7 @@ where
 {
     let mut stack = vec![root];
     while let Some(hash) = stack.pop() {
-        match load_node(store, hash)? {
+        match &*load_node(store, hash)? {
             Node::Leaf(leaf) => {
                 for (key, value) in leaf.entries() {
                     out.insert(key.clone(), value.clone());
@@ -49,7 +50,7 @@ where
     Ok(())
 }
 
-fn load_node<S>(store: &S, hash: Hash) -> Result<Node, SweepError>
+fn load_node<S>(store: &S, hash: Hash) -> Result<Arc<Node>, SweepError>
 where
     S: NodeStore + ?Sized,
 {

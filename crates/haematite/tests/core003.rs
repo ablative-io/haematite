@@ -31,7 +31,7 @@ impl CountingStore {
 impl NodeStore for CountingStore {
     type Error = std::convert::Infallible;
 
-    fn get(&self, hash: &Hash) -> Result<Option<Node>, Self::Error> {
+    fn get(&self, hash: &Hash) -> Result<Option<std::sync::Arc<Node>>, Self::Error> {
         self.reads.set(self.reads.get().saturating_add(1));
         Ok(self.inner.get(hash))
     }
@@ -56,7 +56,7 @@ impl PanicOnHashStore {
 impl NodeStore for PanicOnHashStore {
     type Error = std::convert::Infallible;
 
-    fn get(&self, hash: &Hash) -> Result<Option<Node>, Self::Error> {
+    fn get(&self, hash: &Hash) -> Result<Option<std::sync::Arc<Node>>, Self::Error> {
         assert!(
             !self.panic_on.contains(hash),
             "diff attempted to fetch shared subtree {hash}"

@@ -7,6 +7,7 @@
 //! secondary index (out of scope per the brief).
 
 use std::collections::BTreeMap;
+use std::sync::Arc;
 
 use crate::shard::actor::decode_sequence_key;
 use crate::store::NodeStore;
@@ -90,7 +91,7 @@ where
 {
     let mut stack = vec![root];
     while let Some(hash) = stack.pop() {
-        match load_node(store, hash)? {
+        match &*load_node(store, hash)? {
             Node::Leaf(leaf) => {
                 for (key, value) in leaf.entries() {
                     if decode_sequence_key(key).is_some() {
@@ -110,7 +111,7 @@ where
 
 /// Load a node by hash, mapping a missing node or store error to a
 /// [`ShardError`].
-fn load_node<S>(store: &S, hash: Hash) -> Result<Node, ShardError>
+fn load_node<S>(store: &S, hash: Hash) -> Result<Arc<Node>, ShardError>
 where
     S: NodeStore + ?Sized,
 {

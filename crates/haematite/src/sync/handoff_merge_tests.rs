@@ -43,7 +43,10 @@ fn tombstone_bytes(stamp: Stamp) -> Vec<u8> {
 }
 
 /// Build a committed tree from a key -> stored-bytes set and return its root.
-fn build_tree(store: &mut MemoryStore, entries: &[(&[u8], Vec<u8>)]) -> Result<Hash, Box<dyn Error>> {
+fn build_tree(
+    store: &mut MemoryStore,
+    entries: &[(&[u8], Vec<u8>)],
+) -> Result<Hash, Box<dyn Error>> {
     let root = empty_root(store)?;
     let mutations: Vec<(Vec<u8>, Option<Vec<u8>>)> = entries
         .iter()
@@ -52,7 +55,10 @@ fn build_tree(store: &mut MemoryStore, entries: &[(&[u8], Vec<u8>)]) -> Result<H
     Ok(batch_mutate(store, root, mutations.as_slice())?)
 }
 
-fn build_from_spec(store: &mut MemoryStore, spec: &[SpecEntry<'_>]) -> Result<Hash, Box<dyn Error>> {
+fn build_from_spec(
+    store: &mut MemoryStore,
+    spec: &[SpecEntry<'_>],
+) -> Result<Hash, Box<dyn Error>> {
     let entries: Vec<(&[u8], Vec<u8>)> = spec
         .iter()
         .map(|(key, stamp, value)| {
@@ -82,7 +88,7 @@ fn collect(
     hash: Hash,
     out: &mut BTreeMap<Vec<u8>, StampedEntry>,
 ) -> Result<(), Box<dyn Error>> {
-    match store.get(&hash).ok_or("missing node")? {
+    match &*store.get(&hash).ok_or("missing node")? {
         Node::Leaf(leaf) => {
             for (key, bytes) in leaf.entries() {
                 let entry = StampedEntry::decode(bytes)?.ok_or("not stamped")?;
@@ -163,7 +169,10 @@ fn same_key_keeps_max_stamp_either_arg_order() -> TestResult {
 fn same_key_higher_epoch_beats_higher_seq() -> TestResult {
     // Epoch dominates seq: (epoch 8, seq 0) beats (epoch 7, seq u64::MAX).
     let mut store = MemoryStore::new();
-    let a = build_tree(&mut store, &[(b"k", value_bytes(b"old", stamp(7, "Z", u64::MAX)))])?;
+    let a = build_tree(
+        &mut store,
+        &[(b"k", value_bytes(b"old", stamp(7, "Z", u64::MAX)))],
+    )?;
     let b = build_tree(&mut store, &[(b"k", value_bytes(b"new", stamp(8, "A", 0)))])?;
 
     let merged = require(merge_committed_union(Some(a), Some(b), &mut store)?)?;
@@ -185,9 +194,18 @@ fn tombstone_with_higher_stamp_wins_and_reads_absent() -> TestResult {
     // tombstone is WRITTEN into the merged tree (stored, not dropped).
     for (x, y) in [(value_side, tomb_side), (tomb_side, value_side)] {
         let merged = require(merge_committed_union(Some(x), Some(y), &mut store)?)?;
-        assert_eq!(logical_get(&store, merged, b"k")?, None, "tombstone hides the value");
-        assert!(is_stored(&store, merged, b"k")?, "tombstone persists in the merged tree");
-        let entry = read_stored(&store, merged)?.remove(b"k".as_slice()).ok_or("missing k")?;
+        assert_eq!(
+            logical_get(&store, merged, b"k")?,
+            None,
+            "tombstone hides the value"
+        );
+        assert!(
+            is_stored(&store, merged, b"k")?,
+            "tombstone persists in the merged tree"
+        );
+        let entry = read_stored(&store, merged)?
+            .remove(b"k".as_slice())
+            .ok_or("missing k")?;
         assert!(entry.is_tombstone());
         assert_eq!(entry.stamp(), &stamp(1, "A", 9));
     }
@@ -203,7 +221,9 @@ fn value_with_higher_stamp_beats_tombstone_both_directions() -> TestResult {
     for (x, y) in [(tomb_side, value_side), (value_side, tomb_side)] {
         let merged = require(merge_committed_union(Some(x), Some(y), &mut store)?)?;
         assert_eq!(logical_get(&store, merged, b"k")?, Some(b"v".to_vec()));
-        let entry = read_stored(&store, merged)?.remove(b"k".as_slice()).ok_or("missing k")?;
+        let entry = read_stored(&store, merged)?
+            .remove(b"k".as_slice())
+            .ok_or("missing k")?;
         assert!(!entry.is_tombstone());
         assert_eq!(entry.stamp(), &stamp(1, "A", 9));
     }
@@ -220,12 +240,24 @@ fn tombstone_vs_never_written_keeps_tombstone() -> TestResult {
     // Side A has a committed delete on `k`; side B never wrote `k` (it has another
     // key so the tree is non-trivial). The delete MUST survive (not resurrected).
     let a = build_tree(&mut store, &[(b"k", tombstone_bytes(stamp(2, "A", 3)))])?;
-    let b = build_tree(&mut store, &[(b"other", value_bytes(b"x", stamp(2, "A", 4)))])?;
+    let b = build_tree(
+        &mut store,
+        &[(b"other", value_bytes(b"x", stamp(2, "A", 4)))],
+    )?;
 
     let merged = require(merge_committed_union(Some(a), Some(b), &mut store)?)?;
-    assert!(is_stored(&store, merged, b"k")?, "tombstone must not vanish");
-    assert_eq!(logical_get(&store, merged, b"k")?, None, "key stays deleted");
-    let entry = read_stored(&store, merged)?.remove(b"k".as_slice()).ok_or("missing k")?;
+    assert!(
+        is_stored(&store, merged, b"k")?,
+        "tombstone must not vanish"
+    );
+    assert_eq!(
+        logical_get(&store, merged, b"k")?,
+        None,
+        "key stays deleted"
+    );
+    let entry = read_stored(&store, merged)?
+        .remove(b"k".as_slice())
+        .ok_or("missing k")?;
     assert!(entry.is_tombstone());
     // The unrelated key is also preserved (union).
     assert_eq!(logical_get(&store, merged, b"other")?, Some(b"x".to_vec()));
@@ -377,18 +409,36 @@ fn associativity_all_permutations_yield_identical_root() -> TestResult {
     let baseline = require(fold_merge(&mut store, &forks)?)?;
     for perm in &perms {
         let root = require(fold_merge(&mut store, perm)?)?;
-        assert_eq!(root, baseline, "every merge permutation must yield the identical root");
+        assert_eq!(
+            root, baseline,
+            "every merge permutation must yield the identical root"
+        );
     }
 
     // And the winners are exactly the per-key chain tips:
-    assert_eq!(logical_get(&store, baseline, b"shared")?, Some(b"c-hi".to_vec())); // epoch 5 wins
-    assert_eq!(logical_get(&store, baseline, b"only-a")?, Some(b"a".to_vec()));
-    assert_eq!(logical_get(&store, baseline, b"only-b")?, Some(b"b".to_vec()));
+    assert_eq!(
+        logical_get(&store, baseline, b"shared")?,
+        Some(b"c-hi".to_vec())
+    ); // epoch 5 wins
+    assert_eq!(
+        logical_get(&store, baseline, b"only-a")?,
+        Some(b"a".to_vec())
+    );
+    assert_eq!(
+        logical_get(&store, baseline, b"only-b")?,
+        Some(b"b".to_vec())
+    );
     assert_eq!(logical_get(&store, baseline, b"del")?, None); // B's tombstone (epoch 9) wins
-    assert!(is_stored(&store, baseline, b"del")?, "the winning tombstone persists");
+    assert!(
+        is_stored(&store, baseline, b"del")?,
+        "the winning tombstone persists"
+    );
     assert_eq!(logical_get(&store, baseline, b"only-c")?, None); // lone tombstone survives
     assert!(is_stored(&store, baseline, b"only-c")?);
-    assert_eq!(logical_get(&store, baseline, b"only-e")?, Some(b"e".to_vec()));
+    assert_eq!(
+        logical_get(&store, baseline, b"only-e")?,
+        Some(b"e".to_vec())
+    );
 
     // Explicit associativity shape: merge(merge(A,B),C) == merge(A,merge(B,C)).
     let (a, b, c) = (forks[0], forks[1], forks[2]);
@@ -452,7 +502,13 @@ fn equal_stamp_different_bytes_is_an_error() -> TestResult {
     let b = build_tree(&mut store, &[(b"k", value_bytes(b"two", s.clone()))])?;
 
     let result = merge_committed_union(Some(a), Some(b), &mut store);
-    assert_eq!(result, Err(HandoffMergeError::DuplicateStamp { key: b"k".to_vec(), stamp: s }));
+    assert_eq!(
+        result,
+        Err(HandoffMergeError::DuplicateStamp {
+            key: b"k".to_vec(),
+            stamp: s
+        })
+    );
     Ok(())
 }
 

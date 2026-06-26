@@ -1,4 +1,5 @@
 use std::fmt;
+use std::sync::Arc;
 
 use crate::store::NodeStore;
 use crate::tree::{Hash, Node, TreeError, batch_mutate};
@@ -195,7 +196,7 @@ impl<'a, S: NodeStore + ?Sized> MergeWalk<'a, S> {
             self.load_node(hashes.branch)?
         };
 
-        match (&ancestor_node, &parent_node, &branch_node) {
+        match (&*ancestor_node, &*parent_node, &*branch_node) {
             (Node::Leaf(ancestor), Node::Leaf(parent), Node::Leaf(branch)) => self
                 .merge_leaf_entries_range(
                     EntryTriple {
@@ -217,7 +218,7 @@ impl<'a, S: NodeStore + ?Sized> MergeWalk<'a, S> {
         }
     }
 
-    fn load_node(&self, hash: Hash) -> Result<Node, MergeError> {
+    fn load_node(&self, hash: Hash) -> Result<Arc<Node>, MergeError> {
         self.store
             .get(&hash)
             .map_err(|_error| MergeError::StoreRead { hash })?

@@ -14,6 +14,7 @@
 
 use std::cell::{Cell, RefCell};
 use std::fmt;
+use std::sync::Arc;
 
 use crate::store::NodeStore;
 use crate::store::cache::{CacheError, LruCache};
@@ -162,15 +163,15 @@ impl IndexedDbStore {
     }
 
     /// Read a node: cache first (R5), then an awaited `IndexedDB` transaction.
-    pub async fn get_async(&self, hash: &Hash) -> Result<Option<Node>, IndexedDbStoreError> {
+    pub async fn get_async(&self, hash: &Hash) -> Result<Option<Arc<Node>>, IndexedDbStoreError> {
         if let Some(node) = self.cache_get(hash) {
             return Ok(Some(node));
         }
 
         self.record_transaction();
-        let node = browser::read_node(&self.db, hash).await?;
+        let node = browser::read_node(&self.db, hash).await?.map(Arc::new);
         if let Some(node) = &node {
-            self.cache_put(*hash, node.clone());
+            self.cache_put(*hash, Arc::clone(node));
         }
         Ok(node)
     }
@@ -180,22 +181,22 @@ impl IndexedDbStore {
         let hash = node.hash();
         self.record_transaction();
         if browser::has_node(&self.db, &hash).await? {
-            self.cache_put(hash, node.clone());
+            self.cache_put(hash, Arc::new(node.clone()));
             return Ok(hash);
         }
 
         let compressed = encode_node(node)?;
         self.record_transaction();
         browser::write_node(&self.db, &hash, &compressed).await?;
-        self.cache_put(hash, node.clone());
+        self.cache_put(hash, Arc::new(node.clone()));
         Ok(hash)
     }
 
-    fn cache_get(&self, hash: &Hash) -> Option<Node> {
+    fn cache_get(&self, hash: &Hash) -> Option<Arc<Node>> {
         self.cache.borrow_mut().get(hash)
     }
 
-    fn cache_put(&self, hash: Hash, node: Node) {
+    fn cache_put(&self, hash: Hash, node: Arc<Node>) {
         self.cache.borrow_mut().put(hash, node);
     }
 
@@ -210,7 +211,7 @@ impl NodeStore for IndexedDbStore {
 
     /// Synchronous read serves the cache only; a miss requires
     /// [`IndexedDbStore::get_async`] on a worker (CN4).
-    fn get(&self, hash: &Hash) -> Result<Option<Node>, Self::Error> {
+    fn get(&self, hash: &Hash) -> Result<Option<Arc<Node>>, Self::Error> {
         if let Some(node) = self.cache_get(hash) {
             return Ok(Some(node));
         }

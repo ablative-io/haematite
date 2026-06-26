@@ -98,6 +98,10 @@ name = "single_shard_ops"
 harness = false
 
 [[bench]]
+name = "read_heavy"
+harness = false
+
+[[bench]]
 name = "multi_shard_scaling"
 harness = false
 

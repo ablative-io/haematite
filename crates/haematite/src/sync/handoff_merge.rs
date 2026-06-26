@@ -33,6 +33,7 @@
 
 use std::collections::BTreeMap;
 use std::fmt;
+use std::sync::Arc;
 
 use crate::store::NodeStore;
 use crate::sync::ballot::Stamp;
@@ -199,7 +200,7 @@ fn collect_into<S: NodeStore + ?Sized>(
     hash: Hash,
     out: &mut Vec<StoredEntry>,
 ) -> Result<(), HandoffMergeError> {
-    match load_node(store, hash)? {
+    match &*load_node(store, hash)? {
         Node::Leaf(leaf) => {
             out.extend(leaf.entries().iter().cloned());
             Ok(())
@@ -216,7 +217,7 @@ fn collect_into<S: NodeStore + ?Sized>(
     }
 }
 
-fn load_node<S: NodeStore + ?Sized>(store: &S, hash: Hash) -> Result<Node, HandoffMergeError> {
+fn load_node<S: NodeStore + ?Sized>(store: &S, hash: Hash) -> Result<Arc<Node>, HandoffMergeError> {
     store
         .get(&hash)
         .map_err(|_error| HandoffMergeError::StoreRead { hash })?
