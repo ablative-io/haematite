@@ -565,6 +565,31 @@ impl PushResponse {
             stats,
         }
     }
+
+    /// Construct from already-computed stats, trusting the caller's
+    /// `nodes_transferred` / `bytes_transferred` instead of re-deriving them by
+    /// re-serialising every node.
+    ///
+    /// The wire-decode path (`decode_push_response`) already knows each node's
+    /// serialised length from the on-wire length prefix, so it sums those
+    /// directly; this constructor avoids the redundant re-serialise that
+    /// [`Self::new`] performs via [`NodeTransfer::byte_len`].
+    #[must_use]
+    pub const fn with_stats(
+        shard_id: ShardId,
+        source_root: Option<Hash>,
+        target_root: Option<Hash>,
+        transfers: Vec<NodeTransfer>,
+        stats: SyncStats,
+    ) -> Self {
+        Self {
+            shard_id,
+            source_root,
+            target_root,
+            transfers,
+            stats,
+        }
+    }
 }
 
 /// Missing-node discovery result for one shard.

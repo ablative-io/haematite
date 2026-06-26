@@ -6,6 +6,16 @@ const LEAF_TAG: u8 = 0x00;
 const INTERNAL_TAG: u8 = 0x01;
 const U64_SIZE: usize = 8;
 
+/// Smallest on-wire size of a leaf entry: a u64 key-length prefix and a u64
+/// value-length prefix (both bodies may be empty). Used to bound how many
+/// entries a hostile `entry_count` could possibly describe in the remaining
+/// bytes, so deserialise never pre-allocates an unbounded length.
+const MIN_LEAF_ENTRY_BYTES: usize = 2 * U64_SIZE;
+
+/// Smallest on-wire size of an internal child: a u64 key-length prefix and a
+/// fixed-size child hash.
+const MIN_INTERNAL_CHILD_BYTES: usize = U64_SIZE + HASH_SIZE;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, std::hash::Hash)]
 pub struct Hash([u8; HASH_SIZE]);
 
@@ -85,7 +95,7 @@ impl LeafNode {
     }
 
     pub fn serialise(&self) -> Vec<u8> {
-        let mut bytes = Vec::new();
+        let mut bytes = Vec::with_capacity(leaf_serialised_len(&self.entries));
         bytes.push(LEAF_TAG);
         append_len(&mut bytes, self.entries.len());
         for (key, value) in &self.entries {
@@ -99,7 +109,15 @@ impl LeafNode {
         let mut cursor = ByteCursor::new(bytes);
         cursor.read_expected_tag(LEAF_TAG)?;
         let entry_count = cursor.read_len()?;
-        let mut entries = Vec::new();
+        // `entry_count` is attacker-controlled on a malformed/hostile payload;
+        // clamp the pre-allocation to what the remaining bytes could possibly
+        // hold (each entry needs >= two u64 length prefixes) so we never reserve
+        // an unbounded length. The loop still grows the Vec if the bound is hit.
+        let mut entries = Vec::with_capacity(clamp_capacity(
+            entry_count,
+            cursor.remaining(),
+            MIN_LEAF_ENTRY_BYTES,
+        ));
         for _ in 0..entry_count {
             let key = cursor.read_len_prefixed_bytes()?;
             let value = cursor.read_len_prefixed_bytes()?;
@@ -130,7 +148,7 @@ impl InternalNode {
     }
 
     pub fn serialise(&self) -> Vec<u8> {
-        let mut bytes = Vec::new();
+        let mut bytes = Vec::with_capacity(internal_serialised_len(&self.children));
         bytes.push(INTERNAL_TAG);
         append_len(&mut bytes, self.children.len());
         for (key, child_hash) in &self.children {
@@ -144,7 +162,13 @@ impl InternalNode {
         let mut cursor = ByteCursor::new(bytes);
         cursor.read_expected_tag(INTERNAL_TAG)?;
         let child_count = cursor.read_len()?;
-        let mut children = Vec::new();
+        // Clamp the attacker-controlled `child_count` to what the remaining bytes
+        // could hold (each child needs >= a u64 key-length prefix plus a hash).
+        let mut children = Vec::with_capacity(clamp_capacity(
+            child_count,
+            cursor.remaining(),
+            MIN_INTERNAL_CHILD_BYTES,
+        ));
         for _ in 0..child_count {
             let key = cursor.read_len_prefixed_bytes()?;
             let child_hash = Hash::from_bytes(cursor.read_hash_bytes()?);
@@ -188,6 +212,19 @@ impl Node {
             Self::Internal(internal) => internal.hash(),
         }
     }
+
+    /// Serialise the node ONCE and hash those exact bytes, returning both.
+    ///
+    /// Callers that need the wire bytes AND the content hash (e.g. the disk
+    /// write path) would otherwise serialise twice — once inside [`Self::hash`]
+    /// (which drops the bytes) and again to obtain the payload. This computes
+    /// the same `(bytes, hash)` pair with a single serialisation.
+    #[must_use]
+    pub fn serialise_and_hash(&self) -> (Vec<u8>, Hash) {
+        let bytes = self.serialise();
+        let hash = hash_serialised(&bytes);
+        (bytes, hash)
+    }
 }
 
 fn validate_sorted_unique<T>(entries: &[(Vec<u8>, T)]) -> Result<(), NodeError> {
@@ -205,6 +242,45 @@ fn validate_sorted_unique<T>(entries: &[(Vec<u8>, T)]) -> Result<(), NodeError> 
     }
 
     Ok(())
+}
+
+/// Exact serialised length of a leaf node: tag, entry-count prefix, then for
+/// each entry a key-length prefix + key + value-length prefix + value.
+fn leaf_serialised_len(entries: &[(Vec<u8>, Vec<u8>)]) -> usize {
+    let mut len = 1 + U64_SIZE;
+    for (key, value) in entries {
+        len = len
+            .saturating_add(2 * U64_SIZE)
+            .saturating_add(key.len())
+            .saturating_add(value.len());
+    }
+    len
+}
+
+/// Exact serialised length of an internal node: tag, child-count prefix, then
+/// for each child a key-length prefix + key + a fixed-size child hash.
+fn internal_serialised_len(children: &[(Vec<u8>, Hash)]) -> usize {
+    let mut len = 1 + U64_SIZE;
+    for (key, _) in children {
+        len = len
+            .saturating_add(U64_SIZE)
+            .saturating_add(key.len())
+            .saturating_add(HASH_SIZE);
+    }
+    len
+}
+
+/// Bound a wire-supplied element count by what the remaining bytes could hold.
+///
+/// `count` is the (untrusted) length read from the wire; `remaining` is the
+/// number of bytes still available, and `min_element_bytes` the smallest
+/// possible on-wire size of one element. Returns the smaller of `count` and the
+/// maximum number of elements that could physically fit, so a hostile length
+/// never triggers an unbounded pre-allocation. The decode loop still grows the
+/// Vec normally when the genuine count exceeds the clamp.
+fn clamp_capacity(count: usize, remaining: usize, min_element_bytes: usize) -> usize {
+    let max_possible = remaining / min_element_bytes.max(1);
+    count.min(max_possible)
 }
 
 fn append_len(bytes: &mut Vec<u8>, len: usize) {
@@ -229,6 +305,12 @@ struct ByteCursor<'a> {
 impl<'a> ByteCursor<'a> {
     const fn new(bytes: &'a [u8]) -> Self {
         Self { bytes, offset: 0 }
+    }
+
+    /// Bytes not yet consumed — used to bound pre-allocation against a hostile
+    /// element count.
+    const fn remaining(&self) -> usize {
+        self.bytes.len().saturating_sub(self.offset)
     }
 
     fn read_expected_tag(&mut self, expected: u8) -> Result<(), NodeError> {
