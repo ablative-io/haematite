@@ -81,10 +81,7 @@ pub enum ShardError {
     /// stale/deposed owner is fenced: NOTHING was applied (no put, no commit).
     /// Like [`Self::CasHashMismatch`] this is a vote-against, never an apply
     /// fault.
-    Fenced {
-        promised: Ballot,
-        attempted: Ballot,
-    },
+    Fenced { promised: Ballot, attempted: Ballot },
 }
 
 impl fmt::Display for ShardError {
@@ -185,6 +182,8 @@ pub type PromiserContribution = (Option<Hash>, Vec<crate::sync::NodeTransfer>);
 /// Reply channel payload for a `scan_sequences` request.
 pub(super) type ScanReply = SyncSender<Result<Vec<StreamSeq>, ShardError>>;
 
+pub(super) type BoolReply = SyncSender<Result<bool, ShardError>>;
+
 /// A queued command: a monotonic id (so a failed enqueue can be rolled back)
 /// plus the typed request and its reply channel.
 pub(super) struct ShardCommand {
@@ -217,7 +216,7 @@ pub(super) enum ShardCommandKind {
     },
     DeleteIfExpired {
         key: Vec<u8>,
-        reply: SyncSender<Result<bool, ShardError>>,
+        reply: BoolReply,
     },
     Commit {
         reply: SyncSender<Result<Hash, ShardError>>,
@@ -227,6 +226,7 @@ pub(super) enum ShardCommandKind {
         to: Vec<u8>,
         reply: SyncSender<Result<Vec<RangeItem>, ShardError>>,
     },
+    HasLiveInRange(Vec<u8>, Vec<u8>, BoolReply),
     Append {
         key: Vec<u8>,
         entries: Vec<Vec<u8>>,
@@ -797,7 +797,7 @@ impl ShardHandle {
 
     /// Push a command and wake the process. On a dead pid the command is rolled
     /// back off the queue and [`ShardError::ActorUnavailable`] is returned.
-    fn enqueue(&self, kind: ShardCommandKind) -> Result<(), ShardError> {
+    pub(super) fn enqueue(&self, kind: ShardCommandKind) -> Result<(), ShardError> {
         let id = self.next_command_id.fetch_add(1, Ordering::Relaxed);
         native::lock_queue(&self.commands).push_back(ShardCommand { id, kind });
         if self

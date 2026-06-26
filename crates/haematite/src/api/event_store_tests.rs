@@ -243,6 +243,26 @@ fn scan_visits_every_shard() -> TestResult {
     Ok(())
 }
 
+#[test]
+fn scan_reports_stream_with_many_live_events_and_excludes_non_live_streams() -> TestResult {
+    let dir = TempDir::new()?;
+    let store = new_ttl_store(&dir, 1)?;
+
+    for index in 0..64_u64 {
+        let payload = index.to_be_bytes();
+        store.append_with_ttl(b"many", &payload, index, Some(Duration::from_secs(60)))?;
+    }
+    store.append_with_ttl(b"expired-only", b"gone", 0, Some(Duration::ZERO))?;
+
+    let streams: Vec<Vec<u8>> = store
+        .scan(|_| true)?
+        .into_iter()
+        .map(|result| result.stream_key)
+        .collect();
+    assert_eq!(streams, vec![b"many".to_vec()]);
+    Ok(())
+}
+
 // ---- R7: compare-and-swap -------------------------------------------------
 
 #[test]

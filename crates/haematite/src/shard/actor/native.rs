@@ -152,9 +152,8 @@ impl ShardState {
                 drop(reply.send(result));
                 None
             }
-            ShardCommandKind::Range { from, to, reply } => {
-                drop(reply.send(self.collect_range(&from, &to)));
-                None
+            range @ (ShardCommandKind::Range { .. } | ShardCommandKind::HasLiveInRange(..)) => {
+                self.execute_range(range)
             }
             ShardCommandKind::Append {
                 key,
@@ -298,6 +297,27 @@ impl ShardState {
             self.actor.committed_root(),
             self.actor.buffer(),
         )
+    }
+
+    /// Run range-shaped commands against the merged tree+buffer read view.
+    fn execute_range(&self, command: ShardCommandKind) -> Option<NativeOutcome> {
+        match command {
+            ShardCommandKind::Range { from, to, reply } => {
+                drop(reply.send(self.collect_range(&from, &to)));
+            }
+            ShardCommandKind::HasLiveInRange(from, to, reply) => {
+                let result = super::liveness::has_live_in_range(
+                    &self.store,
+                    self.actor.committed_root(),
+                    self.actor.buffer(),
+                    from.as_slice(),
+                    to.as_slice(),
+                );
+                drop(reply.send(result));
+            }
+            _ => {}
+        }
+        None
     }
 
     /// Merge committed-tree entries with the live buffer for `[from, to)`.

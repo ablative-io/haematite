@@ -73,6 +73,19 @@ pub fn range_on_handle(
     collect_range_items(items)
 }
 
+/// Run a first-match liveness probe for one stream's event-entry range.
+pub(super) fn has_live_events_on_handle(
+    handle: &ShardHandle,
+    key: &[u8],
+    timeout: Duration,
+) -> Result<bool, DatabaseError> {
+    let from = event_range_start(key, 1);
+    let to = event_range_end(key);
+    handle
+        .has_live_in_range(from, to, timeout)
+        .map_err(map_shard_error)
+}
+
 /// Collect streamed range items up to the [`RangeItem::Done`] sentinel.
 fn collect_range_items(items: Vec<RangeItem>) -> Result<DbRange, DatabaseError> {
     let mut entries = Vec::new();
