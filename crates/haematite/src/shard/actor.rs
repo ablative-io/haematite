@@ -17,7 +17,7 @@ pub use handle::{RangeItem, ShardError, ShardHandle};
 use crate::branch::current_timestamp;
 use crate::store::NodeStore;
 use crate::sync::ballot::{Ballot, Stamp};
-use crate::tree::{Cursor, Hash, LeafNode, Node, batch_mutate};
+use crate::tree::{Cursor, Hash, LeafNode, Node, batch_mutate_owned};
 use crate::ttl::entry::{
     StampedEntry, encode_optional_ttl, encode_stamped_optional_ttl, encode_stamped_tombstone,
 };
@@ -344,8 +344,13 @@ impl ShardActor {
             Some(root) => root,
             None => store_empty_root(store)?,
         };
+        // One materialisation of the write set (PERF-003): the buffered mutations
+        // are collected ONCE into `batch` and then MOVED through normalisation by
+        // `batch_mutate_owned` instead of being re-cloned. The buffer itself is
+        // left intact here because `apply_committed_buffer` below still needs it on
+        // the success path.
         let batch = buffered_batch(&self.buffer);
-        let new_root = batch_mutate(store, baseline_root, batch.as_slice()).map_err(tree_error)?;
+        let new_root = batch_mutate_owned(store, baseline_root, batch).map_err(tree_error)?;
 
         self.wal.commit(new_root)?;
         stream_index::apply_committed_buffer(
@@ -403,6 +408,10 @@ impl ShardActor {
             key: seq_key,
             value: new_seq.to_be_bytes().to_vec(),
         });
+        // MULTI-key apply (event entries + the seq counter): the full-buffer
+        // snapshot is load-bearing all-or-nothing rollback (PERF-003 preserves it,
+        // as for `apply_durable_batch`) — a mid-batch failure must leave the buffer
+        // exactly as before. A single-key snapshot cannot express that.
         let previous_buffer = self.buffer.clone();
         for mutation in mutations {
             buffer_mutation(&mut self.buffer, mutation);
@@ -459,12 +468,15 @@ impl ShardActor {
         if actual != expected {
             return Err(CasError::Mismatch { expected, actual });
         }
-        let previous_buffer = self.buffer.clone();
+        // Targeted single-key rollback (PERF-003): remember only this key's prior
+        // entry rather than cloning the whole buffer. `cas` buffers exactly one
+        // key, so restoring that one entry is a complete inverse on failure.
+        let prior = self.buffer.snapshot_entry(key);
         self.buffer.put(key, new.to_be_bytes());
         match self.commit(store) {
             Ok(_root) => Ok(()),
             Err(error) => {
-                self.buffer = previous_buffer;
+                self.buffer.restore_entry(key, prior);
                 Err(CasError::from(error))
             }
         }
@@ -579,7 +591,10 @@ impl ShardActor {
         if actual != expected {
             return Err(HashCasError::HashMismatch { expected, actual });
         }
-        let previous_buffer = self.buffer.clone();
+        // Targeted single-key rollback (PERF-003): a value/tombstone apply buffers
+        // exactly one key, so remembering only that key's prior entry is a complete
+        // inverse on failure — no whole-buffer clone needed.
+        let prior = self.buffer.snapshot_entry(key);
         let encoded = match kind {
             ApplyKind::Value { value, ttl } => {
                 encode_stamped_optional_ttl(value, stamp, ttl).map_err(tree_error)?
@@ -590,7 +605,7 @@ impl ShardActor {
         match self.commit(store) {
             Ok(_root) => Ok(()),
             Err(error) => {
-                self.buffer = previous_buffer;
+                self.buffer.restore_entry(key, prior);
                 Err(HashCasError::from(error))
             }
         }
