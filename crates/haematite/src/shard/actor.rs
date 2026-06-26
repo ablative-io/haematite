@@ -8,6 +8,7 @@ mod liveness;
 pub mod native;
 mod scan;
 mod startup;
+mod stream_index;
 
 use errors::{AppendError, CasError, HashCasError};
 
@@ -38,6 +39,8 @@ pub struct ShardActor {
     wal: DurableWal,
     buffer: WalBuffer,
     committed_root: Option<Hash>,
+    live_streams: stream_index::LiveStreamIndex,
+    stream_index_errors: stream_index::SequenceIndexErrors,
     /// AA-3-0 actor-local durable promise state (design §3, R8). These are owned
     /// by THIS shard actor — never a `DashMap` consulted outside the slice — so
     /// the (future) epoch fence reads `promised` in the same slice that a Prepare
@@ -100,6 +103,8 @@ impl ShardActor {
             wal,
             buffer: WalBuffer::new(),
             committed_root: None,
+            live_streams: stream_index::LiveStreamIndex::new(),
+            stream_index_errors: stream_index::SequenceIndexErrors::new(),
             promised: Ballot::bottom(),
             owner_epoch: None,
             persisted_max_minted: 0,
@@ -111,28 +116,40 @@ impl ShardActor {
     /// Promise state (AA-3-0) is seeded from the recovered WAL: the latest
     /// persisted [`PromiseRecord`] if one exists, else the bottom defaults
     /// `(0,"")` / `None` / `0`. The WAL is also seeded with the recovered promise
-    /// snapshot so the next commit truncation re-emits it (design §3).
-    #[must_use]
-    pub fn from_recovered(mut wal: DurableWal, recovered: RecoveredWal) -> Self {
+    /// snapshot so the next commit truncation re-emits it (design §3). The live
+    /// stream index is rebuilt from the recovered committed root before the actor
+    /// accepts commands, so recovery observes the same baseline as a full walk.
+    pub fn from_recovered<S>(
+        mut wal: DurableWal,
+        recovered: RecoveredWal,
+        store: &S,
+    ) -> Result<Self, WalError>
+    where
+        S: NodeStore + ?Sized,
+    {
         let committed_root = recovered.committed_root();
+        let stream_index = stream_index::rebuild(store, committed_root).map_err(tree_error)?;
         let promise = recovered
             .promise()
             .cloned()
             .unwrap_or_else(PromiseRecord::initial);
         wal.seed_promise(promise.clone());
+        let buffer = recovered.into_buffer();
         let PromiseRecord {
             promised,
             owner_epoch,
             persisted_max_minted,
         } = promise;
-        Self {
+        Ok(Self {
             wal,
-            buffer: recovered.into_buffer(),
+            buffer,
             committed_root,
+            live_streams: stream_index.live,
+            stream_index_errors: stream_index.errors,
             promised,
             owner_epoch,
             persisted_max_minted,
-        }
+        })
     }
 
     /// Last committed root hash known to this shard, if any.
@@ -331,6 +348,11 @@ impl ShardActor {
         let new_root = batch_mutate(store, baseline_root, batch.as_slice()).map_err(tree_error)?;
 
         self.wal.commit(new_root)?;
+        stream_index::apply_committed_buffer(
+            &mut self.live_streams,
+            &mut self.stream_index_errors,
+            &self.buffer,
+        );
         self.buffer = WalBuffer::new();
         self.committed_root = Some(new_root);
         Ok(new_root)
@@ -783,6 +805,20 @@ impl ShardActor {
         &self.buffer
     }
 
+    /// Return this actor's index-backed stream enumeration.
+    pub(super) fn scan_sequences(&self) -> Result<Vec<handle::StreamSeq>, ShardError> {
+        scan::scan_sequences(&self.live_streams, &self.stream_index_errors)
+    }
+
+    /// Return the pre-PERF-002 full-walk scan view for regression tests.
+    #[cfg(test)]
+    fn scan_sequences_full_walk<S>(&self, store: &S) -> Result<Vec<handle::StreamSeq>, ShardError>
+    where
+        S: NodeStore + ?Sized,
+    {
+        stream_index::full_walk_with_buffer(store, self.committed_root, &self.buffer)
+    }
+
     fn read_sequence<S>(&self, seq_key: &[u8], store: &S) -> Result<u64, WalError>
     where
         S: NodeStore + ?Sized,
@@ -890,8 +926,11 @@ impl ShardActor {
             return Ok(self.committed_root);
         };
         self.buffer = WalBuffer::new();
+        let stream_index = stream_index::rebuild(store, Some(root)).map_err(tree_error)?;
         self.wal.commit(root)?;
         self.committed_root = Some(root);
+        self.live_streams = stream_index.live;
+        self.stream_index_errors = stream_index.errors;
         Ok(Some(root))
     }
 }
@@ -991,6 +1030,10 @@ impl crate::sync::TargetNodeReader for EmptyTarget {
 #[cfg(test)]
 #[path = "actor/tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "actor/stream_index_tests.rs"]
+mod stream_index_tests;
 
 #[cfg(test)]
 mod storage_tests {
@@ -1182,7 +1225,7 @@ mod storage_tests {
 
         let recovered = WalRecovery::recover_path(temp.path(), &store)?;
         let wal = DurableWal::new(temp.path(), FsyncPolicy::CommitOnly)?;
-        let mut actor = ShardActor::from_recovered(wal, recovered);
+        let mut actor = ShardActor::from_recovered(wal, recovered, &store)?;
 
         assert_eq!(actor.committed_root(), Some(committed_root));
         assert_eq!(actor.get(b"replayed", &store)?, Some(b"before".to_vec()));
@@ -1219,7 +1262,7 @@ mod storage_tests {
 
         let recovered = WalRecovery::recover_path(temp.path(), &store)?;
         let wal = DurableWal::new(temp.path(), FsyncPolicy::CommitOnly)?;
-        let mut actor = ShardActor::from_recovered(wal, recovered);
+        let mut actor = ShardActor::from_recovered(wal, recovered, &store)?;
 
         let new_root = actor.commit(&mut store)?;
 
@@ -1249,7 +1292,8 @@ mod storage_tests {
 
         let recovered = WalRecovery::recover_path(crashed.path(), &crashed_store)?;
         let crashed_wal = DurableWal::new(crashed.path(), FsyncPolicy::CommitOnly)?;
-        let mut recovered_actor = ShardActor::from_recovered(crashed_wal, recovered);
+        let mut recovered_actor =
+            ShardActor::from_recovered(crashed_wal, recovered, &crashed_store)?;
         recovered_actor.put(b"k".to_vec(), b"v2".to_vec())?;
         let recovered_root = recovered_actor.commit(&mut crashed_store)?;
 
@@ -1322,7 +1366,7 @@ mod promise_recovery_tests {
         let store = MemoryStore::new();
         let recovered = WalRecovery::recover_path(path, &store)?;
         let wal = DurableWal::new(path, FsyncPolicy::CommitOnly)?;
-        Ok(ShardActor::from_recovered(wal, recovered))
+        ShardActor::from_recovered(wal, recovered, &store)
     }
 
     /// (a) A persisted promise survives a crash, and (b) a lower ballot is
@@ -1487,7 +1531,7 @@ mod promise_recovery_tests {
         // Reopen FROM DISK against the store holding the committed tree.
         let recovered = WalRecovery::recover_path(&temp.path, &store)?;
         let wal = DurableWal::new(&temp.path, FsyncPolicy::CommitOnly)?;
-        let actor = ShardActor::from_recovered(wal, recovered);
+        let actor = ShardActor::from_recovered(wal, recovered, &store)?;
         assert_eq!(
             actor.promised(),
             &ballot(9, "Z"),

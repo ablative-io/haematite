@@ -334,7 +334,7 @@ fn shard_zero_accepts_writes_while_shard_five_recovery_is_blocked() -> Result<()
 
     let recovered = WalRecovery::recover_path(shard0.path(), &shard0_store)?;
     let wal = DurableWal::new(shard0.path(), FsyncPolicy::CommitOnly)?;
-    let mut actor = ShardActor::from_recovered(wal, recovered);
+    let mut actor = ShardActor::from_recovered(wal, recovered, &shard0_store)?;
     actor.put(b"accepted".to_vec(), b"while-shard-5-blocked".to_vec())?;
 
     assert_eq!(

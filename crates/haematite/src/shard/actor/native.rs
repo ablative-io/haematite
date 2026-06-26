@@ -92,7 +92,7 @@ impl ShardNativeHandler {
         let store = DiskStore::new(store_dir)?;
         let recovered = WalRecovery::recover_path(wal_path, &store)?;
         let wal = DurableWal::new(wal_path, FsyncPolicy::CommitOnly)?;
-        let actor = ShardActor::from_recovered(wal, recovered);
+        let actor = ShardActor::from_recovered(wal, recovered, &store)?;
         Ok(ShardState { actor, store })
     }
 
@@ -289,14 +289,9 @@ impl ShardState {
         None
     }
 
-    /// Walk the whole shard and decode every stream's sequence metadata; see
-    /// [`super::scan::scan_sequences`].
+    /// Decode every stream's sequence metadata from the actor-owned index.
     fn scan_sequences(&self) -> Result<Vec<StreamSeq>, ShardError> {
-        super::scan::scan_sequences(
-            &self.store,
-            self.actor.committed_root(),
-            self.actor.buffer(),
-        )
+        self.actor.scan_sequences()
     }
 
     /// Run range-shaped commands against the merged tree+buffer read view.
