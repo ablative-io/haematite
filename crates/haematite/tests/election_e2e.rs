@@ -616,13 +616,17 @@ fn deposed_owner_is_fenced_end_to_end() -> TestResult {
     // It must be a fence/quorum FAILURE, never Ok. A and C both rejecting erodes
     // possible-accepts below quorum -> ConsistencyError (the fenced shape).
     match &result {
-        Err(DatabaseError::ConsistencyError(message)) => {
+        Err(DatabaseError::Fenced {
+            required,
+            possible_accepts,
+        }) => {
             assert!(
-                message.contains("fenced"),
-                "deposed-owner write must fail as a FENCE, got: {message}"
+                possible_accepts < required,
+                "deposed-owner write must fail as a FENCE (quorum of accepts no longer \
+                 reachable), got required={required} possible_accepts={possible_accepts}"
             );
         }
-        other => panic!("deposed owner must be fenced (ConsistencyError), got {other:?}"),
+        other => panic!("deposed owner must be fenced (typed Fenced), got {other:?}"),
     }
 
     // The stale value must NOT have landed on the majority peers.

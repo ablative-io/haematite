@@ -241,14 +241,19 @@ fn assert_post_heal_c_fenced(node_c: &Node, key: &[u8], value_c: &[u8]) -> TestR
         QUORUM_TIMEOUT,
     );
     match production {
-        Err(DatabaseError::ConsistencyError(message)) => assert!(
-            message.contains("fenced"),
-            "production replicate_write must report C fenced by CAS rejects, got: {message}"
+        Err(DatabaseError::Fenced {
+            required,
+            possible_accepts,
+        }) => assert!(
+            possible_accepts < required,
+            "production replicate_write must report C fenced by CAS rejects (a quorum of \
+             accepts no longer reachable), got required={required} possible_accepts={possible_accepts}"
         ),
         other => {
-            return Err(
-                format!("post-heal C replicate_write must fail (fenced), got {other:?}").into(),
-            );
+            return Err(format!(
+                "post-heal C replicate_write must fail with the typed Fenced, got {other:?}"
+            )
+            .into());
         }
     }
     Ok(())

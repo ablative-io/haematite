@@ -282,13 +282,17 @@ fn assert_g3_stale_owner_is_fenced(
         OP_TIMEOUT,
     );
     match &stale {
-        Err(DatabaseError::ConsistencyError(message)) => assert!(
-            message.contains("fenced"),
-            "G3: the stale owner's divergent append must fail as a FENCE, got: {message}"
+        Err(DatabaseError::Fenced {
+            required,
+            possible_accepts,
+        }) => assert!(
+            possible_accepts < required,
+            "G3: the stale owner's divergent append must fail as a FENCE (quorum of accepts no \
+             longer reachable), got required={required} possible_accepts={possible_accepts}"
         ),
         other => {
             return Err(format!(
-                "G3: the stale owner's append must be fenced (ConsistencyError), NEVER Ok, \
+                "G3: the stale owner's append must be fenced (typed Fenced), NEVER Ok, \
                  got {other:?}"
             )
             .into());

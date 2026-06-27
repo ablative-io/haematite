@@ -144,7 +144,10 @@ impl Drop for Node {
 
 /// Dial `from` -> `to` (one direction) and wait for the link to register.
 fn link(from: &Node, to: &Node) -> TestResult {
-    let endpoint = from.db.distribution().ok_or("dialing node has no endpoint")?;
+    let endpoint = from
+        .db
+        .distribution()
+        .ok_or("dialing node has no endpoint")?;
     endpoint.add_peer(to.name, to.addr);
     endpoint.connect(to.name)?;
     if !wait_until(HANDSHAKE_TIMEOUT, || endpoint.is_connected(to.name)) {
@@ -428,12 +431,12 @@ fn contested_election_loser_is_fenced() -> TestResult {
         // Identify the deposed (lower-ballot) owner and the live (max) owner. The
         // two ballots are strictly ordered (unique (counter,node)).
         assert_ne!(b_out.ballot, c_out.ballot, "two winners share a ballot");
-        let (loser_node, loser_ballot, winner_node, winner_ballot) =
-            if b_out.ballot < c_out.ballot {
-                (&node_b, &b_out.ballot, &node_c, &c_out.ballot)
-            } else {
-                (&node_c, &c_out.ballot, &node_b, &b_out.ballot)
-            };
+        let (loser_node, loser_ballot, winner_node, winner_ballot) = if b_out.ballot < c_out.ballot
+        {
+            (&node_b, &b_out.ballot, &node_c, &c_out.ballot)
+        } else {
+            (&node_c, &c_out.ballot, &node_b, &b_out.ballot)
+        };
         assert!(
             loser_ballot < winner_ballot,
             "the deposed owner's ballot must be strictly below the live owner's: {loser_ballot:?} \
@@ -463,18 +466,19 @@ fn contested_election_loser_is_fenced() -> TestResult {
             b"stale-loser-value".to_vec(),
             None,
             // Send to the two OTHER nodes (the deposed owner's would-be majority).
-            &membership(
-                3,
-                &other_two(loser_node.name),
-            ),
+            &membership(3, &other_two(loser_node.name)),
             OP_TIMEOUT,
         );
         match &loser_write {
-            Err(DatabaseError::ConsistencyError(message)) => assert!(
-                message.contains("fenced"),
-                "the deposed loser's write must fail as a FENCE, got: {message}"
+            Err(DatabaseError::Fenced {
+                required,
+                possible_accepts,
+            }) => assert!(
+                possible_accepts < required,
+                "the deposed loser's write must fail as a FENCE (quorum of accepts no longer \
+                 reachable), got required={required} possible_accepts={possible_accepts}"
             ),
-            other => panic!("deposed loser must be fenced (ConsistencyError), got {other:?}"),
+            other => panic!("deposed loser must be fenced (typed Fenced), got {other:?}"),
         }
 
         // The stale value must NOT have landed on the majority (the other two nodes).

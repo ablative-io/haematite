@@ -101,7 +101,11 @@ struct Node {
 }
 
 impl Node {
-    fn spawn_sharded(name: &'static str, dir: &Path, shard_count: usize) -> Result<Self, Box<dyn Error>> {
+    fn spawn_sharded(
+        name: &'static str,
+        dir: &Path,
+        shard_count: usize,
+    ) -> Result<Self, Box<dyn Error>> {
         let endpoint = DistributionEndpoint::bind(name, loopback()?, 1, None)?;
         let addr = endpoint.local_addr();
         let db = Arc::new(
@@ -142,7 +146,10 @@ impl Drop for Node {
 }
 
 fn link(from: &Node, to: &Node) -> TestResult {
-    let endpoint = from.db.distribution().ok_or("dialing node has no endpoint")?;
+    let endpoint = from
+        .db
+        .distribution()
+        .ok_or("dialing node has no endpoint")?;
     endpoint.add_peer(to.name, to.addr);
     endpoint.connect(to.name)?;
     if !wait_until(HANDSHAKE_TIMEOUT, || endpoint.is_connected(to.name)) {
@@ -400,13 +407,9 @@ fn failover_serves_full_batch() -> TestResult {
         .db
         .acquire_shard_and_serve(SHARD, &membership(3, &[NODE_B, NODE_C]), OP_TIMEOUT)?;
     // Replicate to {B} ONLY: quorum {A,B} reached; C never receives the batch.
-    node_a.db.replicate_append(
-        &stream,
-        &full,
-        0,
-        &membership(3, &[NODE_B]),
-        OP_TIMEOUT,
-    )?;
+    node_a
+        .db
+        .replicate_append(&stream, &full, 0, &membership(3, &[NODE_B]), OP_TIMEOUT)?;
 
     // C lags the WHOLE batch before failover (load-bearing): whatever it serves
     // after becoming live can ONLY have come from the merge pull, not the setup.
@@ -453,13 +456,9 @@ fn bare_acquire_without_merge_lacks_batch() -> TestResult {
         .db
         .acquire_shard_and_serve(SHARD, &membership(3, &[NODE_B, NODE_C]), OP_TIMEOUT)?;
     // Replicate to {B} ONLY: quorum {A,B} reached, C never receives the batch.
-    node_a.db.replicate_append(
-        &stream,
-        &[e1, e2],
-        0,
-        &membership(3, &[NODE_B]),
-        OP_TIMEOUT,
-    )?;
+    node_a
+        .db
+        .replicate_append(&stream, &[e1, e2], 0, &membership(3, &[NODE_B]), OP_TIMEOUT)?;
 
     // C lags the WHOLE batch (load-bearing: it had nothing before failover).
     assert!(
@@ -527,11 +526,15 @@ fn deposed_owner_append_is_fenced() -> TestResult {
         OP_TIMEOUT,
     );
     match &deposed {
-        Err(DatabaseError::ConsistencyError(message)) => assert!(
-            message.contains("fenced"),
-            "the deposed owner's append must fail as a FENCE, got: {message}"
+        Err(DatabaseError::Fenced {
+            required,
+            possible_accepts,
+        }) => assert!(
+            possible_accepts < required,
+            "the deposed owner's append must fail as a FENCE (quorum of accepts no longer \
+             reachable), got required={required} possible_accepts={possible_accepts}"
         ),
-        other => panic!("deposed owner's append must be fenced (ConsistencyError), got {other:?}"),
+        other => panic!("deposed owner's append must be fenced (typed Fenced), got {other:?}"),
     }
 
     // The stale batch's event must NOT have landed on the other two nodes: their
@@ -540,7 +543,9 @@ fn deposed_owner_append_is_fenced() -> TestResult {
     for node in [node_b, node_c] {
         let payloads = read_payloads(node, &stream)?;
         assert!(
-            !payloads.iter().any(|p| p.as_slice() == b"stale-batch-event"),
+            !payloads
+                .iter()
+                .any(|p| p.as_slice() == b"stale-batch-event"),
             "node {} must NOT hold the deposed owner's fenced batch event",
             node.name
         );
