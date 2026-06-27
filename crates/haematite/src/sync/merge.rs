@@ -89,6 +89,24 @@ impl SyncMergeResult {
     }
 }
 
+/// Structural three-way root merge driven by a branch [`ConflictPolicy`].
+///
+/// # DANGER — DO NOT use for run-history heal/sync
+///
+/// With [`ConflictPolicy::Lww`] this engine **silently LWW-DROPS divergent
+/// per-key writes**: when two partitions concurrently write the same key, the
+/// loser of the last-writer-wins comparison is discarded with no error. That is
+/// data loss, and it is the wrong reconciliation semantics for replicated
+/// run-history.
+///
+/// The production heal/sync path MUST use
+/// [`merge_committed_union`](crate::sync::merge_committed_union) instead, which
+/// takes a per-key max-`(epoch, seq)` union and fails loud on duplicate stamps.
+///
+/// This function is retained only because the partition-safety spike tests
+/// (`tests/spike_fencing.rs`) exercise it to demonstrate exactly this footgun.
+/// It is intentionally NOT re-exported from the crate root. Do not wire it into
+/// any sync, heal, or handoff code path.
 pub fn merge_synced_roots<S: NodeStore + ?Sized>(
     store: &mut S,
     shard_id: ShardId,

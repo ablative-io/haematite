@@ -69,8 +69,8 @@ pub use sync::{
     EventualConsistency, InboundSync, NoopSyncPullTrigger, QuorumOutcome, StrongConsistency,
     SyncMergeError, SyncMergeResult, SyncMergeRoots, SyncNodeId, SyncPair, SyncPullTrigger,
     SyncSchedulerConfig, SyncSchedulerError, SyncSchedulerHandle, SyncSchedulerStats, SyncTopology,
-    TopologyError, WriteMembership, execute_with_consistency, merge_synced_roots, quorum_size,
-    wait_for_quorum, wait_for_quorum_from_receiver,
+    TopologyError, WriteMembership, execute_with_consistency, quorum_size, wait_for_quorum,
+    wait_for_quorum_from_receiver,
 };
 
 #[cfg(feature = "wasm-runtime")]
