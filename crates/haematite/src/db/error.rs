@@ -46,11 +46,26 @@ pub enum DatabaseError {
     /// owner and recorded no `owner_epoch`. Carries the highest competing counter
     /// seen so a caller could retry above it later. This is a clean, safe loss —
     /// the unique-ballot / majority invariants were never relaxed.
-    ElectionLost { highest_seen: u64 },
+    ElectionLost {
+        highest_seen: u64,
+    },
     /// An [`crate::db::Database::acquire_shard`] election could not collect a
     /// majority of promises within the timeout on any attempt (e.g. a minority of
     /// nodes was reachable). The candidate is NOT the owner — never a false win.
-    ElectionTimeout { attempts: u32 },
+    ElectionTimeout {
+        attempts: u32,
+    },
+    /// A replicated CAS write was deterministically out-voted by the cluster: a
+    /// stale/deposed owner's proposal collected enough rejects that a quorum of
+    /// accepts is no longer reachable, so the writer is fenced and NOTHING was
+    /// applied (the typed twin of [`crate::ConsistencyError::Fenced`]). Surfaced
+    /// as its own variant — distinct from a generic [`Self::ConsistencyError`]
+    /// string — so a consumer (e.g. an aion shard owner) can match the fence
+    /// directly and re-resolve ownership rather than parsing a Display message.
+    Fenced {
+        required: usize,
+        possible_accepts: usize,
+    },
 }
 
 impl fmt::Display for DatabaseError {
@@ -118,6 +133,13 @@ impl fmt::Display for DatabaseError {
                 formatter,
                 "shard election timed out without a majority after {attempts} attempts"
             ),
+            Self::Fenced {
+                required,
+                possible_accepts,
+            } => write!(
+                formatter,
+                "fenced by CAS rejects: required {required} accepts, only {possible_accepts} still possible"
+            ),
         }
     }
 }
@@ -147,7 +169,8 @@ impl std::error::Error for DatabaseError {
             | Self::Distribution(_)
             | Self::LocalCommitFailed(_)
             | Self::ElectionLost { .. }
-            | Self::ElectionTimeout { .. } => None,
+            | Self::ElectionTimeout { .. }
+            | Self::Fenced { .. } => None,
         }
     }
 }
@@ -155,5 +178,68 @@ impl std::error::Error for DatabaseError {
 impl From<io::Error> for DatabaseError {
     fn from(error: io::Error) -> Self {
         Self::IoError(error)
+    }
+}
+
+impl From<crate::sync::ConsistencyError> for DatabaseError {
+    /// Preserve the deterministic CAS fence as the typed [`Self::Fenced`] so
+    /// consumers can match it; every other consistency failure keeps its existing
+    /// stringified [`Self::ConsistencyError`] form (behaviour unchanged).
+    fn from(error: crate::sync::ConsistencyError) -> Self {
+        match error {
+            crate::sync::ConsistencyError::Fenced {
+                required,
+                possible_accepts,
+            } => Self::Fenced {
+                required,
+                possible_accepts,
+            },
+            other => Self::ConsistencyError(other.to_string()),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::DatabaseError;
+    use crate::sync::ConsistencyError;
+
+    #[test]
+    fn consistency_fence_maps_to_typed_fenced() {
+        let mapped = DatabaseError::from(ConsistencyError::Fenced {
+            required: 3,
+            possible_accepts: 1,
+        });
+        assert!(
+            matches!(
+                mapped,
+                DatabaseError::Fenced {
+                    required: 3,
+                    possible_accepts: 1
+                }
+            ),
+            "the deterministic CAS fence must survive as the typed DatabaseError::Fenced"
+        );
+    }
+
+    #[test]
+    fn other_consistency_failures_stay_stringified() {
+        // A non-fence consistency failure must NOT be misclassified as a fence; it
+        // keeps its existing stringified ConsistencyError form (behaviour unchanged).
+        for error in [
+            ConsistencyError::QuorumUnavailable {
+                required: 2,
+                possible: 1,
+            },
+            ConsistencyError::TransportUnavailable,
+            ConsistencyError::AckFailed,
+        ] {
+            let display = error.to_string();
+            let mapped = DatabaseError::from(error);
+            assert!(
+                matches!(mapped, DatabaseError::ConsistencyError(ref message) if *message == display),
+                "non-fence consistency failures must remain DatabaseError::ConsistencyError"
+            );
+        }
     }
 }

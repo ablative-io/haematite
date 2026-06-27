@@ -27,11 +27,11 @@ use crate::shard::actor::{PromiseState, RecordPromiseOutcome, ShardError};
 use crate::sync::ballot::Ballot;
 use crate::sync::endpoint::{ElectionError, ElectionOutcome, ProposeWrite};
 use crate::sync::membership::WriteMembership;
-use crate::sync::{QuorumOutcome, SyncNodeId};
 use crate::sync::protocol::{
     AckOutcome, BatchWriteAck, BatchWriteEntry, BatchWriteProposal, Nack, Prepare, Promise,
     RejectReason, WriteAck, WriteProposal,
 };
+use crate::sync::{QuorumOutcome, SyncNodeId};
 use crate::tree::Hash;
 
 impl Database {
@@ -124,7 +124,7 @@ impl Database {
                 membership,
                 timeout,
             )
-            .map_err(|error| DatabaseError::ConsistencyError(error.to_string()))?;
+            .map_err(DatabaseError::from)?;
 
         // Step 2: quorum reached — durably persist the proposer's own committed
         // value locally via the SAME conditional-durable apply the receiver runs,
@@ -197,7 +197,7 @@ impl Database {
                 membership,
                 timeout,
             )
-            .map_err(|error| DatabaseError::ConsistencyError(error.to_string()))?;
+            .map_err(DatabaseError::from)?;
 
         // Step 2: quorum reached — durably persist the proposer's own tombstone
         // with the IDENTICAL stamp the cluster accepted.
@@ -304,9 +304,8 @@ impl Database {
             return Ok(expected_seq);
         }
 
-        let entry_count = u64::try_from(payloads.len()).map_err(|_| {
-            DatabaseError::ConsistencyError("too many append entries".to_owned())
-        })?;
+        let entry_count = u64::try_from(payloads.len())
+            .map_err(|_| DatabaseError::ConsistencyError("too many append entries".to_owned()))?;
         let new_seq = expected_seq.checked_add(entry_count).ok_or_else(|| {
             DatabaseError::ConsistencyError("append sequence overflow".to_owned())
         })?;
@@ -362,7 +361,7 @@ impl Database {
 
         endpoint
             .propose_batch_stamped(shard, entries.clone(), stamp.clone(), membership, timeout)
-            .map_err(|error| DatabaseError::ConsistencyError(error.to_string()))?;
+            .map_err(DatabaseError::from)?;
 
         let handle = self
             .handle_for_shard(shard)
@@ -636,12 +635,10 @@ impl Database {
                     committed_root: state.committed_root,
                 })
             }
-            RecordPromiseOutcome::Rejected { promised } => {
-                crate::sync::SyncMessage::Nack(Nack {
-                    shard_id: prepare.shard_id,
-                    promised,
-                })
-            }
+            RecordPromiseOutcome::Rejected { promised } => crate::sync::SyncMessage::Nack(Nack {
+                shard_id: prepare.shard_id,
+                promised,
+            }),
         };
         self.send_sync_message(&origin, &message)
     }
@@ -942,7 +939,10 @@ impl Database {
 /// persisted_max_minted) + 1`. The `+1` makes the next ballot strictly exceed
 /// every counter the shard has ever promised, owned, or minted.
 fn mint_floor(state: &PromiseState) -> u64 {
-    let owner_counter = state.owner_epoch.as_ref().map_or(0, |ballot| ballot.counter);
+    let owner_counter = state
+        .owner_epoch
+        .as_ref()
+        .map_or(0, |ballot| ballot.counter);
     state
         .promised
         .counter

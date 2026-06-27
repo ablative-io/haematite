@@ -273,7 +273,7 @@ fn wait_for_consistency(consistency: ConsistencyMode) -> Result<(), DatabaseErro
 }
 
 fn map_consistency_error(error: &ConsistencyError) -> DatabaseError {
-    DatabaseError::ConsistencyError(error.to_string())
+    DatabaseError::from(error.clone())
 }
 
 #[cfg(test)]
@@ -377,7 +377,10 @@ mod tests {
         assert_eq!(contents.entries()[1].operation_type(), OperationType::Put);
         assert_eq!(contents.entries()[1].key(), key.as_slice());
         let tombstone = contents.entries()[1].value().ok_or("tombstone is a Put")?;
-        assert!(tombstone.starts_with(b"HMSTMP01"), "delete stores a stamped tombstone");
+        assert!(
+            tombstone.starts_with(b"HMSTMP01"),
+            "delete stores a stamped tombstone"
+        );
 
         let reopened = Database::open(&data_dir)?;
         assert_eq!(reopened.get(&key)?, None);
@@ -608,7 +611,10 @@ mod tests {
             }
         }
         let expected: std::collections::BTreeSet<Vec<u8>> = put_keys.iter().cloned().collect();
-        assert_eq!(union, expected, "union of shard ranges must equal live keys");
+        assert_eq!(
+            union, expected,
+            "union of shard ranges must equal live keys"
+        );
         assert!(!union.contains(&deleted), "deleted key must not appear");
 
         // Empty range [k, k) returns empty on every shard.
@@ -664,7 +670,10 @@ mod tests {
         db.commit()?;
 
         // Routed read finds it (routes to route_key's shard).
-        assert_eq!(db.get_routed(&route_key, &physical_key)?, Some(value.clone()));
+        assert_eq!(
+            db.get_routed(&route_key, &physical_key)?,
+            Some(value.clone())
+        );
 
         // A NON-routed get(physical_key) routes to shard_for(physical_key) — a
         // DIFFERENT shard — so it must NOT see the value. This is the proof that
