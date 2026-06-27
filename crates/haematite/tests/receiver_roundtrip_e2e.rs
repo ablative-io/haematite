@@ -109,12 +109,16 @@ fn real_apply_round_trip_commits_and_stores_value() -> TestResult {
             value: b"value".to_vec(),
             ttl: None,
         },
+        0, // shard_id: single-shard tests route to shard 0
         Ballot::bottom(),
         &membership,
         Duration::from_secs(5),
     )?;
 
-    assert!(outcome.reached(), "quorum reached via real apply: {outcome:?}");
+    assert!(
+        outcome.reached(),
+        "quorum reached via real apply: {outcome:?}"
+    );
     assert_eq!(outcome.required, 2);
     assert_eq!(outcome.acknowledged, 2, "local ack + B's real WriteAck");
     assert!(

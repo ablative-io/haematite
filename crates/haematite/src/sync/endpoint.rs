@@ -60,7 +60,8 @@ use crate::tree::Hash;
 use super::protocol::{
     AckOutcome, BatchWriteAck, BatchWriteEntry, BatchWriteProposal, Nack, Prepare, Promise,
     PushResponse, RejectReason, ShardSyncRequest, SyncError, SyncMessage, WriteAck, WriteId,
-    WriteProposal, encode_beamr_sync_frame, register_beamr_sync_handler, send_sync_message_via_beamr,
+    WriteProposal, encode_beamr_sync_frame, register_beamr_sync_handler,
+    send_sync_message_via_beamr,
 };
 
 /// Writer-side correlation registry: in-flight `WriteId` → the channel that the
@@ -139,7 +140,10 @@ pub enum ElectionError {
     Lost { highest_seen: Ballot },
     /// The election could not reach a majority before the deadline and saw no
     /// higher competing ballot (e.g. a minority of nodes was reachable).
-    Timeout { required: usize, promised_votes: usize },
+    Timeout {
+        required: usize,
+        promised_votes: usize,
+    },
     /// A local precondition failed (no transport, blocking call from inside the
     /// runtime, or a quorum-size computation error). Distinct from a clean
     /// election loss — nothing about the cluster's ballots was learned.
@@ -504,14 +508,25 @@ impl DistributionEndpoint {
     pub fn propose_write(
         &self,
         write: ProposeWrite,
+        shard_id: ShardId,
         epoch: Ballot,
         membership: &WriteMembership,
         timeout: Duration,
     ) -> Result<QuorumOutcome<SyncNodeId>, ConsistencyError> {
         // The bare-epoch entry point (2a / 3-3 direct callers) stamps `seq = 0`.
         // The owner-driven path (`Database::replicate_write`) uses
-        // `propose_write_stamped` with the atomic per-epoch `seq` (R-SEQ).
-        self.propose_write_stamped(write, Stamp::new(epoch, 0), false, membership, timeout)
+        // `propose_write_stamped` with the atomic per-epoch `seq` (R-SEQ). The caller
+        // supplies the owning `shard_id` — for a key-routed write that is exactly
+        // `shard_for(&key)`, which is what the receiver previously re-derived, so the
+        // routing stays byte-identical.
+        self.propose_write_stamped(
+            write,
+            shard_id,
+            Stamp::new(epoch, 0),
+            false,
+            membership,
+            timeout,
+        )
     }
 
     /// As [`Self::propose_write`], but carrying the full owner-assigned commit
@@ -522,6 +537,7 @@ impl DistributionEndpoint {
     pub fn propose_write_stamped(
         &self,
         write: ProposeWrite,
+        shard_id: ShardId,
         stamp: Stamp,
         tombstone: bool,
         membership: &WriteMembership,
@@ -563,6 +579,7 @@ impl DistributionEndpoint {
             .clone();
         let proposal = WriteProposal {
             write_id,
+            shard_id,
             key,
             expected,
             value,
@@ -1141,7 +1158,11 @@ fn register_inbound_drain(
             // contrast, is a REQUEST to act as an acceptor — it flows to the generic
             // drain so the responder loop applies it via `handle_inbound_prepare`.
             Ok(SyncMessage::Promise(promise)) => {
-                route_election_vote(&elections, promise.shard_id, ElectionVote::Promised(promise));
+                route_election_vote(
+                    &elections,
+                    promise.shard_id,
+                    ElectionVote::Promised(promise),
+                );
             }
             Ok(SyncMessage::Nack(nack)) => {
                 route_election_vote(&elections, nack.shard_id, ElectionVote::Nacked(nack));

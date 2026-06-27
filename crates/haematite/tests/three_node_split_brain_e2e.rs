@@ -207,6 +207,7 @@ fn assert_post_heal_c_fenced(node_c: &Node, key: &[u8], value_c: &[u8]) -> TestR
             value: value_c.to_vec(),
             ttl: None,
         },
+        0, // shard_id: single-shard tests route to shard 0
         Ballot::bottom(),
         &membership(3, &[NODE_A, NODE_B]),
         QUORUM_TIMEOUT,
@@ -245,7 +246,9 @@ fn assert_post_heal_c_fenced(node_c: &Node, key: &[u8], value_c: &[u8]) -> TestR
             "production replicate_write must report C fenced by CAS rejects, got: {message}"
         ),
         other => {
-            return Err(format!("post-heal C replicate_write must fail (fenced), got {other:?}").into());
+            return Err(
+                format!("post-heal C replicate_write must fail (fenced), got {other:?}").into(),
+            );
         }
     }
     Ok(())
@@ -368,17 +371,22 @@ fn minority_is_fenced_without_reachable_peers() -> TestResult {
 
     // The structured fence shape: directly drive the quorum primitive to prove C
     // counts ONLY its local ack (1) against required 2 — it cannot self-quorum.
-    let direct = node_c.db.distribution().ok_or("C has no endpoint")?.propose_write(
-        ProposeWrite {
-            key: key.clone(),
-            expected: None,
-            value,
-            ttl: None,
-        },
-        Ballot::bottom(),
-        &membership(3, &[]),
-        FENCE_TIMEOUT,
-    );
+    let direct = node_c
+        .db
+        .distribution()
+        .ok_or("C has no endpoint")?
+        .propose_write(
+            ProposeWrite {
+                key: key.clone(),
+                expected: None,
+                value,
+                ttl: None,
+            },
+            0, // shard_id: single-shard tests route to shard 0
+            Ballot::bottom(),
+            &membership(3, &[]),
+            FENCE_TIMEOUT,
+        );
     match direct {
         Err(ConsistencyError::QuorumTimeout {
             required,
@@ -386,9 +394,14 @@ fn minority_is_fenced_without_reachable_peers() -> TestResult {
             ..
         }) => {
             assert_eq!(required, 2, "quorum over 3 is 2");
-            assert_eq!(acknowledged, 1, "only C's own local ack — cannot self-quorum");
+            assert_eq!(
+                acknowledged, 1,
+                "only C's own local ack — cannot self-quorum"
+            );
         }
-        other => return Err(format!("minority must be fenced via QuorumTimeout, got {other:?}").into()),
+        other => {
+            return Err(format!("minority must be fenced via QuorumTimeout, got {other:?}").into());
+        }
     }
 
     // The write did not commit anywhere: no peer applied it (none reachable) and
@@ -464,7 +477,10 @@ fn heal_mid_write_exactly_one_side_acquires() -> TestResult {
         "majority {{A,B}} must commit the create: {ab_outcome:?}"
     );
     assert_eq!(ab_outcome.required, 2);
-    assert!(ab_outcome.acknowledged >= 2, "A local + B Applied: {ab_outcome:?}");
+    assert!(
+        ab_outcome.acknowledged >= 2,
+        "A local + B Applied: {ab_outcome:?}"
+    );
 
     // BOTH A and B durably hold the winning value: A committed it locally, B's
     // responder applied it. This is what makes the post-heal CAS fence work — every
@@ -474,26 +490,38 @@ fn heal_mid_write_exactly_one_side_acquires() -> TestResult {
         Some(value_ab.clone()),
         "A must durably hold its own committed k = \"from-AB\""
     );
-    let b_has_winner = wait_until(QUORUM_TIMEOUT, || {
-        matches!(node_b.db.get(&key), Ok(Some(ref v)) if v == &value_ab)
-    });
-    assert!(b_has_winner, "B must durably hold k = \"from-AB\" after the majority commit");
+    let b_has_winner = wait_until(
+        QUORUM_TIMEOUT,
+        || matches!(node_b.db.get(&key), Ok(Some(ref v)) if v == &value_ab),
+    );
+    assert!(
+        b_has_winner,
+        "B must durably hold k = \"from-AB\" after the majority commit"
+    );
 
     // --- Minority C (still partitioned): proposes the conflicting create. -----
     // C starts from k absent on ITS copy and has no reachable peers -> fenced.
-    let c_fenced_pre_heal = node_c.db.distribution().ok_or("C has no endpoint")?.propose_write(
-        ProposeWrite {
-            key: key.clone(),
-            expected: None,
-            value: value_c.clone(),
-            ttl: None,
-        },
-        Ballot::bottom(),
-        &membership(3, &[]),
-        FENCE_TIMEOUT,
-    );
+    let c_fenced_pre_heal = node_c
+        .db
+        .distribution()
+        .ok_or("C has no endpoint")?
+        .propose_write(
+            ProposeWrite {
+                key: key.clone(),
+                expected: None,
+                value: value_c.clone(),
+                ttl: None,
+            },
+            0, // shard_id: single-shard tests route to shard 0
+            Ballot::bottom(),
+            &membership(3, &[]),
+            FENCE_TIMEOUT,
+        );
     assert!(
-        matches!(c_fenced_pre_heal, Err(ConsistencyError::QuorumTimeout { .. })),
+        matches!(
+            c_fenced_pre_heal,
+            Err(ConsistencyError::QuorumTimeout { .. })
+        ),
         "isolated C must be fenced pre-heal (QuorumTimeout), got {c_fenced_pre_heal:?}"
     );
 

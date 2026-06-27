@@ -127,6 +127,7 @@ pub fn encode_sync_message(message: &SyncMessage) -> Result<Vec<u8>, SyncError> 
         SyncMessage::WriteProposal(proposal) => {
             bytes.push(MESSAGE_WRITE_PROPOSAL);
             append_write_id(&mut bytes, &proposal.write_id);
+            append_shard_id(&mut bytes, proposal.shard_id);
             append_len_prefixed_bytes(&mut bytes, &proposal.key);
             append_optional_hash(&mut bytes, proposal.expected);
             append_len_prefixed_bytes(&mut bytes, &proposal.value);
@@ -227,6 +228,7 @@ pub fn decode_sync_message(bytes: &[u8]) -> Result<SyncMessage, SyncError> {
         }),
         MESSAGE_WRITE_PROPOSAL => SyncMessage::WriteProposal(WriteProposal {
             write_id: cursor.read_write_id()?,
+            shard_id: cursor.read_shard_id()?,
             key: cursor.read_len_prefixed_bytes()?,
             expected: cursor.read_optional_hash()?,
             value: cursor.read_len_prefixed_bytes()?,

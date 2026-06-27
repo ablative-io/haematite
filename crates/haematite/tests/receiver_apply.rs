@@ -14,9 +14,9 @@
 use std::error::Error;
 use std::path::Path;
 
+use haematite::sync::SyncNodeId;
 use haematite::sync::ballot::Ballot;
 use haematite::sync::protocol::{AckOutcome, RejectReason, WriteId, WriteProposal};
-use haematite::sync::SyncNodeId;
 use haematite::tree::Hash;
 use haematite::wal::DurableWal;
 use haematite::{Database, DatabaseConfig};
@@ -41,6 +41,9 @@ fn wal_path(data_dir: &Path, shard_id: usize) -> std::path::PathBuf {
 fn proposal(key: &[u8], expected: Option<Hash>, value: &[u8]) -> WriteProposal {
     WriteProposal {
         write_id: WriteId::new(SyncNodeId::from("node-a@127.0.0.1"), 1, 0),
+        // These receiver tests run a single-shard database, so every key routes to
+        // shard 0; the receiver now routes the proposal by this explicit `shard_id`.
+        shard_id: 0,
         key: key.to_vec(),
         expected,
         value: value.to_vec(),

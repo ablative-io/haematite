@@ -319,6 +319,7 @@ fn write_proposal_round_trips_across_field_variations() -> Result<(), Box<dyn st
         // empty value, no precondition, no ttl, BOTTOM epoch (un-elected 2a case)
         WriteProposal {
             write_id: write_id.clone(),
+            shard_id: 0,
             key: b"k".to_vec(),
             expected: None,
             value: Vec::new(),
@@ -327,9 +328,14 @@ fn write_proposal_round_trips_across_field_variations() -> Result<(), Box<dyn st
             seq: 0,
             tombstone: false,
         },
-        // expected Some + ttl Some + a REAL epoch with a multi-byte node tiebreak
+        // expected Some + ttl Some + a REAL epoch with a multi-byte node tiebreak,
+        // and a non-zero `shard_id` so the round-trip proves the shard survives the
+        // wire — a routed stamped write (durable timer) co-locates a key on a
+        // DIFFERENT shard than its bytes hash to, so a shard_id decode regression
+        // would silently mis-route it.
         WriteProposal {
             write_id: write_id.clone(),
+            shard_id: 7,
             key: b"another/key".to_vec(),
             expected: Some(expected),
             value: b"hello world".to_vec(),
@@ -340,9 +346,10 @@ fn write_proposal_round_trips_across_field_variations() -> Result<(), Box<dyn st
             tombstone: true,
         },
         // large value + a high-counter epoch (exercises the full u64 counter) + a
-        // high seq (exercises the full u64 seq field)
+        // high seq (exercises the full u64 seq field) + a max `shard_id` (full usize)
         WriteProposal {
             write_id,
+            shard_id: usize::MAX,
             key: Vec::new(),
             expected: Some(expected),
             value: vec![0xAB; 64 * 1024],
@@ -558,6 +565,7 @@ fn truncated_batch_write_messages_decode_to_clean_error() -> Result<(), Box<dyn 
 fn truncated_write_messages_decode_to_clean_error() -> Result<(), Box<dyn std::error::Error>> {
     let proposal = SyncMessage::WriteProposal(WriteProposal {
         write_id: WriteId::new("origin", 3, 1),
+        shard_id: 2,
         key: b"key".to_vec(),
         expected: None,
         value: b"value".to_vec(),
@@ -603,6 +611,7 @@ fn denormalized_duration_nanos_decode_to_error() -> Result<(), Box<dyn std::erro
     // write_id; then key, expected=None, value, ttl flag=1, secs, nanos, epoch.
     let message = SyncMessage::WriteProposal(WriteProposal {
         write_id: WriteId::new("origin", 0, 0),
+        shard_id: 0,
         key: Vec::new(),
         expected: None,
         value: Vec::new(),
@@ -634,6 +643,7 @@ fn write_proposal_epoch_field_truncation_is_clean_error() -> Result<(), Box<dyn 
     // truncation from the start of the epoch field to the end of the frame.
     let proposal = WriteProposal {
         write_id: WriteId::new("origin", 4, 11),
+        shard_id: 3,
         key: b"shard-key".to_vec(),
         expected: None,
         value: b"v".to_vec(),

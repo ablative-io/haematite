@@ -304,6 +304,15 @@ pub enum AckOutcome {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WriteProposal {
     pub write_id: WriteId,
+    /// The explicit owning shard for this write (mirrors
+    /// [`BatchWriteProposal::shard_id`]). A bare single-key proposal would route by
+    /// hashing its `key`, but a ROUTED stamped write (the durable-timer primitive,
+    /// `Database::replicate_write_routed`) co-locates a physical `key` on a
+    /// DIFFERENT key's shard, so the shard is named directly here and the receiver
+    /// routes by `shard_id` rather than re-deriving it from `key`. For the ordinary
+    /// (non-routed) caller this is exactly `shard_for(&key)`, so the on-disk routing
+    /// is byte-identical to the pre-`shard_id` behaviour.
+    pub shard_id: ShardId,
     pub key: KvKey,
     /// CAS precondition: the prior value hash (`None` means create-if-absent).
     pub expected: Option<Hash>,

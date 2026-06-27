@@ -119,6 +119,7 @@ impl Database {
                     value: value.clone(),
                     ttl,
                 },
+                shard,
                 stamp.clone(),
                 false,
                 membership,
@@ -141,6 +142,93 @@ impl Database {
             // raced this key locally — impossible under single-owner-per-key — so a
             // mismatch signals a violated invariant just as an IO fault signals a
             // storage failure; both are a failed durable local commit.
+            Err(error) => Err(DatabaseError::LocalCommitFailed(error.to_string())),
+        }
+    }
+
+    /// Coordinate one Strong CAS write to quorum AND durably apply it locally,
+    /// but ROUTED onto `route_key`'s shard while writing the physical `key` — the
+    /// stamped, quorum-replicated analogue of
+    /// [`put_routed`](crate::api::kv::KvStore::put_routed).
+    ///
+    /// [`Self::replicate_write`] routes a single key by hashing that same key. A few
+    /// callers (notably aion's durable timers) must persist a physical `key` whose
+    /// bytes hash to a DIFFERENT shard than the workflow it belongs to, yet keep it
+    /// CO-LOCATED on the workflow's shard so it travels with that shard on adoption /
+    /// handoff and is decoded as a stamped entry by the union merge. This method does
+    /// exactly that: it derives the owning `shard = shard_for(route_key)`, stamps that
+    /// `shard` onto the [`WriteProposal`] (so every replica routes the physical
+    /// `write.key` to the SAME shard), and applies the proposer's own committed value
+    /// locally via `handle_for_shard(shard)`. The stamp, fence, quorum tally,
+    /// local-commit sequencing, and error mapping are IDENTICAL to
+    /// [`Self::replicate_write`]; only the routing key differs from the physical key.
+    /// The physical write (key + CAS `expected` + value + ttl) is grouped as a
+    /// [`ProposeWrite`], the same payload bundle the endpoint coordinator takes.
+    ///
+    /// There is intentionally no routed stamped DELETE: timers never delete (they
+    /// clear by overwrite or by a `TimerFired` value), so a routed tombstone has no
+    /// caller.
+    ///
+    /// # Errors
+    /// As [`Self::replicate_write`]: [`DatabaseError::ConsistencyError`] when the
+    /// write does not reach quorum (fenced / timed out / transport), or
+    /// [`DatabaseError::LocalCommitFailed`] when quorum was reached but the local
+    /// durable commit failed.
+    pub fn replicate_write_routed(
+        &self,
+        route_key: &[u8],
+        write: ProposeWrite,
+        membership: &WriteMembership,
+        timeout: Duration,
+    ) -> Result<QuorumOutcome<SyncNodeId>, DatabaseError> {
+        let endpoint = self.distribution().ok_or_else(|| {
+            DatabaseError::Distribution(
+                "no distribution endpoint for replicate_write_routed".to_owned(),
+            )
+        })?;
+
+        // The owning shard is derived from `route_key` (the workflow's stream key),
+        // NOT the physical `write.key` — that co-location is the whole point. The
+        // stamp is drawn from THIS shard's serve-authority, exactly as
+        // `replicate_write`.
+        let shard = self.shard_for(route_key);
+        let stamp = self.owner_stamps.next_stamp(shard);
+
+        // The local durable apply (step 2) needs the physical write's fields again
+        // after they are moved into the proposal, so capture them here.
+        let ProposeWrite {
+            key,
+            expected,
+            value,
+            ttl,
+        } = write;
+
+        // Step 1: drive the write to peer-quorum, stamping the explicit `shard` so
+        // every receiver routes the physical `key` to `route_key`'s shard.
+        let outcome = endpoint
+            .propose_write_stamped(
+                ProposeWrite {
+                    key: key.clone(),
+                    expected,
+                    value: value.clone(),
+                    ttl,
+                },
+                shard,
+                stamp.clone(),
+                false,
+                membership,
+                timeout,
+            )
+            .map_err(DatabaseError::from)?;
+
+        // Step 2: quorum reached — durably apply the proposer's own copy locally on
+        // `route_key`'s shard (by index, not by hashing the physical key) with the
+        // IDENTICAL stamp the cluster accepted.
+        let handle = self
+            .handle_for_shard(shard)
+            .map_err(|error| DatabaseError::LocalCommitFailed(error.to_string()))?;
+        match handle.apply_durable(key, expected, value, ttl, stamp, self.timeout()) {
+            Ok(()) => Ok(outcome),
             Err(error) => Err(DatabaseError::LocalCommitFailed(error.to_string())),
         }
     }
@@ -192,6 +280,7 @@ impl Database {
                     value: Vec::new(),
                     ttl: None,
                 },
+                shard,
                 stamp.clone(),
                 true,
                 membership,
@@ -433,7 +522,13 @@ impl Database {
     /// Run the conditional-durable apply against the owning shard and classify the
     /// result into an [`AckOutcome`].
     fn apply_proposal_durably(&self, proposal: &WriteProposal) -> AckOutcome {
-        let handle = match self.handle_for(&proposal.key) {
+        // Route by the proposal's EXPLICIT `shard_id` (mirrors the batch path),
+        // not by re-hashing `proposal.key`. For a key-routed write the proposer set
+        // `shard_id = shard_for(&key)`, so this is the same handle the old
+        // `handle_for(&proposal.key)` produced (byte-identical); for a ROUTED stamped
+        // write (durable timer) the physical key lives on a DIFFERENT key's shard,
+        // and only `shard_id` names it correctly.
+        let handle = match self.handle_for_shard(proposal.shard_id) {
             Ok(handle) => handle,
             Err(_error) => return AckOutcome::Rejected(RejectReason::ApplyError),
         };

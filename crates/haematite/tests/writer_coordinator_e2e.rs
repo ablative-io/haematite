@@ -16,8 +16,8 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use haematite::sync::consistency::ConsistencyError;
 use haematite::sync::ballot::Ballot;
+use haematite::sync::consistency::ConsistencyError;
 use haematite::sync::membership::WriteMembership;
 use haematite::sync::{
     AckOutcome, DistributionEndpoint, ProposeWrite, SyncMessage, SyncNodeId, WriteAck,
@@ -136,6 +136,7 @@ fn reaches_quorum_via_real_two_endpoint_ack() -> TestResult {
             value: b"v".to_vec(),
             ttl: None,
         },
+        0, // shard_id: single-shard tests route to shard 0
         Ballot::bottom(),
         &membership,
         Duration::from_secs(5),
@@ -145,7 +146,9 @@ fn reaches_quorum_via_real_two_endpoint_ack() -> TestResult {
     assert_eq!(outcome.required, 2);
     assert_eq!(outcome.acknowledged, 2, "local ack + B's WriteAck");
     assert!(
-        outcome.acknowledged_nodes.contains(&SyncNodeId::from(NODE_B)),
+        outcome
+            .acknowledged_nodes
+            .contains(&SyncNodeId::from(NODE_B)),
         "B is recorded as an acker"
     );
 
@@ -194,6 +197,7 @@ fn duplicate_write_ack_deduped() -> TestResult {
             value: b"v".to_vec(),
             ttl: None,
         },
+        0, // shard_id: single-shard tests route to shard 0
         Ballot::bottom(),
         &membership,
         Duration::from_secs(5),
@@ -256,6 +260,7 @@ fn late_ack_after_quorum_dropped() -> TestResult {
             value: b"v".to_vec(),
             ttl: None,
         },
+        0, // shard_id: single-shard tests route to shard 0
         Ballot::bottom(),
         &membership,
         Duration::from_secs(5),
@@ -290,11 +295,15 @@ fn late_ack_after_quorum_dropped() -> TestResult {
             value: b"v2".to_vec(),
             ttl: None,
         },
+        0, // shard_id: single-shard tests route to shard 0
         Ballot::bottom(),
         &membership,
         Duration::from_secs(5),
     )?;
-    assert!(outcome2.reached(), "writer healthy after a dropped late ack");
+    assert!(
+        outcome2.reached(),
+        "writer healthy after a dropped late ack"
+    );
     stub2.join().map_err(|_| "stub thread panicked")?;
     Ok(())
 }
@@ -346,6 +355,7 @@ fn restart_reuse_ack_rejected_fix_d() -> TestResult {
             value: b"v".to_vec(),
             ttl: None,
         },
+        0, // shard_id: single-shard tests route to shard 0
         Ballot::bottom(),
         &membership,
         Duration::from_millis(800),
@@ -387,6 +397,7 @@ async fn propose_write_from_async_context_errors_not_panics() -> TestResult {
             value: b"v".to_vec(),
             ttl: None,
         },
+        0, // shard_id: single-shard tests route to shard 0
         Ballot::bottom(),
         &membership,
         Duration::from_millis(100),
