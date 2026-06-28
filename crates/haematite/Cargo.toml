@@ -39,7 +39,7 @@ serde_json = "1"
 # Native-only dependencies. Excluded from the wasm32-unknown-unknown build so
 # that no native-only code (DiskStore, durable WAL, the actor runtime) leaks in.
 [target.'cfg(not(all(target_arch = "wasm32", target_os = "unknown")))'.dependencies]
-beamr = "0.10.0"
+beamr = "0.11.0"
 blake3 = "1"
 dashmap = "6.2.1"
 tempfile = "3"
@@ -50,7 +50,7 @@ zstd = "0.13"
 # a pure-Rust zstd implementation (the C-backed zstd crate cannot target
 # wasm32-unknown-unknown), and the wasm bindings drive IndexedDB and beamr-wasm.
 [target.'cfg(all(target_arch = "wasm32", target_os = "unknown"))'.dependencies]
-beamr-wasm = { version = "0.4.1", optional = true }
+beamr-wasm = { version = "0.5.0", optional = true }
 blake3 = { version = "1", default-features = false, features = ["pure"] }
 indexed_db_futures = { version = "0.6.4", default-features = false, features = [
     "typed-arrays",
