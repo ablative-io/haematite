@@ -8,9 +8,11 @@ use crate::wal::{LookupResult, WalBuffer};
 
 use super::registry::BranchRegistryGuard;
 
-/// Shard identifier used by the branch handle until the shard router defines a
-/// crate-wide type.
-pub type ShardId = usize;
+/// Shard identifier used by the branch handle.
+///
+/// Re-exported from the platform-neutral [`crate::ids`] module so the wasm sync
+/// codec and the native branch layer share one identical type.
+pub use crate::ids::ShardId;
 
 /// The shard used by the single-shard fork helpers.
 pub const DEFAULT_SHARD_ID: ShardId = 0;

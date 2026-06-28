@@ -1,4 +1,3 @@
-pub mod ballot;
 pub mod consistency;
 pub mod endpoint;
 pub mod handoff_merge;
@@ -9,8 +8,10 @@ pub mod pull;
 pub mod push;
 pub mod scheduler;
 pub mod topology;
+pub mod transport_glue;
 
-pub use ballot::{Ballot, Stamp};
+pub use crate::sync_codec::ballot;
+pub use crate::sync_codec::ballot::{Ballot, Stamp};
 pub use consistency::{
     Ack, CasVote, ConsistencyError, ConsistencyMode, EventualConsistency, QuorumOutcome,
     StrongConsistency, execute_with_consistency, quorum_size, wait_for_cas_quorum,
@@ -34,8 +35,8 @@ pub use protocol::{
     send_promise_via_beamr, send_pull_request_via_beamr, send_push_response_via_beamr,
     send_root_exchange_request_via_beamr, send_root_exchange_response_via_beamr,
     send_shard_sync_request_via_beamr, send_sync_message_via_beamr,
-    send_target_node_request_via_beamr, send_target_node_response_via_beamr, send_write_ack_via_beamr,
-    send_write_proposal_via_beamr,
+    send_target_node_request_via_beamr, send_target_node_response_via_beamr,
+    send_write_ack_via_beamr, send_write_proposal_via_beamr,
 };
 pub use pull::{
     PullResult, apply_push_response, apply_push_response_prefix, create_pull_request,

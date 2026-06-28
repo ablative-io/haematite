@@ -24,10 +24,10 @@ use crate::sync::{
 use crate::tree::Hash;
 
 /// Key bytes used by the general KV API.
-pub type KvKey = Vec<u8>;
-
-/// Value bytes used by the general KV API.
-pub type KvValue = Vec<u8>;
+///
+/// Re-exported from the platform-neutral [`crate::ids`] module so the wasm sync
+/// codec and the native KV API share one identical type.
+pub use crate::ids::{KvKey, KvValue};
 
 /// One key-value pair returned by [`Database::range`].
 pub type KvEntry = (KvKey, KvValue);

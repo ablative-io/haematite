@@ -1,6 +1,10 @@
+pub mod ids;
 pub mod store;
+pub mod sync_codec;
 pub mod tree;
 pub mod wal;
+
+pub use ids::{KvKey, KvValue, ShardId};
 
 // Native-only modules. These pull in the actor runtime (beamr/tokio), the
 // distribution layer, and filesystem persistence, none of which target
@@ -52,15 +56,15 @@ pub use wal::{DurableWal, FsyncPolicy, RecoveredWal, WalFileContents, WalRecover
 pub use branch::{
     BranchError, BranchHandle, BranchRegistry, BranchWalBuffer, CheckoutError, CommitLog,
     CommitLogEntry, ConflictError, ConflictInput, ConflictPolicy, CustomMergeFn, MergeConflict,
-    MergeError, MergeReport, PruneError, PruneReport, ReadOnlyView, ShardId, SnapshotEntry,
-    SnapshotError, SnapshotRegistry, Timestamp, checkout, current_timestamp, fork, fork_registered,
-    fork_shards, fork_shards_registered, merge, merge_with_report, prune,
+    MergeError, MergeReport, PruneError, PruneReport, ReadOnlyView, SnapshotEntry, SnapshotError,
+    SnapshotRegistry, Timestamp, checkout, current_timestamp, fork, fork_registered, fork_shards,
+    fork_shards_registered, merge, merge_with_report, prune,
 };
 
 #[cfg(not(feature = "wasm"))]
 pub use api::{
-    ApiError, CasMismatch, Event, EventStore, KvEntry, KvKey, KvRange, KvValue, ScanResult,
-    SequenceConflict, ShardRoots, StreamMeta, decode_stream_key, encode_stream_key,
+    ApiError, CasMismatch, Event, EventStore, KvEntry, KvRange, ScanResult, SequenceConflict,
+    ShardRoots, StreamMeta, decode_stream_key, encode_stream_key,
 };
 
 #[cfg(not(feature = "wasm"))]

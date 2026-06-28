@@ -14,7 +14,7 @@
 //! `counter` is compared first and `node` only breaks ties. This ordering is
 //! pinned by [`tests`] so a field reorder can never silently invert it.
 
-use crate::sync::topology::SyncNodeId;
+use crate::sync_codec::ids::SyncNodeId;
 
 /// A unique, monotonic election ballot = the per-shard epoch (§2.1).
 ///
@@ -94,7 +94,7 @@ impl Stamp {
 #[cfg(test)]
 mod tests {
     use super::Ballot;
-    use crate::sync::topology::SyncNodeId;
+    use crate::sync_codec::ids::SyncNodeId;
 
     fn ballot(counter: u64, node: &str) -> Ballot {
         Ballot::new(counter, SyncNodeId::from(node))

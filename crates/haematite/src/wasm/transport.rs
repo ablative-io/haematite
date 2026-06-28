@@ -311,16 +311,18 @@ mod socket {
 
 #[cfg(test)]
 mod tests {
-    //! Native parity tests (R2). They prove the WebSocket carrier preserves the
-    //! shared sync codec's frames byte-for-byte: a message encoded by
-    //! [`crate::sync::encode_beamr_sync_frame`] survives the carrier's outbound
-    //! and inbound frame handling unchanged and decodes back to an identical
-    //! [`crate::sync::SyncMessage`]. No WebSocket is involved — the carrier's
-    //! frame functions ARE the parity surface, and they run on the native host.
+    //! Parity tests (R2). They prove the WebSocket carrier preserves the shared
+    //! sync codec's frames byte-for-byte: a message encoded by
+    //! [`crate::sync_codec::encode_beamr_sync_frame`] survives the carrier's
+    //! outbound and inbound frame handling unchanged and decodes back to an
+    //! identical [`crate::sync_codec::SyncMessage`]. No WebSocket is involved — the
+    //! carrier's frame functions ARE the parity surface. They import the codec from
+    //! the ungated `crate::sync_codec` so they compile and run on BOTH the native
+    //! host and the wasm target.
 
     use super::frame;
-    use crate::sync::ballot::Ballot;
-    use crate::sync::{
+    use crate::sync_codec::ballot::Ballot;
+    use crate::sync_codec::{
         NodeTransfer, PullRequest, PushResponse, RootExchangeRequest, SyncMessage, SyncStats,
         WriteId, WriteProposal, decode_beamr_sync_frame, encode_beamr_sync_frame,
     };

@@ -1,6 +1,6 @@
 use std::fmt;
 
-use crate::branch::ShardId;
+use crate::ids::ShardId;
 use crate::tree::Hash;
 
 /// Errors raised by the hash-based sync protocol.
