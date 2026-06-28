@@ -10,6 +10,12 @@ mod scan;
 mod startup;
 mod stream_index;
 
+// WR-9a: cooperative-scheduler shard smoke. A child of `shard::actor` so it can
+// reach the `pub(super)` factory + command-queue seams the threaded `ShardHandle`
+// uses, and drive the REAL shard `NativeHandler` on `beamr::scheduler::WasmScheduler`.
+#[cfg(test)]
+mod coop_smoke;
+
 use errors::{AppendError, CasError, HashCasError};
 
 pub use handle::{RangeItem, ShardError, ShardHandle};
