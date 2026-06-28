@@ -19,6 +19,7 @@ pub mod ids;
 pub mod message;
 pub mod missing;
 pub mod target;
+pub mod wire;
 
 pub use ballot::{Ballot, Stamp};
 pub use error::SyncError;
@@ -31,3 +32,7 @@ pub use message::{
 };
 pub use missing::find_missing_nodes;
 pub use target::{TargetNodeReader, TargetNodeRequest, TargetNodeResponse, TargetNodeSummary};
+pub use wire::{
+    SyncMessage, decode_beamr_sync_frame, decode_sync_message, encode_beamr_sync_frame,
+    encode_sync_message,
+};

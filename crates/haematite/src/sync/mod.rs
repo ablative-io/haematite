@@ -8,6 +8,7 @@ pub mod pull;
 pub mod push;
 pub mod scheduler;
 pub mod topology;
+pub mod transport_glue;
 
 pub use crate::sync_codec::ballot;
 pub use crate::sync_codec::ballot::{Ballot, Stamp};

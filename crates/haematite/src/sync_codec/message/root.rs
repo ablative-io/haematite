@@ -62,6 +62,10 @@ impl SyncStats {
         self.bytes_transferred = self.bytes_transferred.saturating_add(byte_len);
     }
 
+    /// Native-only helper: the sync `pull` path zeroes the transfer counts when it
+    /// has already applied them locally. The wasm codec never calls it, so it is
+    /// gated out of the wasm build to keep that target warning-clean.
+    #[cfg(not(feature = "wasm"))]
     #[must_use]
     pub(crate) const fn without_transfer_counts(self) -> Self {
         Self {
