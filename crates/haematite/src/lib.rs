@@ -18,7 +18,12 @@ pub mod sync;
 #[cfg(not(feature = "wasm"))]
 pub mod ttl;
 
-#[cfg(feature = "wasm")]
+// The `wasm` module is declared on every target so the browser transport's
+// platform-neutral frame core and its native sync-codec parity tests (WASM-003)
+// compile and run under `cargo test --lib`. The browser-only submodules
+// (`detect`, `runtime`) and the `web_sys::WebSocket` carrier inside `transport`
+// stay behind `wasm`/`wasm32` cfg gates, so no web-sys leaks into the native
+// build.
 pub mod wasm;
 
 mod error;
