@@ -1,5 +1,6 @@
 pub mod ids;
 pub mod store;
+pub mod sync_codec;
 pub mod tree;
 pub mod wal;
 

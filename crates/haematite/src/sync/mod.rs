@@ -1,4 +1,3 @@
-pub mod ballot;
 pub mod consistency;
 pub mod endpoint;
 pub mod handoff_merge;
@@ -10,7 +9,8 @@ pub mod push;
 pub mod scheduler;
 pub mod topology;
 
-pub use ballot::{Ballot, Stamp};
+pub use crate::sync_codec::ballot;
+pub use crate::sync_codec::ballot::{Ballot, Stamp};
 pub use consistency::{
     Ack, CasVote, ConsistencyError, ConsistencyMode, EventualConsistency, QuorumOutcome,
     StrongConsistency, execute_with_consistency, quorum_size, wait_for_cas_quorum,
