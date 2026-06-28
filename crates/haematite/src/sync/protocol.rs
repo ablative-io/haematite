@@ -5,11 +5,8 @@
 //! [`crate::sync_codec`] module so they compile on wasm. The native-only beamr
 //! transport glue (`send_*_via_beamr`, `register_beamr_sync_handler`) lives in
 //! [`crate::sync::transport_glue`]. This module keeps every
-//! `crate::sync::protocol::*` path stable by re-exporting both.
-
-#[cfg(test)]
-#[path = "protocol/tests.rs"]
-mod tests;
+//! `crate::sync::protocol::*` path stable by re-exporting both. The codec parity
+//! tests now live in `crate::sync_codec::tests` so they run on both targets.
 
 pub use crate::sync::transport_glue::{
     register_beamr_sync_handler, send_batch_write_ack_via_beamr,

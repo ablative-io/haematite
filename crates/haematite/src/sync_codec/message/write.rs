@@ -2,8 +2,8 @@
 
 use std::time::Duration;
 
-use crate::ids::{KvKey, KvValue};
 use crate::ids::ShardId;
+use crate::ids::{KvKey, KvValue};
 use crate::sync_codec::ballot::{Ballot, Stamp};
 use crate::sync_codec::ids::SyncNodeId;
 use crate::tree::Hash;

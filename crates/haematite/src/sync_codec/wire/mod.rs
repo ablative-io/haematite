@@ -31,10 +31,6 @@ use crate::sync_codec::message::{
 };
 use crate::sync_codec::target::{TargetNodeRequest, TargetNodeResponse};
 
-// `encode_push_response` and `wrap_beamr_sync_frame` are codec-internal helpers
-// used only inside `encode`; only `encode_beamr_push_response_frame` crosses to
-// the native transport glue. Re-export just what leaves the codec.
-
 pub(crate) const SYNC_CONTROL_FRAME: &[u8] = b"haematite.sync.v1";
 pub(crate) const SYNC_PROTOCOL_VERSION: u8 = 1;
 

@@ -21,6 +21,9 @@ pub mod missing;
 pub mod target;
 pub mod wire;
 
+#[cfg(test)]
+mod tests;
+
 pub use ballot::{Ballot, Stamp};
 pub use error::SyncError;
 pub use ids::SyncNodeId;

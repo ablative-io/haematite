@@ -23,7 +23,7 @@ use super::{
 /// smaller of `count` and the maximum number of `min_element_bytes`-sized
 /// elements that could physically fit in `remaining`; the decode loop still
 /// grows the Vec normally if the genuine count exceeds the clamp.
-pub(crate) fn clamp_capacity(count: usize, remaining: usize, min_element_bytes: usize) -> usize {
+pub fn clamp_capacity(count: usize, remaining: usize, min_element_bytes: usize) -> usize {
     let max_possible = remaining / min_element_bytes.max(1);
     count.min(max_possible)
 }

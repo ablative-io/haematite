@@ -130,7 +130,7 @@ pub fn encode_beamr_sync_frame(message: &SyncMessage) -> Result<Vec<u8>, SyncErr
 
 /// Wrap an already-encoded sync-message payload in the beamr control-frame
 /// header (control-tag length, payload length, control tag, payload).
-pub(crate) fn wrap_beamr_sync_frame(payload: &[u8]) -> Result<Vec<u8>, SyncError> {
+fn wrap_beamr_sync_frame(payload: &[u8]) -> Result<Vec<u8>, SyncError> {
     let control_len =
         u32::try_from(SYNC_CONTROL_FRAME.len()).map_err(|_error| SyncError::MessageTooLarge {
             len: SYNC_CONTROL_FRAME.len(),
@@ -154,16 +154,14 @@ pub(crate) fn wrap_beamr_sync_frame(payload: &[u8]) -> Result<Vec<u8>, SyncError
 /// native beamr transport glue calls it; the wasm node uses the generic encode
 /// path, so it is gated out of the wasm build.
 #[cfg(not(feature = "wasm"))]
-pub(crate) fn encode_beamr_push_response_frame(
-    response: &PushResponse,
-) -> Result<Vec<u8>, SyncError> {
+pub fn encode_beamr_push_response_frame(response: &PushResponse) -> Result<Vec<u8>, SyncError> {
     let mut payload = Vec::new();
     payload.push(SYNC_PROTOCOL_VERSION);
     encode_push_response(response, &mut payload);
     wrap_beamr_sync_frame(&payload)
 }
 
-pub(crate) fn encode_push_response(response: &PushResponse, bytes: &mut Vec<u8>) {
+fn encode_push_response(response: &PushResponse, bytes: &mut Vec<u8>) {
     bytes.push(MESSAGE_PUSH_RESPONSE);
     append_shard_id(bytes, response.shard_id);
     append_optional_hash(bytes, response.source_root);

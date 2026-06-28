@@ -18,6 +18,6 @@ pub use root::{
 };
 pub use transfer::{MissingNodes, NodeTransfer, PushResponse};
 pub use write::{
-    AckOutcome, BatchWriteAck, BatchWriteEntry, BatchWriteProposal, RejectReason, WriteAck, WriteId,
-    WriteProposal,
+    AckOutcome, BatchWriteAck, BatchWriteEntry, BatchWriteProposal, RejectReason, WriteAck,
+    WriteId, WriteProposal,
 };
