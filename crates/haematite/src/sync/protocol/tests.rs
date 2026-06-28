@@ -4,9 +4,10 @@ use std::convert::Infallible;
 use std::time::Duration;
 
 use super::*;
-use crate::store::MemoryStore;
+use crate::store::{MemoryStore, NodeStore};
 use crate::sync::ballot::Ballot;
-use crate::tree::{InternalNode, LeafNode};
+use crate::sync_codec::ids::SyncNodeId;
+use crate::tree::{Hash, InternalNode, LeafNode, Node};
 
 #[derive(Debug)]
 struct CountingStore<'a> {

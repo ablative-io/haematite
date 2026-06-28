@@ -14,7 +14,20 @@
 //! the wasm build.
 
 pub mod ballot;
+pub mod error;
 pub mod ids;
+pub mod message;
+pub mod missing;
+pub mod target;
 
 pub use ballot::{Ballot, Stamp};
+pub use error::SyncError;
 pub use ids::SyncNodeId;
+pub use message::{
+    AckOutcome, BatchWriteAck, BatchWriteEntry, BatchWriteProposal, MissingNodes, Nack,
+    NodeTransfer, Prepare, Promise, PullRequest, PushResponse, RejectReason, RootExchange,
+    RootExchangeRequest, RootExchangeResponse, ShardSyncRequest, SyncDecision, SyncPlan, SyncStats,
+    WriteAck, WriteId, WriteProposal, plan_sync,
+};
+pub use missing::find_missing_nodes;
+pub use target::{TargetNodeReader, TargetNodeRequest, TargetNodeResponse, TargetNodeSummary};
