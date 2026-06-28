@@ -90,6 +90,15 @@ proptest = "1"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "time", "sync"] }
 criterion = "0.5"
 
+# WR-9a: the cooperative single-threaded `beamr::scheduler::WasmScheduler` (the
+# wasm runtime's scheduler) is only built when beamr's `cooperative` feature is
+# on. The native (threaded) build links `beamr = "0.11.0"` with its default
+# features; this dev-only dependency additively turns on `cooperative` for the
+# test build (cargo unifies the two), so the cooperative shard smoke can run the
+# real shard `NativeHandler` on `WasmScheduler` without a browser.
+[target.'cfg(not(all(target_arch = "wasm32", target_os = "unknown")))'.dev-dependencies]
+beamr = { version = "0.11.0", features = ["cooperative"] }
+
 [target.'cfg(all(target_arch = "wasm32", target_os = "unknown"))'.dev-dependencies]
 wasm-bindgen-test = "0.3"
 
