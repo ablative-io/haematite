@@ -1,0 +1,86 @@
+{
+  "repo_root": "/Users/tom/Developer/ablative/haematite",
+  "clone_url": "https://github.com/ablative-io/haematite.git",
+  "workspace_id": "2d5fdd51-1f25-45a4-8f86-4d4c978d1355",
+  "brief_id": "PERF-002",
+  "reviewers": ["Waffles the Terrible"],
+  "base_ref": "main",
+  "placement": "local",
+  "isolation": "worktree",
+  "review_cap": 1,
+  "round_backoff_ms": 2000,
+  "verify_fix_cap": 3,
+  "review_deadline_ms": 7200000,
+  "brief_document": {
+    "id": "PERF-002",
+    "cluster": "core",
+    "title": "Per-shard secondary stream index: O(streams) enumeration instead of O(total entries) full-tree walk",
+    "depends_on": [],
+    "blocked_by": [],
+    "checklist": [],
+    "stories": [],
+    "design_anchor": [],
+    "purpose": "EventStore::scan / stream enumeration currently walks the ENTIRE committed tree to discover which streams exist (shard/actor/scan.rs enumeration is O(total entries across all streams)). Maintain a per-shard in-memory secondary index BTreeMap<stream_key, next_seq> of live stream keys so enumeration is O(number of streams), not O(total events). This is the larger read-path win after PERF-001 (scan first-match, already landed). Behaviour-preserving: enumeration returns exactly the same stream set in the same order; only the cost drops.",
+    "task": "Add a per-shard secondary index (a BTreeMap<stream_key, next_seq> or equivalent) of currently-live stream keys, owned by the shard actor (single-threaded, so no locking needed). Maintain it at EXACTLY the points that mutate the committed set: (1) commit (the universal durable-write funnel), (2) from_recovered (rebuild on startup/recovery from the committed tree), and (3) merge_adopt / any path that swaps committed_root wholesale (this BYPASSES commit and is the load-bearing trap — the index MUST be rebuilt or reconciled there or it will silently go stale). Wire stream enumeration (the scan path in shard/actor/scan.rs and its Database/EventStore caller) to read the index instead of walking the whole tree. Do NOT change observable enumeration results or ordering, TTL/visibility semantics, durability, hashing, replication, or the epoch-fence/commit linearization.",
+    "requirements": [
+      {
+        "id": "R1",
+        "title": "Per-shard live-stream secondary index",
+        "spec": "THE SYSTEM SHALL maintain, per shard, an in-memory ordered index of live stream keys (stream_key -> next_seq, or equivalent) that reflects exactly the streams a full enumeration would return. It SHALL be updated on every committed mutation and SHALL be consistent with the committed tree after commit, recovery, and committed-root adoption.",
+        "acceptance": [
+          "A per-shard ordered structure (e.g. BTreeMap<Vec<u8>, u64>) of live stream keys exists on the shard actor state.",
+          "It is maintained at commit (the write funnel), at from_recovered (rebuilt from the committed tree on startup/recovery), AND at merge_adopt / any committed_root wholesale swap (rebuilt/reconciled there).",
+          "A stream that becomes fully tombstoned/expired is removed from (or excluded by) the index so enumeration does not report it.",
+          "No locking is introduced for the index (the shard actor is single-threaded by construction)."
+        ],
+        "files": { "create": [], "modify": [], "delete": [] },
+        "checklist": [],
+        "stories": []
+      },
+      {
+        "id": "R2",
+        "title": "Enumeration reads the index, not a full-tree walk",
+        "spec": "Stream enumeration (the scan path) SHALL consult the secondary index instead of walking the entire committed tree, making it O(streams). EventStore::scan's observable output (the set and order of streams) SHALL be unchanged.",
+        "acceptance": [
+          "The enumeration in shard/actor/scan.rs no longer performs an O(total-entries) full-tree walk to list streams.",
+          "Existing scan / enumeration tests pass unchanged.",
+          "A regression test asserts the index stays correct across commit, recovery (reopen), and a merge_adopt / committed-root swap (the trap): enumeration after each matches a from-scratch full walk."
+        ],
+        "files": { "create": [], "modify": [], "delete": [] },
+        "checklist": [],
+        "stories": []
+      }
+    ],
+    "boundaries": [
+      "SHALL NOT change observable enumeration/scan results or ordering, or the public range/get/scan/append API.",
+      "SHALL NOT alter TTL/visibility (tombstone/expired) semantics.",
+      "SHALL NOT touch durability, hashing, replication, or the epoch-fence/commit linearization point.",
+      "SHALL NOT introduce unsafe code; the crate sets unsafe_code = forbid.",
+      "SHALL keep no production unwrap()/expect()/panic!(); the crate denies clippy unwrap_used/expect_used/panic.",
+      "MUST handle the merge_adopt / committed_root wholesale-swap path explicitly (it bypasses commit) or the index goes stale; this is the highest-risk part and MUST have a regression test.",
+      "Index rebuild on recovery MUST be crash-safe and consistent with the replayed committed root."
+    ],
+    "verification": [
+      "cargo fmt --check is clean for changed files (rustfmt edition 2024; use --config skip_children=true to avoid reformatting unrelated module children).",
+      "cargo clippy -p haematite --all-targets -- -D warnings is clean (all/pedantic/nursery + unwrap/expect/panic denied).",
+      "cargo test -p haematite passes in full (lib ~365 tests + integration), zero failures.",
+      "A regression test demonstrates index correctness across commit + recovery + merge_adopt/committed-root swap (enumeration matches a full-walk oracle).",
+      "No public API change beyond what enumeration needs internally.",
+      "Behaviour-preserving for EventStore::scan (same streams, same order)."
+    ]
+  },
+  "resolved_context": {
+    "adrs": [],
+    "checklist": [],
+    "constraints": [
+      { "id": "CN1", "text": "No file over 500 lines; extract submodules if approaching the limit." },
+      { "id": "CN2", "text": "No panics in production code; unwrap()/expect() only in tests." },
+      { "id": "CN3", "text": "mod.rs contains only pub mod / pub use; no logic." },
+      { "id": "CN4", "text": "All public types implement Debug; all error types implement std::error::Error." }
+    ],
+    "intention": "The larger haematite read-path win after PERF-001 (scan first-match) landed: make stream enumeration O(streams) not O(total entries) via a per-shard secondary index, without changing what enumeration returns. The merge_adopt / committed-root-swap path is the known trap (it bypasses the commit write-funnel). See ABLATIVE-STACK-ROADMAP.md and the haematite-perf-audit findings (audit item 'D').",
+    "provenance": { "quote": "as fast as possible, can't have any embarrassing oversights", "requested_by": "Tom" },
+    "design_path": "docs/design/core",
+    "stories": []
+  }
+}

@@ -1,0 +1,84 @@
+{
+  "repo_root": "/Users/tom/Developer/ablative/haematite",
+  "clone_url": "https://github.com/ablative-io/haematite.git",
+  "workspace_id": "2d5fdd51-1f25-45a4-8f86-4d4c978d1355",
+  "brief_id": "PERF-003",
+  "reviewers": ["Waffles the Terrible"],
+  "base_ref": "main",
+  "placement": "local",
+  "isolation": "worktree",
+  "review_cap": 1,
+  "round_backoff_ms": 2000,
+  "verify_fix_cap": 3,
+  "review_deadline_ms": 7200000,
+  "brief_document": {
+    "id": "PERF-003",
+    "cluster": "core",
+    "title": "Commit clone cleanup: stop copying the write set ~3x per commit",
+    "depends_on": [],
+    "blocked_by": [],
+    "checklist": [],
+    "stories": [],
+    "design_anchor": [],
+    "purpose": "On the durable write path, the same key/value bytes are cloned roughly three times per commit: the WAL buffer commit path clones the BTreeMap into a Vec (buffered_batch / WalBuffer::commit), normalise_mutations re-clones them again, and every individual write takes a full self.buffer.clone() snapshot for rollback. This is pure CPU/allocation overhead — it does NOT change durability or correctness. Reduce the copying: drain the buffer's BTreeMap into batch_mutate by value/iterator instead of clone-collecting it, and make write rollback target only the single mutated key instead of snapshotting the entire buffer. CPU-only optimisation; behaviour and durability are unchanged.",
+    "task": "Eliminate the redundant per-commit copies of the write set on the shard actor's durable write path. (1) The buffer-to-batch path (buffered_batch / WalBuffer::commit -> batch_mutate -> normalise_mutations) currently clone-collects the BTreeMap into a Vec and then re-clones during normalisation; restructure so the buffered mutations are drained/moved by value (owned iterator) into the mutation pipeline with at most one materialisation. (2) The per-write rollback snapshot (each put/delete/cas/apply-durable clones the ENTIRE WalBuffer so it can roll back on failure) should be replaced with a targeted single-key rollback (remember only the prior entry for the key being mutated, restore just that on failure). Do NOT change observable behaviour, durability, the commit linearization, hashing, or replication. NOTE: some clones are correctness-load-bearing — specifically the buffer snapshot semantics on multi-key apply_durable_batch (all-or-nothing rollback) and any key.to_vec() that crosses the beamr actor/term boundary. Preserve those guarantees; restructure carefully rather than naively deleting clones.",
+    "requirements": [
+      {
+        "id": "R1",
+        "title": "Single-materialisation buffer drain into the mutation pipeline",
+        "spec": "THE commit path SHALL move the buffered write set into batch_mutate/normalise by value (drain the BTreeMap / owned iterator) with at most one materialisation, instead of clone-collecting it into a Vec and then re-cloning during normalisation. The resulting committed tree, root hash, and durability SHALL be identical to before.",
+        "acceptance": [
+          "buffered_batch / WalBuffer::commit no longer clone-collects the whole BTreeMap into a Vec only to re-clone it in normalise_mutations; the buffered entries are drained/moved through with one materialisation.",
+          "Committed root hashes are byte-identical to main for the same write sequence (covered by existing commit/replication/proptest tests).",
+          "No change to durability, fsync ordering, or the commit linearization point."
+        ],
+        "files": { "create": [], "modify": [], "delete": [] },
+        "checklist": [],
+        "stories": []
+      },
+      {
+        "id": "R2",
+        "title": "Targeted single-key rollback instead of full-buffer snapshot",
+        "spec": "Per-write failure rollback (put/delete/cas and single-key durable apply) SHALL restore only the prior state of the mutated key rather than cloning the entire WalBuffer up front. Multi-key apply_durable_batch SHALL retain its all-or-nothing rollback semantics.",
+        "acceptance": [
+          "A single put/delete/cas no longer clones the whole buffer for rollback; on failure it restores only the affected key's prior entry (present/absent).",
+          "apply_durable_batch keeps all-or-nothing rollback (a mid-batch failure leaves the buffer exactly as before the batch).",
+          "Existing failure/rollback tests pass unchanged; a test covers single-key rollback restoring the prior value and absent-key cases."
+        ],
+        "files": { "create": [], "modify": [], "delete": [] },
+        "checklist": [],
+        "stories": []
+      }
+    ],
+    "boundaries": [
+      "MINIMAL CHANGE ONLY — THIS IS THE HARD BOUNDARY: make ONLY the buffer-drain (R1) and targeted-rollback (R2) edits in the directly-relevant files (the WAL buffer commit path, normalise_mutations, and the shard actor's write/rollback methods). DO NOT split files, reorganise modules, move code between files, extract #[cfg(test)] modules into sibling files, or restructure anything. If a file you touch ALREADY exceeds 500 lines, LEAVE its size as-is — CN1 applies to NEW files you create, NOT to pre-existing large files; you MUST NOT refactor pre-existing files for size. The total diff should be on the order of tens of lines across ~2-4 files, NOT a module reorganisation. A large multi-file restructure is an automatic REJECT.",
+      "CPU/allocation-only optimisation: SHALL NOT change observable behaviour, committed root hashes, durability, fsync ordering, the commit linearization, hashing, or replication.",
+      "SHALL preserve correctness-load-bearing copies: apply_durable_batch all-or-nothing rollback semantics, and any key.to_vec() that crosses the beamr actor/term boundary (do not pass borrowed data across the boundary).",
+      "SHALL NOT introduce unsafe code (crate sets unsafe_code = forbid).",
+      "SHALL keep no production unwrap()/expect()/panic!() (crate denies clippy unwrap_used/expect_used/panic).",
+      "SHALL keep files under 500 lines (extract submodules if needed).",
+      "If a clone cannot be safely removed without risking correctness, KEEP it and note why in the result rather than weakening a guarantee."
+    ],
+    "verification": [
+      "cargo fmt --check clean for changed files (rustfmt edition 2024; --config skip_children=true to avoid reformatting unrelated module children).",
+      "cargo clippy -p haematite --all-targets -- -D warnings clean (all/pedantic/nursery + unwrap/expect/panic denied).",
+      "cargo test -p haematite passes in full (lib ~365 tests + integration + proptest), zero failures — especially commit/replication/recovery/rollback tests.",
+      "Committed root hashes unchanged vs main for the same write sequences (the existing history-independence + replication proptests cover this).",
+      "A representative before/after micro-measure or reasoning showing reduced allocations/copies per commit (the win is CPU, not latency-dominated by fsync)."
+    ]
+  },
+  "resolved_context": {
+    "adrs": [],
+    "checklist": [],
+    "constraints": [
+      { "id": "CN1", "text": "No file over 500 lines; extract submodules if approaching the limit." },
+      { "id": "CN2", "text": "No panics in production code; unwrap()/expect() only in tests." },
+      { "id": "CN3", "text": "mod.rs contains only pub mod / pub use; no logic." },
+      { "id": "CN4", "text": "All public types implement Debug; all error types implement std::error::Error." }
+    ],
+    "intention": "Audit item 'F' from the haematite hot-path perf review: the write set is copied ~3x per commit (buffered_batch BTreeMap->Vec clone, normalise_mutations re-clone, per-write full-buffer rollback snapshot). Drain by value + targeted single-key rollback. CPU-only, durability/behaviour unchanged. Some clones are load-bearing (apply_durable_batch all-or-nothing; key.to_vec across the actor boundary) — preserve them. See ABLATIVE-STACK-ROADMAP.md and the haematite-perf-audit findings.",
+    "provenance": { "quote": "as fast as possible, can't have any embarrassing oversights", "requested_by": "Tom" },
+    "design_path": "docs/design/core",
+    "stories": []
+  }
+}
