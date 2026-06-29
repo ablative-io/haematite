@@ -1,0 +1,110 @@
+{
+  "repo_root": "/Users/tom/Developer/ablative/haematite",
+  "brief_id": "PERF-001",
+  "reviewers": [
+    "Waffles the Terrible"
+  ],
+  "base_ref": "main",
+  "placement": "local",
+  "isolation": "worktree",
+  "brief_document": {
+    "id": "PERF-001",
+    "cluster": "core",
+    "title": "scan(): first-match liveness probe instead of full-range materialisation",
+    "depends_on": [],
+    "blocked_by": [],
+    "checklist": [],
+    "stories": [],
+    "design_anchor": [],
+    "purpose": "EventStore::scan currently calls Database::stream_has_live_events for every stream whose predicate matches, and that helper materialises the stream's ENTIRE event range (cloning every key+value) only to test non-emptiness. This makes scan O(streams * events-per-stream). A liveness probe only needs the FIRST visible entry. Make it short-circuit at the first live entry so scan's per-match cost drops from O(events-in-stream) to O(log n). Behaviour-preserving: scan returns exactly the same streams in the same order; only the internal probe gets cheaper.",
+    "task": "Add an early-terminating liveness path so stream_has_live_events stops at the first visible (non-tombstoned, non-expired) entry instead of collecting the whole range. The shard actor already has a streaming range cursor; expose a bounded/first-match variant (e.g. a Range command carrying limit: Some(1), or a dedicated HasLiveEntries command) and have collect_range stop after emitting the first live entry. Wire Database::stream_has_live_events to it. Do not change scan's observable results, ordering, TTL/visibility semantics, or any public API beyond what this needs.",
+    "requirements": [
+      {
+        "id": "R1",
+        "title": "First-match liveness probe in the shard actor",
+        "spec": "WHEN the engine needs to know only whether a stream has at least one live entry, THE SYSTEM SHALL evaluate it by scanning from the stream's lower bound and stopping at the FIRST entry that is visible under the existing TTL/visibility filter, without materialising or cloning the remaining entries. THE SYSTEM SHALL NOT change the result of any existing range query.",
+        "acceptance": [
+          "A bounded/first-match path exists on the shard actor that returns as soon as one live entry is found (e.g. Range with a limit, or a dedicated has-live-entries command).",
+          "collect_range (or the new path) does not clone or buffer entries beyond the first live one for the liveness case.",
+          "The committed-tree + write-buffer merge and the TTL/visibility (tombstone/expired) filtering match the existing range semantics exactly for the first live entry.",
+          "No change to the public Database range/get/scan API surface beyond an internal helper or command variant."
+        ],
+        "files": {
+          "create": [],
+          "modify": [],
+          "delete": []
+        },
+        "checklist": [],
+        "stories": []
+      },
+      {
+        "id": "R2",
+        "title": "Wire stream_has_live_events to the probe",
+        "spec": "Database::stream_has_live_events SHALL use the first-match probe instead of issuing a full range and testing is_empty(). EventStore::scan's observable output (the set and order of streams returned) SHALL be unchanged.",
+        "acceptance": [
+          "stream_has_live_events no longer collects a full KvRange to test non-emptiness.",
+          "Existing scan / stream_has_live_events tests pass unchanged; a regression test asserts a stream with many events is reported live without materialising all of them (e.g. via behaviour, not internals).",
+          "An empty / fully-tombstoned / fully-expired stream is still reported as NOT live."
+        ],
+        "files": {
+          "create": [],
+          "modify": [],
+          "delete": []
+        },
+        "checklist": [],
+        "stories": []
+      }
+    ],
+    "boundaries": [
+      "SHALL NOT change observable scan results, ordering, or the public range/get/scan API.",
+      "SHALL NOT alter TTL/visibility (tombstone/expired) semantics — the probe must see exactly what a range sees.",
+      "SHALL NOT touch durability, hashing, replication, or the epoch-fence/commit paths.",
+      "SHALL NOT introduce unsafe code; the crate sets unsafe_code = forbid.",
+      "SHALL keep no production unwrap()/expect()/panic!(); the crate denies clippy unwrap_used/expect_used/panic.",
+      "SHALL NOT add a secondary index (out of scope; a separate brief)."
+    ],
+    "verification": [
+      "cargo fmt --check is clean for changed files.",
+      "cargo clippy -p haematite --all-targets -- -D warnings is clean (all/pedantic/nursery + unwrap/expect/panic denied).",
+      "cargo test -p haematite passes in full (lib ~360 tests + integration), zero failures.",
+      "A regression test demonstrates the first-match behaviour (a multi-event stream reported live without full materialisation).",
+      "No public API change beyond the internal probe/command.",
+      "The change is behaviour-preserving for EventStore::scan (same streams, same order)."
+    ]
+  },
+  "resolved_context": {
+    "adrs": [],
+    "checklist": [],
+    "constraints": [
+      {
+        "id": "CN1",
+        "text": "No file over 500 lines; extract submodules if approaching the limit."
+      },
+      {
+        "id": "CN2",
+        "text": "No panics in production code; unwrap()/expect() only in tests."
+      },
+      {
+        "id": "CN3",
+        "text": "mod.rs contains only pub mod / pub use; no logic."
+      },
+      {
+        "id": "CN4",
+        "text": "All public types implement Debug; all error types implement std::error::Error."
+      }
+    ],
+    "intention": "Make enumeration/scan fast without changing what it returns. This is the first of the haematite read-path perf items after the Arc<Node> node-store and RangeIter Arc changes already landed (see ABLATIVE-STACK-ROADMAP.md). The larger secondary-stream-index change is a separate, later brief.",
+    "provenance": {
+      "quote": "as fast as possible, can't have any embarrassing oversights",
+      "requested_by": "Tom"
+    },
+    "design_path": "docs/design/core",
+    "stories": []
+  },
+  "clone_url": "https://github.com/ablative-io/haematite.git",
+  "workspace_id": "2d5fdd51-1f25-45a4-8f86-4d4c978d1355",
+  "review_cap": 1,
+  "round_backoff_ms": 2000,
+  "verify_fix_cap": 3,
+  "review_deadline_ms": 7200000
+}
