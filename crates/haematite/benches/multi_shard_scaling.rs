@@ -65,15 +65,20 @@ fn bench_multi_shard(c: &mut Criterion) {
     // -- put (buffered): expected ~flat across shard counts -------------------
     let mut put_group = c.benchmark_group("multi_shard_put_buffered");
     for &shards in &SHARD_COUNTS {
-        put_group.bench_with_input(BenchmarkId::from_parameter(shards), &shards, |b, &shards| {
-            let (db, _dir) = fresh_db(shards);
-            let mut counter = 0_u64;
-            b.iter(|| {
-                let key = format!("k:{counter:016}").into_bytes();
-                counter += 1;
-                db.put(black_box(key), black_box(b"value".to_vec())).expect("put");
-            });
-        });
+        put_group.bench_with_input(
+            BenchmarkId::from_parameter(shards),
+            &shards,
+            |b, &shards| {
+                let (db, _dir) = fresh_db(shards);
+                let mut counter = 0_u64;
+                b.iter(|| {
+                    let key = format!("k:{counter:016}").into_bytes();
+                    counter += 1;
+                    db.put(black_box(key), black_box(b"value".to_vec()))
+                        .expect("put");
+                });
+            },
+        );
     }
     put_group.finish();
 
@@ -82,22 +87,26 @@ fn bench_multi_shard(c: &mut Criterion) {
     // fan-out commit, which fsyncs every shard. More shards ⇒ more fsyncs ⇒ slower.
     let mut commit_group = c.benchmark_group("multi_shard_commit_all");
     for &shards in &SHARD_COUNTS {
-        commit_group.bench_with_input(BenchmarkId::from_parameter(shards), &shards, |b, &shards| {
-            let (db, _dir) = fresh_db(shards);
-            let mut counter = 0_u64;
-            b.iter_batched(
-                || {
-                    let key = format!("c:{counter:016}").into_bytes();
-                    counter += 1;
-                    db.put(key, b"value".to_vec()).expect("put");
-                },
-                |()| {
-                    let roots = db.commit().expect("commit");
-                    black_box(roots);
-                },
-                criterion::BatchSize::SmallInput,
-            );
-        });
+        commit_group.bench_with_input(
+            BenchmarkId::from_parameter(shards),
+            &shards,
+            |b, &shards| {
+                let (db, _dir) = fresh_db(shards);
+                let mut counter = 0_u64;
+                b.iter_batched(
+                    || {
+                        let key = format!("c:{counter:016}").into_bytes();
+                        counter += 1;
+                        db.put(key, b"value".to_vec()).expect("put");
+                    },
+                    |()| {
+                        let roots = db.commit().expect("commit");
+                        black_box(roots);
+                    },
+                    criterion::BatchSize::SmallInput,
+                );
+            },
+        );
     }
     commit_group.finish();
 }

@@ -63,19 +63,33 @@ fn q1_real_write_path_only_counts_local_ack() -> TestResult {
 
     // total_nodes = 1: quorum is 1, the local durable WAL ack satisfies it.
     let single = ConsistencyMode::Strong(StrongConsistency::new(1, Duration::from_millis(50)));
-    let r1 = db.put_with_consistency(b"owner/shard-7/epoch".to_vec(), 1_u64.to_be_bytes().to_vec(), single);
+    let r1 = db.put_with_consistency(
+        b"owner/shard-7/epoch".to_vec(),
+        1_u64.to_be_bytes().to_vec(),
+        single,
+    );
     println!("[total_nodes=1] put_with_consistency(Strong) -> {r1:?}");
-    assert!(r1.is_ok(), "single-node strong write should be satisfied by the local ack");
+    assert!(
+        r1.is_ok(),
+        "single-node strong write should be satisfied by the local ack"
+    );
 
     // total_nodes = 3: quorum is 2. The production path feeds NO remote acks, so
     // the only ack available is the local one -> times out. This is the gap.
     let cluster = ConsistencyMode::Strong(StrongConsistency::new(3, Duration::from_millis(50)));
-    let r3 = db.put_with_consistency(b"owner/shard-7/epoch".to_vec(), 2_u64.to_be_bytes().to_vec(), cluster);
+    let r3 = db.put_with_consistency(
+        b"owner/shard-7/epoch".to_vec(),
+        2_u64.to_be_bytes().to_vec(),
+        cluster,
+    );
     println!("[total_nodes=3] put_with_consistency(Strong) -> {r3:?}");
     match &r3 {
         Err(DatabaseError::ConsistencyError(msg)) => {
             println!("    -> failed honestly: {msg}");
-            assert!(msg.contains("quorum") || msg.contains("timed out"), "expected a quorum failure, got: {msg}");
+            assert!(
+                msg.contains("quorum") || msg.contains("timed out"),
+                "expected a quorum failure, got: {msg}"
+            );
         }
         other => panic!("Q1 expected a quorum failure for total_nodes=3, got {other:?}"),
     }
@@ -159,18 +173,27 @@ fn quorum_gated_epoch_write(
 
 #[test]
 fn q2_quorum_gated_epoch_write_membership_derived() {
-    println!("\n========== Q2: quorum-gated epoch write (membership-derived total_nodes) ==========");
+    println!(
+        "\n========== Q2: quorum-gated epoch write (membership-derived total_nodes) =========="
+    );
     let timeout = Duration::from_millis(50);
 
     // 3-node cluster: nodes {0,1,2}. Quorum over 3 = 2.
     let cluster = [0usize, 1, 2];
-    println!("cluster = {cluster:?}, quorum over full membership = {:?}", quorum_size(cluster.len()));
+    println!(
+        "cluster = {cluster:?}, quorum over full membership = {:?}",
+        quorum_size(cluster.len())
+    );
 
     // --- MAJORITY side: nodes 0 and 1 reachable (2 of 3). Node 0 writes the epoch.
     let majority = Membership::new(&cluster, &[0, 1]);
     let maj = quorum_gated_epoch_write(&majority, 0, timeout);
     println!("[majority partition {{0,1}}] epoch write -> {maj:?}");
-    assert_eq!(maj, Ok(2), "majority (local 0 + remote 1) must reach quorum 2");
+    assert_eq!(
+        maj,
+        Ok(2),
+        "majority (local 0 + remote 1) must reach quorum 2"
+    );
     println!("    -> COMMITS: local ack(0) + remote ack(1) = 2 >= quorum 2.");
 
     // --- MINORITY side: only node 2 reachable (1 of 3). Node 2 tries to write.
@@ -184,13 +207,21 @@ fn q2_quorum_gated_epoch_write_membership_derived() {
     let min = quorum_gated_epoch_write(&minority, 2, timeout);
     println!("[minority partition {{2}}]   epoch write -> {min:?}");
     match &min {
-        Err(ConsistencyError::QuorumTimeout { required, acknowledged, .. }) => {
-            println!("    -> FENCED via QuorumTimeout: required={required}, got={acknowledged} (cannot self-quorum).");
+        Err(ConsistencyError::QuorumTimeout {
+            required,
+            acknowledged,
+            ..
+        }) => {
+            println!(
+                "    -> FENCED via QuorumTimeout: required={required}, got={acknowledged} (cannot self-quorum)."
+            );
             assert_eq!(*required, 2);
             assert_eq!(*acknowledged, 1);
         }
         Err(ConsistencyError::QuorumUnavailable { required, possible }) => {
-            println!("    -> FENCED via QuorumUnavailable: required={required}, possible={possible}.");
+            println!(
+                "    -> FENCED via QuorumUnavailable: required={required}, possible={possible}."
+            );
         }
         other => panic!("Q2 expected the minority to be FENCED, got {other:?}"),
     }
@@ -206,8 +237,14 @@ fn q2_quorum_gated_epoch_write_membership_derived() {
     let a_ok = side_a.is_ok();
     let b_ok = side_b.is_ok();
     println!("  exactly one side acquired? {}", a_ok ^ b_ok);
-    assert!(a_ok ^ b_ok, "exactly one partition may acquire under quorum");
-    assert!(a_ok && !b_ok, "the majority must win, the minority must be fenced");
+    assert!(
+        a_ok ^ b_ok,
+        "exactly one partition may acquire under quorum"
+    );
+    assert!(
+        a_ok && !b_ok,
+        "the majority must win, the minority must be fenced"
+    );
 
     println!(
         "\nQ2 RESULT: with total_nodes derived from LIVE membership and the epoch write \
@@ -227,7 +264,9 @@ fn q2_quorum_gated_epoch_write_membership_derived() {
 
 #[test]
 fn q3_quorum_must_be_over_full_membership_not_reachable_subset() {
-    println!("\n========== Q3: quorum invariant — over full membership, not reachable subset ==========");
+    println!(
+        "\n========== Q3: quorum invariant — over full membership, not reachable subset =========="
+    );
     let timeout = Duration::from_millis(50);
     let cluster = [0usize, 1, 2];
 
@@ -235,8 +274,13 @@ fn q3_quorum_must_be_over_full_membership_not_reachable_subset() {
     // ack alone satisfies it -> the minority "wins". This is the bug to avoid.
     let wrong = StrongConsistency::new(1, timeout); // sized from reachable {2}
     let wrong_outcome = wait_for_quorum::<usize, _>(wrong, std::iter::empty());
-    println!("[WRONG: total_nodes=reachable.len()=1] minority -> {wrong_outcome:?} (would self-quorum: BUG)");
-    assert!(wrong_outcome.is_ok(), "demonstrates the bug if quorum is sized from the reachable subset");
+    println!(
+        "[WRONG: total_nodes=reachable.len()=1] minority -> {wrong_outcome:?} (would self-quorum: BUG)"
+    );
+    assert!(
+        wrong_outcome.is_ok(),
+        "demonstrates the bug if quorum is sized from the reachable subset"
+    );
 
     // RIGHT sizing: total_nodes = full membership (3). quorum(3)=2, local ack
     // alone (1) is insufficient -> FENCED. With NO remote acks supplied it
@@ -244,9 +288,14 @@ fn q3_quorum_must_be_over_full_membership_not_reachable_subset() {
     // timeout for acks that never arrive). Either way the minority cannot write.
     let right = StrongConsistency::new(cluster.len(), timeout);
     let right_outcome = wait_for_quorum::<usize, _>(right, std::iter::empty());
-    println!("[RIGHT: total_nodes=full membership=3] minority -> {right_outcome:?} (correctly fenced)");
+    println!(
+        "[RIGHT: total_nodes=full membership=3] minority -> {right_outcome:?} (correctly fenced)"
+    );
     assert!(
-        matches!(right_outcome, Err(ConsistencyError::QuorumTimeout { .. } | ConsistencyError::QuorumUnavailable { .. })),
+        matches!(
+            right_outcome,
+            Err(ConsistencyError::QuorumTimeout { .. } | ConsistencyError::QuorumUnavailable { .. })
+        ),
         "minority must be fenced"
     );
 
@@ -259,7 +308,10 @@ fn q3_quorum_must_be_over_full_membership_not_reachable_subset() {
     let remote_only = StrongConsistency::remote_only(2, timeout);
     let unavailable = wait_for_quorum::<usize, _>(remote_only, std::iter::empty());
     println!("[remote_only total_nodes=2] -> {unavailable:?} (QuorumUnavailable short-circuit)");
-    assert!(matches!(unavailable, Err(ConsistencyError::QuorumUnavailable { .. })));
+    assert!(matches!(
+        unavailable,
+        Err(ConsistencyError::QuorumUnavailable { .. })
+    ));
 
     println!(
         "Q3 RESULT: the load-bearing invariant is total_nodes = FULL membership size. \

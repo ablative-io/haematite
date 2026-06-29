@@ -50,7 +50,10 @@ fn main() -> Result<(), Box<dyn Error>> {
     })?;
 
     println!("== kv_basics: a single-node key-value tour ==");
-    println!("created a {SHARD_COUNT}-shard store at {}\n", dir.path().display());
+    println!(
+        "created a {SHARD_COUNT}-shard store at {}\n",
+        dir.path().display()
+    );
 
     // -- Act 1: put + read-your-writes ------------------------------------------
     println!("-- Act 1: put a key, read it back (read-your-writes) --");
@@ -64,7 +67,10 @@ fn main() -> Result<(), Box<dyn Error>> {
     // -- Act 2: commit -> per-shard roots ---------------------------------------
     println!("-- Act 2: commit flushes the WAL buffer into the prolly trees --");
     let roots = db.commit()?;
-    println!("  commit returned a root hash for each of {} shards:", roots.len());
+    println!(
+        "  commit returned a root hash for each of {} shards:",
+        roots.len()
+    );
     for (shard, root) in &roots {
         println!("    shard {shard}: {}", short_hash(&format!("{root:?}")));
     }

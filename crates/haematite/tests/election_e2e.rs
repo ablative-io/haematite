@@ -125,7 +125,10 @@ impl Drop for Node {
 
 /// Dial `from` -> `to` (one direction) and wait for the link to register.
 fn link(from: &Node, to: &Node) -> TestResult {
-    let endpoint = from.db.distribution().ok_or("dialing node has no endpoint")?;
+    let endpoint = from
+        .db
+        .distribution()
+        .ok_or("dialing node has no endpoint")?;
     endpoint.add_peer(to.name, to.addr);
     endpoint.connect(to.name)?;
     if !wait_until(HANDSHAKE_TIMEOUT, || endpoint.is_connected(to.name)) {
@@ -168,11 +171,10 @@ fn single_candidate_wins_with_self_plus_peer() -> TestResult {
     link_both(&node_a, &node_b)?;
     link_both(&node_a, &node_c)?;
 
-    let outcome: ElectionOutcome = node_a.db.acquire_shard(
-        SHARD,
-        &membership(3, &[NODE_B, NODE_C]),
-        ELECT_TIMEOUT,
-    )?;
+    let outcome: ElectionOutcome =
+        node_a
+            .db
+            .acquire_shard(SHARD, &membership(3, &[NODE_B, NODE_C]), ELECT_TIMEOUT)?;
 
     // Won ballot names A and has a real (>=1) counter.
     assert_eq!(
@@ -293,7 +295,10 @@ fn two_candidates_same_shard_single_live_owner() -> TestResult {
     // (1) Total order: any two winners are strictly comparable (never co-equal /
     // incomparable). With at most two winners this is "the max strictly dominates".
     if winners.len() == 2 {
-        assert_ne!(winners[0], winners[1], "two winners must not share a ballot");
+        assert_ne!(
+            winners[0], winners[1],
+            "two winners must not share a ballot"
+        );
         assert!(
             winners[0] < winners[1] || winners[1] < winners[0],
             "winning ballots must be totally ordered"
@@ -321,7 +326,10 @@ fn two_candidates_same_shard_single_live_owner() -> TestResult {
 
     if winners.len() == 2 {
         let lower = winners.iter().min().cloned().ok_or("no min winner")?;
-        assert!(lower < max_winner, "the two winners must be strictly ordered");
+        assert!(
+            lower < max_winner,
+            "the two winners must be strictly ordered"
+        );
         // Drive the data-write fence precondition directly: a fresh Prepare at the
         // LOWER winner's ballot, sent to B, is refused — B has promised the MAX
         // (> lower), so it Nacks and its `promised` never regresses below the max.
@@ -401,9 +409,10 @@ fn monotonic_ballot_across_reacquire() -> TestResult {
     let first = node_a
         .db
         .acquire_shard(SHARD, &membership(3, &[NODE_B, NODE_C]), ELECT_TIMEOUT)?;
-    let second = node_a
-        .db
-        .acquire_shard(SHARD, &membership(3, &[NODE_B, NODE_C]), ELECT_TIMEOUT)?;
+    let second =
+        node_a
+            .db
+            .acquire_shard(SHARD, &membership(3, &[NODE_B, NODE_C]), ELECT_TIMEOUT)?;
 
     assert!(
         second.ballot > first.ballot,
@@ -452,9 +461,10 @@ fn acceptor_promise_then_nack_with_fields() -> TestResult {
 
     // --- B becomes a prior owner WITH committed data, so its Promise later carries
     // a non-None accepted_epoch (its owner_epoch) AND a non-None committed_root. ---
-    let b_owner = node_b
-        .db
-        .acquire_shard(SHARD, &membership(3, &[NODE_A, NODE_C]), ELECT_TIMEOUT)?;
+    let b_owner =
+        node_b
+            .db
+            .acquire_shard(SHARD, &membership(3, &[NODE_A, NODE_C]), ELECT_TIMEOUT)?;
     // Commit a value on B so its shard has a committed root.
     node_b.db.replicate_write(
         b"acceptor-key".to_vec(),
@@ -498,10 +508,9 @@ fn acceptor_promise_then_nack_with_fields() -> TestResult {
     // it self-promises + needs B, but B will Nack any C ballot <= B.promised. C
     // re-mints above it across retries; if it cannot beat A's owner round-trip in
     // time it loses cleanly. Either way C must NOT win on a stale (<=) ballot. ------
-    let c_result =
-        node_c
-            .db
-            .acquire_shard(SHARD, &membership(3, &[NODE_B]), FENCE_TIMEOUT);
+    let c_result = node_c
+        .db
+        .acquire_shard(SHARD, &membership(3, &[NODE_B]), FENCE_TIMEOUT);
     // C reaches only B (1 peer) + itself = 2 of 3 = majority IS reachable, so C may
     // actually win by re-minting above B.promised. The Nack PROPERTY we assert is
     // narrower and always true: C never wins on a ballot <= B's promised. If C won,
@@ -541,7 +550,10 @@ fn unique_ballot_tiebreak_is_total() {
     let c = Ballot::new(7, SyncNodeId::from(NODE_C));
 
     // Distinct despite the SAME counter.
-    assert_ne!(a, c, "same counter, distinct nodes must be distinct ballots");
+    assert_ne!(
+        a, c,
+        "same counter, distinct nodes must be distinct ballots"
+    );
     // Totally ordered: exactly one of < / > holds (never incomparable, never equal).
     assert!(
         (a < c) ^ (c < a),
@@ -585,15 +597,17 @@ fn deposed_owner_is_fenced_end_to_end() -> TestResult {
     link_both(&node_b, &node_c)?;
 
     // A wins ownership at e_A.
-    let elect_a = node_a
-        .db
-        .acquire_shard(SHARD, &membership(3, &[NODE_B, NODE_C]), ELECT_TIMEOUT)?;
+    let elect_a =
+        node_a
+            .db
+            .acquire_shard(SHARD, &membership(3, &[NODE_B, NODE_C]), ELECT_TIMEOUT)?;
 
     // C supersedes A at e_C > e_A: a legitimate failover. After this, B and C have
     // promised = e_C (> e_A), so A is the deposed owner.
-    let elect_c = node_c
-        .db
-        .acquire_shard(SHARD, &membership(3, &[NODE_A, NODE_B]), ELECT_TIMEOUT)?;
+    let elect_c =
+        node_c
+            .db
+            .acquire_shard(SHARD, &membership(3, &[NODE_A, NODE_B]), ELECT_TIMEOUT)?;
     assert!(
         elect_c.ballot > elect_a.ballot,
         "C's superseding ballot must strictly exceed A's: {:?} !> {:?}",

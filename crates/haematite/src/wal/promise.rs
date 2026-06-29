@@ -157,7 +157,10 @@ impl<'a> Cursor<'a> {
             .offset
             .checked_add(len)
             .ok_or(WalError::LengthOverflow)?;
-        let slice = self.bytes.get(self.offset..end).ok_or(WalError::Truncated)?;
+        let slice = self
+            .bytes
+            .get(self.offset..end)
+            .ok_or(WalError::Truncated)?;
         self.offset = end;
         Ok(slice)
     }

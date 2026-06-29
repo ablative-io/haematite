@@ -111,7 +111,9 @@ impl WasmShardRuntime {
     }
 
     pub fn load_module(&mut self, bytes: &[u8]) -> Result<JsValue, WasmRuntimeError> {
-        self.vm.load_module(bytes).map_err(WasmRuntimeError::from_js)
+        self.vm
+            .load_module(bytes)
+            .map_err(WasmRuntimeError::from_js)
     }
 
     pub fn register_async_nif(
@@ -219,7 +221,11 @@ fn is_worker_scope() -> bool {
 }
 
 fn set_property(target: &js_sys::Object, name: &str, value: &JsValue) {
-    drop(js_sys::Reflect::set(target, &JsValue::from_str(name), value));
+    drop(js_sys::Reflect::set(
+        target,
+        &JsValue::from_str(name),
+        value,
+    ));
 }
 
 fn js_error_message(value: JsValue) -> String {

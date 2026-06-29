@@ -14,10 +14,10 @@
 use std::error::Error;
 use std::path::Path;
 
-use haematite::sync::ballot::{Ballot, Stamp};
-use haematite::sync::protocol::{BatchWriteEntry, BatchWriteProposal};
-use haematite::sync::protocol::{AckOutcome, RejectReason, WriteId};
 use haematite::sync::SyncNodeId;
+use haematite::sync::ballot::{Ballot, Stamp};
+use haematite::sync::protocol::{AckOutcome, RejectReason, WriteId};
+use haematite::sync::protocol::{BatchWriteEntry, BatchWriteProposal};
 use haematite::tree::Hash;
 use haematite::{Database, DatabaseConfig};
 

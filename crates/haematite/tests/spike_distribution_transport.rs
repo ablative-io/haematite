@@ -45,12 +45,16 @@
 //!   cargo test -p haematite --test spike_distribution_transport -- --nocapture --test-threads=1
 
 #![allow(clippy::unwrap_used, clippy::panic, clippy::print_stdout)]
-#![allow(clippy::expect_used, clippy::doc_markdown, clippy::redundant_closure_for_method_calls)]
+#![allow(
+    clippy::expect_used,
+    clippy::doc_markdown,
+    clippy::redundant_closure_for_method_calls
+)]
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
-use std::sync::{Arc, Mutex};
 use std::sync::mpsc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use beamr::atom::{Atom, AtomTable};

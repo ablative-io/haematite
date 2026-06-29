@@ -187,9 +187,15 @@ mod tests {
         let mut all = HashSet::new();
         for handle in handles {
             let seqs = handle.join().unwrap_or_default();
-            assert!(!seqs.is_empty(), "worker thread produced no seqs (panicked?)");
+            assert!(
+                !seqs.is_empty(),
+                "worker thread produced no seqs (panicked?)"
+            );
             for seq in seqs {
-                assert!(all.insert(seq), "duplicate seq {seq} — TOCTOU / non-atomic draw");
+                assert!(
+                    all.insert(seq),
+                    "duplicate seq {seq} — TOCTOU / non-atomic draw"
+                );
             }
         }
         // Exactly `THREADS * PER_THREAD` distinct seqs in `0..N`, contiguous.

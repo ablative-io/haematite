@@ -156,7 +156,10 @@ fn main() -> Result3<()> {
     println!("  survivor B durably holds:");
     println!("      events  = {:?}", as_strs(&b_events));
     println!("      status  = {}", show(&b_status));
-    assert_eq!(b_events, events, "B must hold the full committed event batch");
+    assert_eq!(
+        b_events, events,
+        "B must hold the full committed event batch"
+    );
     assert_eq!(
         b_status,
         Some(b"AWAITING_SHIPMENT".to_vec()),
@@ -164,7 +167,10 @@ fn main() -> Result3<()> {
     );
 
     let c_events = read_payloads(&node_c, stream)?;
-    println!("  laggard  C holds events = {:?}  (deliberately excluded — load-bearing)", as_strs(&c_events));
+    println!(
+        "  laggard  C holds events = {:?}  (deliberately excluded — load-bearing)",
+        as_strs(&c_events)
+    );
     assert!(
         c_events.is_empty(),
         "C must lag the events so the failover recovery is non-vacuous"
@@ -238,7 +244,9 @@ fn main() -> Result3<()> {
     // working, not a failover failure. The point of this act is liveness of the new
     // owner over the RECOVERED stream, which the local owner append shows cleanly.
     println!("  B, as the live owner, CONTINUES the recovered workflow:");
-    println!("      replicate_append OrderShipped onto the recovered stream, to quorum {{B, C}}...");
+    println!(
+        "      replicate_append OrderShipped onto the recovered stream, to quorum {{B, C}}..."
+    );
     // Quorum {B, C}: total_nodes 3 ⇒ quorum 2. C missed the original batch, so it
     // would reject a stream append at seq 3 (correct OCC). To extend the recovered
     // stream we therefore first bring C current via its own become_live merge (it
@@ -371,7 +379,10 @@ fn wait_until(timeout: Duration, mut predicate: impl FnMut() -> bool) -> bool {
 }
 
 fn link(from: &Node, to: &Node) -> Result3<()> {
-    let endpoint = from.db.distribution().ok_or("dialing node has no endpoint")?;
+    let endpoint = from
+        .db
+        .distribution()
+        .ok_or("dialing node has no endpoint")?;
     endpoint.add_peer(to.name, to.addr);
     endpoint.connect(to.name)?;
     if !wait_until(HANDSHAKE_TIMEOUT, || endpoint.is_connected(to.name)) {

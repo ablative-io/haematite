@@ -16,11 +16,11 @@ use beamr::module::ModuleRegistry;
 use beamr::process::ExitReason;
 use beamr::scheduler::{Scheduler, SchedulerConfig};
 
-use super::handle::{RangeItem, ShardError, ShardHandle};
 use super::RecordPromiseOutcome;
+use super::handle::{RangeItem, ShardError, ShardHandle};
 use crate::store::DiskStore;
-use crate::sync::ballot::{Ballot, Stamp};
 use crate::sync::SyncNodeId;
+use crate::sync::ballot::{Ballot, Stamp};
 use crate::tree::{Hash, LeafNode, Node};
 use crate::wal::DurableWal;
 
@@ -503,8 +503,20 @@ fn merge_adopt_unions_forked_promiser_state() -> Result<(), Box<dyn Error>> {
 
     // Promiser B holds {k3}; promiser C holds {k2}. Different keys, different
     // committed roots (an incomparable fork under one owner, §2.4).
-    let b = export_committed(&scheduler, "fork-b", b"k3", b"v3", Stamp::new(ballot(2, "A"), 1))?;
-    let c = export_committed(&scheduler, "fork-c", b"k2", b"v2", Stamp::new(ballot(2, "A"), 0))?;
+    let b = export_committed(
+        &scheduler,
+        "fork-b",
+        b"k3",
+        b"v3",
+        Stamp::new(ballot(2, "A"), 1),
+    )?;
+    let c = export_committed(
+        &scheduler,
+        "fork-c",
+        b"k2",
+        b"v2",
+        Stamp::new(ballot(2, "A"), 0),
+    )?;
 
     // MERGE path: fold BOTH promisers into a fresh target.
     let target = TestShard::spawn(&scheduler, "fork-target")?;
@@ -545,8 +557,20 @@ fn merge_adopt_unions_forked_promiser_state() -> Result<(), Box<dyn Error>> {
 fn merge_adopt_root_survives_crash_recovery() -> Result<(), Box<dyn Error>> {
     let scheduler = test_scheduler()?;
 
-    let b = export_committed(&scheduler, "durable-b", b"k3", b"v3", Stamp::new(ballot(2, "A"), 1))?;
-    let c = export_committed(&scheduler, "durable-c", b"k2", b"v2", Stamp::new(ballot(2, "A"), 0))?;
+    let b = export_committed(
+        &scheduler,
+        "durable-b",
+        b"k3",
+        b"v3",
+        Stamp::new(ballot(2, "A"), 1),
+    )?;
+    let c = export_committed(
+        &scheduler,
+        "durable-c",
+        b"k2",
+        b"v2",
+        Stamp::new(ballot(2, "A"), 0),
+    )?;
 
     let target = TestShard::spawn(&scheduler, "durable-target")?;
     target.handle.merge_adopt(vec![b, c], TIMEOUT)?;
@@ -727,11 +751,23 @@ fn batch_cas_mismatch_rejects_whole_batch_no_partial_apply() -> Result<(), Box<d
     );
 
     // ALL-OR-NOTHING: the keys whose CAS WOULD have passed were NOT applied.
-    assert_eq!(get(handle, b"k1")?, None, "k1 must NOT be applied (no partial write)");
-    assert_eq!(get(handle, b"k3")?, None, "k3 must NOT be applied (no partial write)");
+    assert_eq!(
+        get(handle, b"k1")?,
+        None,
+        "k1 must NOT be applied (no partial write)"
+    );
+    assert_eq!(
+        get(handle, b"k3")?,
+        None,
+        "k3 must NOT be applied (no partial write)"
+    );
     // k2 is unchanged — still the seeded value with its seeded stamp.
     assert_eq!(get(handle, b"k2")?, Some(b"already-here".to_vec()));
-    assert_eq!(stamp_of(handle, b"k2")?, seeded, "k2 must be untouched by the rejected batch");
+    assert_eq!(
+        stamp_of(handle, b"k2")?,
+        seeded,
+        "k2 must be untouched by the rejected batch"
+    );
 
     scheduler.shutdown();
     Ok(())

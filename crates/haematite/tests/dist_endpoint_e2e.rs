@@ -72,10 +72,7 @@ fn sync_message_round_trips_between_two_live_databases() {
     // ----- Teach each side how to reach the other, then dial A -> B -----------
     // The connect side must know B's address; the accept side (B) must know A's
     // address so its handshake bookkeeping resolves.
-    database_b
-        .connect_peer(NODE_A_NAME, addr_a)
-        .map(drop)
-        .ok();
+    database_b.connect_peer(NODE_A_NAME, addr_a).map(drop).ok();
     database_a
         .connect_peer(NODE_B_NAME, addr_b)
         .expect("node A dials node B");
@@ -106,7 +103,10 @@ fn sync_message_round_trips_between_two_live_databases() {
 
     match received {
         SyncMessage::RootRequest(got) => {
-            assert_eq!(got, sent, "RootExchangeRequest round-trips through the Database API");
+            assert_eq!(
+                got, sent,
+                "RootExchangeRequest round-trips through the Database API"
+            );
         }
         other => panic!("expected RootRequest, got {other:?}"),
     }

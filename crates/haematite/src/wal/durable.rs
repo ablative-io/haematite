@@ -144,7 +144,10 @@ impl DurableWal {
     /// (contents + metadata) before `Ok`. The frame shares the WAL's outer
     /// `[frame_len: u32 LE]` framing and CRC discipline, so it co-exists with
     /// data entries and the committed-root marker in one fsync domain.
-    pub fn append_promise(&mut self, record: &super::promise::PromiseRecord) -> Result<(), WalError> {
+    pub fn append_promise(
+        &mut self,
+        record: &super::promise::PromiseRecord,
+    ) -> Result<(), WalError> {
         let bytes = record.serialise();
         self.write_entry_frame(&bytes)?;
         self.file.sync_all()?;

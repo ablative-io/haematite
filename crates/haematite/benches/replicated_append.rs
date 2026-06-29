@@ -66,7 +66,9 @@ const SHARD: usize = 0;
 const BATCH_N: usize = 8;
 
 fn payloads() -> Vec<Vec<u8>> {
-    (0..BATCH_N).map(|i| format!("event-{i:04}").into_bytes()).collect()
+    (0..BATCH_N)
+        .map(|i| format!("event-{i:04}").into_bytes())
+        .collect()
 }
 
 fn bench_replicated_append(c: &mut Criterion) {
@@ -156,10 +158,19 @@ impl Node {
         let responder_running = Arc::clone(&running);
         let responder = std::thread::spawn(move || {
             while responder_running.load(Ordering::Relaxed) {
-                drop(respond_to_inbound_writes(&responder_db, Duration::from_millis(20)));
+                drop(respond_to_inbound_writes(
+                    &responder_db,
+                    Duration::from_millis(20),
+                ));
             }
         });
-        Ok(Self { db, addr, name, responder: Some(responder), running })
+        Ok(Self {
+            db,
+            addr,
+            name,
+            responder: Some(responder),
+            running,
+        })
     }
 }
 
@@ -194,7 +205,12 @@ impl Cluster {
         link_both(&node_a, &node_b)?;
         link_both(&node_a, &node_c)?;
         link_both(&node_b, &node_c)?;
-        Ok(Self { node_a, node_b, node_c, _dirs: [dir_a, dir_b, dir_c] })
+        Ok(Self {
+            node_a,
+            node_b,
+            node_c,
+            _dirs: [dir_a, dir_b, dir_c],
+        })
     }
 
     fn shutdown(self) {
@@ -216,7 +232,10 @@ fn wait_until(timeout: Duration, mut predicate: impl FnMut() -> bool) -> bool {
 }
 
 fn link(from: &Node, to: &Node) -> Result<(), Box<dyn std::error::Error>> {
-    let endpoint = from.db.distribution().ok_or("dialing node has no endpoint")?;
+    let endpoint = from
+        .db
+        .distribution()
+        .ok_or("dialing node has no endpoint")?;
     endpoint.add_peer(to.name, to.addr);
     endpoint.connect(to.name)?;
     if !wait_until(HANDSHAKE_TIMEOUT, || endpoint.is_connected(to.name)) {

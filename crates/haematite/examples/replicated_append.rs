@@ -93,7 +93,11 @@ fn main() -> Result3<()> {
     for node in [&node_a, &node_b, &node_c] {
         let payloads = read_payloads(node, stream)?;
         let seq = node.db.read_stream_next_seq(stream)?;
-        println!("  {}: events = {:?}, next-seq = {seq:?}", node.name, as_strs(&payloads));
+        println!(
+            "  {}: events = {:?}, next-seq = {seq:?}",
+            node.name,
+            as_strs(&payloads)
+        );
         assert_eq!(payloads, batch, "{} must hold the full batch", node.name);
         assert_eq!(seq, Some(4), "{} must hold next-seq 4", node.name);
     }
@@ -116,7 +120,11 @@ fn main() -> Result3<()> {
     }
     for node in [&node_a, &node_b, &node_c] {
         let payloads = read_payloads(node, stream)?;
-        assert_eq!(payloads, batch, "{} stream unchanged after the conflict", node.name);
+        assert_eq!(
+            payloads, batch,
+            "{} stream unchanged after the conflict",
+            node.name
+        );
     }
     println!("  all nodes still hold exactly the original 4 events\n");
 
@@ -206,7 +214,10 @@ fn wait_until(timeout: Duration, mut predicate: impl FnMut() -> bool) -> bool {
 }
 
 fn link(from: &Node, to: &Node) -> Result3<()> {
-    let endpoint = from.db.distribution().ok_or("dialing node has no endpoint")?;
+    let endpoint = from
+        .db
+        .distribution()
+        .ok_or("dialing node has no endpoint")?;
     endpoint.add_peer(to.name, to.addr);
     endpoint.connect(to.name)?;
     if !wait_until(HANDSHAKE_TIMEOUT, || endpoint.is_connected(to.name)) {

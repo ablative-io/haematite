@@ -229,7 +229,8 @@ impl StampedEntry {
     /// reads as absent at every clock.
     #[must_use]
     pub fn is_expired_at(&self, now: ExpiryTimestamp) -> bool {
-        self.expires_at().is_some_and(|expires_at| expires_at <= now)
+        self.expires_at()
+            .is_some_and(|expires_at| expires_at <= now)
     }
 
     /// Deterministically encode this stamped envelope.
@@ -316,7 +317,11 @@ impl StampedEntry {
 /// value. The logical `value` bytes are stored verbatim, so the read path
 /// recovers them exactly and the CAS hash is unchanged.
 #[must_use]
-pub fn encode_stamped(value: Vec<u8>, stamp: Stamp, expires_at: Option<ExpiryTimestamp>) -> Vec<u8> {
+pub fn encode_stamped(
+    value: Vec<u8>,
+    stamp: Stamp,
+    expires_at: Option<ExpiryTimestamp>,
+) -> Vec<u8> {
     StampedEntry::new(stamp, expires_at, value).encode()
 }
 
@@ -481,8 +486,8 @@ mod tests {
     }
 
     #[test]
-    fn stamped_envelope_round_trips_stamp_ttl_and_value()
-    -> Result<(), Box<dyn std::error::Error>> {
+    fn stamped_envelope_round_trips_stamp_ttl_and_value() -> Result<(), Box<dyn std::error::Error>>
+    {
         // A stamped envelope carries `{ stamp, ttl, value }` and decodes back to
         // exactly those — including a multi-byte node id and a high seq/counter.
         let entry = StampedEntry::new(
@@ -491,7 +496,10 @@ mod tests {
             b"payload".to_vec(),
         );
         let decoded = StampedEntry::decode(&entry.encode())?.ok_or("missing stamped envelope")?;
-        assert_eq!(decoded.stamp(), &stamp(7, "owner-node-\u{00e9}", 0xdead_beef));
+        assert_eq!(
+            decoded.stamp(),
+            &stamp(7, "owner-node-\u{00e9}", 0xdead_beef)
+        );
         assert_eq!(decoded.expires_at(), Some(42));
         assert_eq!(decoded.value(), Some(b"payload".as_slice()));
         assert!(!decoded.is_tombstone());
@@ -508,7 +516,10 @@ mod tests {
     fn non_stamped_bytes_decode_to_none() -> Result<(), Box<dyn std::error::Error>> {
         // A plain TTL envelope and a raw value are NOT stamped envelopes.
         assert_eq!(StampedEntry::decode(b"plain")?, None);
-        assert_eq!(StampedEntry::decode(&TtlEntry::expiring(b"v".to_vec(), 9).encode())?, None);
+        assert_eq!(
+            StampedEntry::decode(&TtlEntry::expiring(b"v".to_vec(), 9).encode())?,
+            None
+        );
         Ok(())
     }
 
@@ -516,8 +527,8 @@ mod tests {
     /// reads as ABSENT (`visible_value_at` is Expired at every clock), and its
     /// CAS hash is `None` (it has no logical value, so create-if-absent matches).
     #[test]
-    fn stamped_tombstone_round_trips_and_reads_as_absent()
-    -> Result<(), Box<dyn std::error::Error>> {
+    fn stamped_tombstone_round_trips_and_reads_as_absent() -> Result<(), Box<dyn std::error::Error>>
+    {
         let encoded = encode_stamped_tombstone(stamp(11, "owner", 4));
         let decoded = StampedEntry::decode(&encoded)?.ok_or("missing tombstone")?;
         assert!(decoded.is_tombstone());
@@ -542,13 +553,19 @@ mod tests {
     fn empty_value_is_not_a_tombstone() -> Result<(), Box<dyn std::error::Error>> {
         let empty_value = encode_stamped(Vec::new(), stamp(3, "n", 0), None);
         let tombstone = encode_stamped_tombstone(stamp(3, "n", 0));
-        assert_ne!(empty_value, tombstone, "empty value must differ from tombstone");
+        assert_ne!(
+            empty_value, tombstone,
+            "empty value must differ from tombstone"
+        );
 
         let value = StampedEntry::decode(&empty_value)?.ok_or("missing value")?;
         assert!(!value.is_tombstone());
         assert_eq!(value.value(), Some(b"".as_slice()));
         // An empty value is Live(empty) — present-but-empty, NOT absent.
-        assert_eq!(visible_value_at(&empty_value, 0)?, Visibility::Live(Vec::new()));
+        assert_eq!(
+            visible_value_at(&empty_value, 0)?,
+            Visibility::Live(Vec::new())
+        );
 
         let tomb = StampedEntry::decode(&tombstone)?.ok_or("missing tombstone")?;
         assert!(tomb.is_tombstone());
@@ -561,12 +578,14 @@ mod tests {
     /// CAS identity. We hash the visibility-filtered (stamp-stripped) value exactly
     /// as `ShardActor::current_value_hash` does.
     #[test]
-    fn same_value_different_stamps_hash_identically()
-    -> Result<(), Box<dyn std::error::Error>> {
+    fn same_value_different_stamps_hash_identically() -> Result<(), Box<dyn std::error::Error>> {
         let value = b"logical-value".to_vec();
         let a = encode_stamped(value.clone(), stamp(3, "A", 0), None);
         let b = encode_stamped(value.clone(), stamp(9, "B", 17), None);
-        assert_ne!(a, b, "different stamps must encode to different envelope bytes");
+        assert_ne!(
+            a, b,
+            "different stamps must encode to different envelope bytes"
+        );
 
         let visible_a = visible_value_at(&a, 0)?;
         let visible_b = visible_value_at(&b, 0)?;
@@ -583,8 +602,7 @@ mod tests {
     }
 
     #[test]
-    fn stamped_value_colliding_with_magic_round_trips()
-    -> Result<(), Box<dyn std::error::Error>> {
+    fn stamped_value_colliding_with_magic_round_trips() -> Result<(), Box<dyn std::error::Error>> {
         // A logical value that itself begins with STAMP_MAGIC survives the stamped
         // envelope unambiguously: decode strips the outer header and returns the
         // inner bytes verbatim (the length-delimited fields make this exact).

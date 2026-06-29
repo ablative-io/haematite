@@ -97,7 +97,11 @@ fn main() -> Result<(), Box<dyn Error>> {
     let events = store.read(b"audit:log")?;
     println!("  read audit:log -> {} events:", events.len());
     for event in &events {
-        println!("    seq {}: {}", event.seq, String::from_utf8_lossy(&event.payload));
+        println!(
+            "    seq {}: {}",
+            event.seq,
+            String::from_utf8_lossy(&event.payload)
+        );
     }
     assert_eq!(events.len(), 2);
     assert_eq!(events[0].payload, b"NodeStarted");

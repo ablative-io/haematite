@@ -343,7 +343,11 @@ fn scan_sequence_keys_for_shards_scopes_to_named_shards() -> Result<(), Box<dyn 
     assert!(by_shard.len() >= 2, "streams must span multiple shards");
 
     // The full scan returns every stream.
-    let all: BTreeSet<Vec<u8>> = db.scan_sequence_keys()?.into_iter().map(|(k, _)| k).collect();
+    let all: BTreeSet<Vec<u8>> = db
+        .scan_sequence_keys()?
+        .into_iter()
+        .map(|(k, _)| k)
+        .collect();
     let expected: BTreeSet<Vec<u8>> = by_shard.values().flatten().cloned().collect();
     assert_eq!(all, expected, "full scan must return all streams");
 
@@ -353,16 +357,26 @@ fn scan_sequence_keys_for_shards_scopes_to_named_shards() -> Result<(), Box<dyn 
             .scan_sequence_keys_for_shards(&[shard])?
             .into_iter()
             .map(|(k, seq)| {
-                assert_eq!(db.shard_for(&k), shard, "scoped scan surfaced a foreign-shard stream");
+                assert_eq!(
+                    db.shard_for(&k),
+                    shard,
+                    "scoped scan surfaced a foreign-shard stream"
+                );
                 assert_eq!(seq, 1, "each stream has exactly one event");
                 k
             })
             .collect();
-        assert_eq!(&scoped, keys, "shard {shard} scan must return exactly its own streams");
+        assert_eq!(
+            &scoped, keys,
+            "shard {shard} scan must return exactly its own streams"
+        );
     }
 
     // An out-of-range shard id errors cleanly rather than panicking.
-    assert!(db.scan_sequence_keys_for_shards(&[db.shard_count()]).is_err());
+    assert!(
+        db.scan_sequence_keys_for_shards(&[db.shard_count()])
+            .is_err()
+    );
     Ok(())
 }
 

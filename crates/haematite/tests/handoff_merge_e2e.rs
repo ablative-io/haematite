@@ -128,7 +128,10 @@ impl Drop for Node {
 }
 
 fn link(from: &Node, to: &Node) -> TestResult {
-    let endpoint = from.db.distribution().ok_or("dialing node has no endpoint")?;
+    let endpoint = from
+        .db
+        .distribution()
+        .ok_or("dialing node has no endpoint")?;
     endpoint.add_peer(to.name, to.addr);
     endpoint.connect(to.name)?;
     if !wait_until(HANDSHAKE_TIMEOUT, || endpoint.is_connected(to.name)) {
@@ -338,7 +341,11 @@ fn committed_delete_survives_failover_not_resurrected() -> TestResult {
         &membership(3, &[NODE_B]),
         OP_TIMEOUT,
     )?;
-    assert_eq!(node_b.db.get(b"k")?, None, "B applied the tombstone (absent)");
+    assert_eq!(
+        node_b.db.get(b"k")?,
+        None,
+        "B applied the tombstone (absent)"
+    );
     assert_eq!(
         node_c.db.get(b"k")?,
         Some(b"v".to_vec()),

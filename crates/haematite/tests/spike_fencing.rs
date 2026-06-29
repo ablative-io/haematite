@@ -164,9 +164,15 @@ fn e1_cas_fencing_epoch_single_instance() -> TestResult {
     // as Some(0) (distinct from None=absent).
     println!("[probe] absent-vs-physical-zero:");
     let zkey = b"ownership/zerocheck".to_vec();
-    println!("    before any write, read_value = {:?}", store.read_value(&zkey)?);
+    println!(
+        "    before any write, read_value = {:?}",
+        store.read_value(&zkey)?
+    );
     store.cas(&zkey, None, 0)?; // create with physical 0
-    println!("    after cas(None -> 0), read_value = {:?}", store.read_value(&zkey)?);
+    println!(
+        "    after cas(None -> 0), read_value = {:?}",
+        store.read_value(&zkey)?
+    );
     let absent_again = store.cas(&zkey, None, 5);
     println!("    cas(None -> 5) on a physical-0 key = {absent_again:?} (None != Some(0))");
 
@@ -208,16 +214,25 @@ fn e2_divergent_event_streams_sync_merge() -> TestResult {
     println!("node B root = {root_b}");
 
     println!("\n--- BEFORE sync ---");
-    println!("A stream: {:?}", render(read_stream(&node_a, root_a, &stream, 4)));
+    println!(
+        "A stream: {:?}",
+        render(read_stream(&node_a, root_a, &stream, 4))
+    );
     println!("A counter: {:?}", counter(&node_a, root_a, &stream));
-    println!("B stream: {:?}", render(read_stream(&node_b, root_b, &stream, 4)));
+    println!(
+        "B stream: {:?}",
+        render(read_stream(&node_b, root_b, &stream, 4))
+    );
     println!("B counter: {:?}", counter(&node_b, root_b, &stream));
 
     // HEAL: run the REAL sync transfer (B pulls A's nodes into B's store) then
     // the REAL three-way merge on node B. Target = B's root, source = A's root,
     // base = common base.
     let pull = pull_from_source(&node_a, &mut node_b, 0, Some(root_a), Some(root_b))?;
-    println!("\nsync pull: nodes_transferred = {}", pull.stats.nodes_transferred);
+    println!(
+        "\nsync pull: nodes_transferred = {}",
+        pull.stats.nodes_transferred
+    );
 
     let merged = merge_synced_roots(
         &mut node_b,
@@ -230,26 +245,42 @@ fn e2_divergent_event_streams_sync_merge() -> TestResult {
         println!(
             "  conflict key={} parent(B)={:?} branch(A)={:?} resolved={:?}",
             String::from_utf8_lossy(&d.key),
-            d.parent_value.as_ref().map(|v| String::from_utf8_lossy(v).into_owned()),
-            d.branch_value.as_ref().map(|v| String::from_utf8_lossy(v).into_owned()),
-            d.resolved_value.as_ref().map(|v| String::from_utf8_lossy(v).into_owned()),
+            d.parent_value
+                .as_ref()
+                .map(|v| String::from_utf8_lossy(v).into_owned()),
+            d.branch_value
+                .as_ref()
+                .map(|v| String::from_utf8_lossy(v).into_owned()),
+            d.resolved_value
+                .as_ref()
+                .map(|v| String::from_utf8_lossy(v).into_owned()),
         );
     }
 
     println!("\n--- AFTER merge (merged root on node B) ---");
     let after = read_stream(&node_b, merged.merged_root, &stream, 4);
     println!("merged stream: {:?}", render(after));
-    println!("merged counter: {:?}", counter(&node_b, merged.merged_root, &stream));
+    println!(
+        "merged counter: {:?}",
+        counter(&node_b, merged.merged_root, &stream)
+    );
 
     // Empirical checks: did A's event survive? did B's? what happened at the
     // collided event key (engine seq 2)? what about the counter?
     let seq2 = get(&node_b, merged.merged_root, &event_key(&stream, 2));
     println!(
         "\nevent@seq2 after merge = {:?}",
-        seq2.as_ref().map(|v| String::from_utf8_lossy(v).into_owned())
+        seq2.as_ref()
+            .map(|v| String::from_utf8_lossy(v).into_owned())
     );
-    println!("OBSERVATION: A's payload survived = {}", seq2.as_deref() == Some(b"A-wrote-this"));
-    println!("OBSERVATION: B's payload survived = {}", seq2.as_deref() == Some(b"B-wrote-this"));
+    println!(
+        "OBSERVATION: A's payload survived = {}",
+        seq2.as_deref() == Some(b"A-wrote-this")
+    );
+    println!(
+        "OBSERVATION: B's payload survived = {}",
+        seq2.as_deref() == Some(b"B-wrote-this")
+    );
     println!(
         "OBSERVATION: exactly one of the two divergent events at seq2 was silently dropped (LWW)."
     );
@@ -286,8 +317,14 @@ fn e2b_nonoverlapping_seqs_both_survive_but_counter_collides() -> TestResult {
     )?;
 
     println!("divergences = {}", merged.divergence_count());
-    println!("merged stream: {:?}", render(read_stream(&node_b, merged.merged_root, &stream, 5)));
-    println!("merged counter: {:?}", counter(&node_b, merged.merged_root, &stream));
+    println!(
+        "merged stream: {:?}",
+        render(read_stream(&node_b, merged.merged_root, &stream, 5))
+    );
+    println!(
+        "merged counter: {:?}",
+        counter(&node_b, merged.merged_root, &stream)
+    );
     println!(
         "OBSERVATION: distinct-key events both survive; the SHARED counter key is the only \
          conflict and is LWW'd, so the counter no longer matches the true event count."
@@ -318,31 +355,53 @@ fn e3_fence_with_shared_ownership_domain() -> TestResult {
             u64::from_be_bytes(a)
         })
     };
-    let cas_epoch =
-        |store: &mut MemoryStore, root: Hash, expected: Option<u64>, new: u64| -> Result<Hash, String> {
-            let actual = get(store, root, &owner_key).map(|b| {
-                let a: [u8; 8] = b.as_slice().try_into().unwrap();
-                u64::from_be_bytes(a)
-            });
-            if actual != expected {
-                return Err(format!("CasMismatch expected={expected:?} actual={actual:?}"));
-            }
-            Ok(batch_mutate(store, root, &[(owner_key.clone(), Some(new.to_be_bytes().to_vec()))]).unwrap())
-        };
+    let cas_epoch = |store: &mut MemoryStore,
+                     root: Hash,
+                     expected: Option<u64>,
+                     new: u64|
+     -> Result<Hash, String> {
+        let actual = get(store, root, &owner_key).map(|b| {
+            let a: [u8; 8] = b.as_slice().try_into().unwrap();
+            u64::from_be_bytes(a)
+        });
+        if actual != expected {
+            return Err(format!(
+                "CasMismatch expected={expected:?} actual={actual:?}"
+            ));
+        }
+        Ok(batch_mutate(
+            store,
+            root,
+            &[(owner_key.clone(), Some(new.to_be_bytes().to_vec()))],
+        )
+        .unwrap())
+    };
 
     // A acquires epoch 1 in the shared domain.
     owner_root = cas_epoch(&mut shared_owner, owner_root, None, 1)?;
-    println!("[A] acquired epoch 1 in shared domain. epoch={:?}", read_epoch(&shared_owner, owner_root));
+    println!(
+        "[A] acquired epoch 1 in shared domain. epoch={:?}",
+        read_epoch(&shared_owner, owner_root)
+    );
 
     // B (new owner) acquires epoch 2 in the SAME shared domain.
     owner_root = cas_epoch(&mut shared_owner, owner_root, Some(1), 2)?;
-    println!("[B] acquired epoch 2 in shared domain. epoch={:?}", read_epoch(&shared_owner, owner_root));
+    println!(
+        "[B] acquired epoch 2 in shared domain. epoch={:?}",
+        read_epoch(&shared_owner, owner_root)
+    );
 
     // Stale A tries to write, gated on epoch==1: gate fails -> NO event written.
     let a_epoch_belief = 1_u64;
     let gate_ok = read_epoch(&shared_owner, owner_root) == Some(a_epoch_belief);
-    println!("[A] gate write on epoch==1 -> {}", if gate_ok { "PASS (BUG)" } else { "FENCED" });
-    assert!(!gate_ok, "E3 FAILED: stale owner passed the shared-domain gate");
+    println!(
+        "[A] gate write on epoch==1 -> {}",
+        if gate_ok { "PASS (BUG)" } else { "FENCED" }
+    );
+    assert!(
+        !gate_ok,
+        "E3 FAILED: stale owner passed the shared-domain gate"
+    );
     println!(
         "E3 RESULT (shared domain): stale writer fenced; with a single consistency domain for the \
          epoch record there is nothing divergent to merge.\n"
@@ -363,8 +422,18 @@ fn e3_critical_ownership_record_diverges_under_partition() -> TestResult {
     // Common base: epoch 1, owned by some prior owner. Both sides start here.
     let empty_a = empty_root(&mut node_a);
     let empty_b = empty_root(&mut node_b);
-    let base_a = batch_mutate(&mut node_a, empty_a, &[(owner_key.clone(), Some(1_u64.to_be_bytes().to_vec()))]).unwrap();
-    let base_b = batch_mutate(&mut node_b, empty_b, &[(owner_key.clone(), Some(1_u64.to_be_bytes().to_vec()))]).unwrap();
+    let base_a = batch_mutate(
+        &mut node_a,
+        empty_a,
+        &[(owner_key.clone(), Some(1_u64.to_be_bytes().to_vec()))],
+    )
+    .unwrap();
+    let base_b = batch_mutate(
+        &mut node_b,
+        empty_b,
+        &[(owner_key.clone(), Some(1_u64.to_be_bytes().to_vec()))],
+    )
+    .unwrap();
     assert_eq!(base_a, base_b);
     let base = base_a;
 
@@ -372,21 +441,35 @@ fn e3_critical_ownership_record_diverges_under_partition() -> TestResult {
         get(store, root, &owner_key).map(|b| u64::from_be_bytes(b.as_slice().try_into().unwrap()))
     };
     // LOCAL cas: each side reads ITS OWN copy, sees epoch 1, and bumps to 2.
-    let local_cas = |store: &mut MemoryStore, root: Hash, expected: u64, new: u64| -> Result<Hash, String> {
-        let actual = read(store, root);
-        if actual != Some(expected) {
-            return Err(format!("CasMismatch expected={expected} actual={actual:?}"));
-        }
-        Ok(batch_mutate(store, root, &[(owner_key.clone(), Some(new.to_be_bytes().to_vec()))]).unwrap())
-    };
+    let local_cas =
+        |store: &mut MemoryStore, root: Hash, expected: u64, new: u64| -> Result<Hash, String> {
+            let actual = read(store, root);
+            if actual != Some(expected) {
+                return Err(format!("CasMismatch expected={expected} actual={actual:?}"));
+            }
+            Ok(batch_mutate(
+                store,
+                root,
+                &[(owner_key.clone(), Some(new.to_be_bytes().to_vec()))],
+            )
+            .unwrap())
+        };
 
     // BOTH partitions independently acquire (cas-bump 1 -> 2). Both SUCCEED,
     // because each only consults its local copy.
     let root_a = local_cas(&mut node_a, base, 1, 2)?;
     let root_b = local_cas(&mut node_b, base, 1, 2)?;
-    println!("[A] local cas(1 -> 2) => {:?}  (SUCCESS)", read(&node_a, root_a));
-    println!("[B] local cas(1 -> 2) => {:?}  (SUCCESS)", read(&node_b, root_b));
-    println!(">>> BOTH partitions believe they own the shard at epoch 2. Split-brain on the EPOCH itself.");
+    println!(
+        "[A] local cas(1 -> 2) => {:?}  (SUCCESS)",
+        read(&node_a, root_a)
+    );
+    println!(
+        "[B] local cas(1 -> 2) => {:?}  (SUCCESS)",
+        read(&node_b, root_b)
+    );
+    println!(
+        ">>> BOTH partitions believe they own the shard at epoch 2. Split-brain on the EPOCH itself."
+    );
 
     // Each "owner" now writes events gated on its locally-true epoch==2 — both
     // pass their local gate.
@@ -396,7 +479,12 @@ fn e3_critical_ownership_record_diverges_under_partition() -> TestResult {
 
     // HEAL: merge the ownership record. Both sides set epoch 1 -> 2: same value.
     pull_from_source(&node_a, &mut node_b, 0, Some(ev_a), Some(ev_b))?;
-    let merged = merge_synced_roots(&mut node_b, 0, SyncMergeRoots::new(ev_b, ev_a, base), &ConflictPolicy::Lww)?;
+    let merged = merge_synced_roots(
+        &mut node_b,
+        0,
+        SyncMergeRoots::new(ev_b, ev_a, base),
+        &ConflictPolicy::Lww,
+    )?;
 
     let final_epoch = read(&node_b, merged.merged_root);
     println!("\n--- AFTER heal/merge ---");
@@ -407,9 +495,15 @@ fn e3_critical_ownership_record_diverges_under_partition() -> TestResult {
         println!(
             "  diverged key = {} (is_epoch_record={key_is_epoch})  parent={:?} branch={:?} resolved={:?}",
             String::from_utf8_lossy(&d.key),
-            d.parent_value.as_ref().map(|v| String::from_utf8_lossy(v).into_owned()),
-            d.branch_value.as_ref().map(|v| String::from_utf8_lossy(v).into_owned()),
-            d.resolved_value.as_ref().map(|v| String::from_utf8_lossy(v).into_owned()),
+            d.parent_value
+                .as_ref()
+                .map(|v| String::from_utf8_lossy(v).into_owned()),
+            d.branch_value
+                .as_ref()
+                .map(|v| String::from_utf8_lossy(v).into_owned()),
+            d.resolved_value
+                .as_ref()
+                .map(|v| String::from_utf8_lossy(v).into_owned()),
         );
     }
     let epoch_was_flagged = merged.divergences.iter().any(|d| d.key == owner_key);
@@ -417,7 +511,10 @@ fn e3_critical_ownership_record_diverges_under_partition() -> TestResult {
         "epoch record itself flagged as a conflict? {epoch_was_flagged}  (both wrote 2 => identical \
          => NOT flagged; merge is clean on the epoch key)"
     );
-    println!("merged stream = {:?}", render(read_stream(&node_b, merged.merged_root, &stream, 2)));
+    println!(
+        "merged stream = {:?}",
+        render(read_stream(&node_b, merged.merged_root, &stream, 2))
+    );
     println!(
         "OBSERVATION: both sides wrote epoch=2 so the epoch record merges CLEANLY (no conflict \
          surfaced), yet TWO different owners each committed events under 'their' epoch 2. The \

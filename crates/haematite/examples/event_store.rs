@@ -93,12 +93,18 @@ fn main() -> Result<(), Box<dyn Error>> {
                 "  append seq 0  REJECTED: SequenceConflict {{ expected: {}, actual: {} }}",
                 conflict.expected, conflict.actual
             );
-            println!("  (the stream is really at seq {}, so nothing was appended)", conflict.actual);
+            println!(
+                "  (the stream is really at seq {}, so nothing was appended)",
+                conflict.actual
+            );
         }
         Err(other) => println!("  UNEXPECTED error: {other}"),
     }
     let after = store.read(stream)?;
-    println!("  the stream is unchanged — still {} events (the guard protected it)", after.len());
+    println!(
+        "  the stream is unchanged — still {} events (the guard protected it)",
+        after.len()
+    );
     assert_eq!(after.len(), 5);
     println!();
 

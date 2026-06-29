@@ -107,11 +107,7 @@ impl Node {
         Self::attach(name, data_dir, db)
     }
 
-    fn attach(
-        name: &'static str,
-        data_dir: PathBuf,
-        db: Database,
-    ) -> Result<Self, Box<dyn Error>> {
+    fn attach(name: &'static str, data_dir: PathBuf, db: Database) -> Result<Self, Box<dyn Error>> {
         let endpoint = DistributionEndpoint::bind(name, loopback()?, 1, None)?;
         let addr = endpoint.local_addr();
         let db = Arc::new(db.with_distribution(endpoint));
@@ -151,7 +147,10 @@ impl Drop for Node {
 
 /// Dial `from` -> `to` (one direction) and wait for the link to register.
 fn link(from: &Node, to: &Node) -> TestResult {
-    let endpoint = from.db.distribution().ok_or("dialing node has no endpoint")?;
+    let endpoint = from
+        .db
+        .distribution()
+        .ok_or("dialing node has no endpoint")?;
     endpoint.add_peer(to.name, to.addr);
     endpoint.connect(to.name)?;
     if !wait_until(HANDSHAKE_TIMEOUT, || endpoint.is_connected(to.name)) {
@@ -208,17 +207,38 @@ fn replicated_write_lands_identical_stamp_on_proposer_and_peer() -> TestResult {
     )?;
 
     // The two writes carry stamps (e',0) and (e',1) — identical on A and B.
-    let a_k1 = node_a.db.stored_stamp_for_test(b"k1").ok_or("A missing k1 stamp")?;
-    let b_k1 = node_b.db.stored_stamp_for_test(b"k1").ok_or("B missing k1 stamp")?;
-    let a_k2 = node_a.db.stored_stamp_for_test(b"k2").ok_or("A missing k2 stamp")?;
-    let b_k2 = node_b.db.stored_stamp_for_test(b"k2").ok_or("B missing k2 stamp")?;
+    let a_k1 = node_a
+        .db
+        .stored_stamp_for_test(b"k1")
+        .ok_or("A missing k1 stamp")?;
+    let b_k1 = node_b
+        .db
+        .stored_stamp_for_test(b"k1")
+        .ok_or("B missing k1 stamp")?;
+    let a_k2 = node_a
+        .db
+        .stored_stamp_for_test(b"k2")
+        .ok_or("A missing k2 stamp")?;
+    let b_k2 = node_b
+        .db
+        .stored_stamp_for_test(b"k2")
+        .ok_or("B missing k2 stamp")?;
 
-    assert_eq!(a_k1, b_k1, "k1 stamp must be IDENTICAL on proposer and peer");
-    assert_eq!(a_k2, b_k2, "k2 stamp must be IDENTICAL on proposer and peer");
+    assert_eq!(
+        a_k1, b_k1,
+        "k1 stamp must be IDENTICAL on proposer and peer"
+    );
+    assert_eq!(
+        a_k2, b_k2,
+        "k2 stamp must be IDENTICAL on proposer and peer"
+    );
     assert_eq!(a_k1.epoch, e_prime, "k1 stamped with the live epoch e'");
     assert_eq!(a_k2.epoch, e_prime, "k2 stamped with the live epoch e'");
     // Distinct seqs under one epoch, advancing per committed write.
-    assert_ne!(a_k1.seq, a_k2.seq, "two writes under one epoch get distinct seq");
+    assert_ne!(
+        a_k1.seq, a_k2.seq,
+        "two writes under one epoch get distinct seq"
+    );
     assert!(a_k1.seq < a_k2.seq, "seq advances with write order");
     Ok(())
 }
@@ -263,8 +283,14 @@ fn recovered_owner_epoch_cannot_restamp_without_reacquire() -> TestResult {
             WRITE_TIMEOUT,
         )?;
     }
-    let pre1 = node_a.db.stored_stamp_for_test(b"pre1").ok_or("missing pre1")?;
-    let pre2 = node_a.db.stored_stamp_for_test(b"pre2").ok_or("missing pre2")?;
+    let pre1 = node_a
+        .db
+        .stored_stamp_for_test(b"pre1")
+        .ok_or("missing pre1")?;
+    let pre2 = node_a
+        .db
+        .stored_stamp_for_test(b"pre2")
+        .ok_or("missing pre2")?;
     assert_eq!(pre1, Stamp::new(e_prime.clone(), 0));
     assert_eq!(pre2, Stamp::new(e_prime.clone(), 1));
 
@@ -333,7 +359,10 @@ fn recovered_owner_epoch_cannot_restamp_without_reacquire() -> TestResult {
         .db
         .stored_stamp_for_test(b"post-reacquire")
         .ok_or("missing post-reacquire stamp")?;
-    assert_eq!(after.epoch, e_pp, "post-reacquire writes stamp the NEW epoch e''");
+    assert_eq!(
+        after.epoch, e_pp,
+        "post-reacquire writes stamp the NEW epoch e''"
+    );
     assert_eq!(after.seq, 0, "seq restarts at 0 under the new live epoch");
     // Distinct from every pre-crash (e', _): e'' strictly dominates e'.
     assert!(after > pre1 && after > pre2, "(e'',0) dominates all (e',_)");
@@ -358,7 +387,10 @@ fn is_current_owner_tracks_live_epoch_across_acquire_and_crash() -> TestResult {
     link_both(&node_a, &node_b)?;
 
     // Before any election: not the owner, and the advisory epoch is bottom.
-    assert!(!node_a.db.is_current_owner(SHARD), "no election yet -> not owner");
+    assert!(
+        !node_a.db.is_current_owner(SHARD),
+        "no election yet -> not owner"
+    );
     assert_eq!(node_a.db.current_owner_epoch(SHARD), Ballot::bottom());
 
     // Win the shard this lifetime -> owner.
@@ -366,7 +398,10 @@ fn is_current_owner_tracks_live_epoch_across_acquire_and_crash() -> TestResult {
         .db
         .acquire_shard(SHARD, &membership(2, &[NODE_B]), WRITE_TIMEOUT)?;
     let e_prime = owner.ballot;
-    assert!(node_a.db.is_current_owner(SHARD), "after record_won -> owner");
+    assert!(
+        node_a.db.is_current_owner(SHARD),
+        "after record_won -> owner"
+    );
     assert_eq!(
         node_a.db.current_owner_epoch(SHARD),
         e_prime,
@@ -389,8 +424,14 @@ fn is_current_owner_tracks_live_epoch_across_acquire_and_crash() -> TestResult {
     let reacquired = node_a
         .db
         .acquire_shard(SHARD, &membership(2, &[NODE_B]), WRITE_TIMEOUT)?;
-    assert!(reacquired.ballot > e_prime, "re-acquire mints a higher ballot");
-    assert!(node_a.db.is_current_owner(SHARD), "after re-acquire -> owner again");
+    assert!(
+        reacquired.ballot > e_prime,
+        "re-acquire mints a higher ballot"
+    );
+    assert!(
+        node_a.db.is_current_owner(SHARD),
+        "after re-acquire -> owner again"
+    );
     assert_eq!(node_a.db.current_owner_epoch(SHARD), reacquired.ballot);
     Ok(())
 }
@@ -430,7 +471,11 @@ fn distributed_delete_is_fenced_stamped_and_quorum_replicated() -> TestResult {
         WRITE_TIMEOUT,
     )?;
     let value_hash = haematite::tree::Hash::of(b"v");
-    assert_eq!(node_b.db.get(b"k")?, Some(b"v".to_vec()), "B holds the value");
+    assert_eq!(
+        node_b.db.get(b"k")?,
+        Some(b"v".to_vec()),
+        "B holds the value"
+    );
 
     // DELETE k: a stamped tombstone replicated to quorum, CAS expecting the value
     // hash. The delete draws the NEXT seq under e' (seq 1; the put was seq 0).
@@ -452,11 +497,26 @@ fn distributed_delete_is_fenced_stamped_and_quorum_replicated() -> TestResult {
         Some(true),
         "the committed delete landed a stamped tombstone on the peer, not a removal"
     );
-    let a_stamp = node_a.db.stored_stamp_for_test(b"k").ok_or("A missing tombstone stamp")?;
-    let b_stamp = node_b.db.stored_stamp_for_test(b"k").ok_or("B missing tombstone stamp")?;
-    assert_eq!(a_stamp, b_stamp, "tombstone stamp IDENTICAL on proposer and peer");
-    assert_eq!(a_stamp.epoch, e_prime, "tombstone stamped with the live epoch e'");
-    assert_eq!(a_stamp.seq, 1, "delete drew the next seq (put was 0) under e'");
+    let a_stamp = node_a
+        .db
+        .stored_stamp_for_test(b"k")
+        .ok_or("A missing tombstone stamp")?;
+    let b_stamp = node_b
+        .db
+        .stored_stamp_for_test(b"k")
+        .ok_or("B missing tombstone stamp")?;
+    assert_eq!(
+        a_stamp, b_stamp,
+        "tombstone stamp IDENTICAL on proposer and peer"
+    );
+    assert_eq!(
+        a_stamp.epoch, e_prime,
+        "tombstone stamped with the live epoch e'"
+    );
+    assert_eq!(
+        a_stamp.seq, 1,
+        "delete drew the next seq (put was 0) under e'"
+    );
 
     // --- A stale-epoch delete is FENCED. Crash A so live_epoch -> bottom; B keeps
     // promised = e'. A bottom-stamped delete is below B.promised -> Fenced. ---
@@ -496,10 +556,22 @@ fn tombstone_cas_semantics_and_delete_recreate_delete() -> TestResult {
     node_a.db.acquire_shard(SHARD, &member, WRITE_TIMEOUT)?;
 
     // put k=v1 (seq 0), then DELETE expecting v1 (seq 1).
-    node_a.db.replicate_write(b"k".to_vec(), None, b"v1".to_vec(), None, &member, WRITE_TIMEOUT)?;
+    node_a.db.replicate_write(
+        b"k".to_vec(),
+        None,
+        b"v1".to_vec(),
+        None,
+        &member,
+        WRITE_TIMEOUT,
+    )?;
     let v1_hash = haematite::tree::Hash::of(b"v1");
-    node_a.db.replicate_delete(b"k".to_vec(), Some(v1_hash), &member, WRITE_TIMEOUT)?;
-    let s_del1 = node_a.db.stored_stamp_for_test(b"k").ok_or("missing del1 stamp")?;
+    node_a
+        .db
+        .replicate_delete(b"k".to_vec(), Some(v1_hash), &member, WRITE_TIMEOUT)?;
+    let s_del1 = node_a
+        .db
+        .stored_stamp_for_test(b"k")
+        .ok_or("missing del1 stamp")?;
     assert_eq!(node_a.db.get(b"k")?, None);
 
     // (b) A CAS expecting the OLD value v1 MISSES on the tombstone (its logical
@@ -519,9 +591,23 @@ fn tombstone_cas_semantics_and_delete_recreate_delete() -> TestResult {
     assert_eq!(node_a.db.get(b"k")?, None, "the missed CAS applied nothing");
 
     // (a) create-if-absent (expected = None) MATCHES the tombstone and recreates.
-    node_a.db.replicate_write(b"k".to_vec(), None, b"v2".to_vec(), None, &member, WRITE_TIMEOUT)?;
-    let s_recreate = node_a.db.stored_stamp_for_test(b"k").ok_or("missing recreate stamp")?;
-    assert_eq!(node_a.db.get(b"k")?, Some(b"v2".to_vec()), "create-if-absent recreated the key");
+    node_a.db.replicate_write(
+        b"k".to_vec(),
+        None,
+        b"v2".to_vec(),
+        None,
+        &member,
+        WRITE_TIMEOUT,
+    )?;
+    let s_recreate = node_a
+        .db
+        .stored_stamp_for_test(b"k")
+        .ok_or("missing recreate stamp")?;
+    assert_eq!(
+        node_a.db.get(b"k")?,
+        Some(b"v2".to_vec()),
+        "create-if-absent recreated the key"
+    );
     assert_eq!(
         node_a.db.stored_is_tombstone_for_test(b"k"),
         Some(false),
@@ -531,13 +617,28 @@ fn tombstone_cas_semantics_and_delete_recreate_delete() -> TestResult {
     // (c) DELETE again (expecting v2). Final read None; three strictly-increasing
     // stamps: del1 < recreate < del2.
     let v2_hash = haematite::tree::Hash::of(b"v2");
-    node_a.db.replicate_delete(b"k".to_vec(), Some(v2_hash), &member, WRITE_TIMEOUT)?;
-    let s_del2 = node_a.db.stored_stamp_for_test(b"k").ok_or("missing del2 stamp")?;
+    node_a
+        .db
+        .replicate_delete(b"k".to_vec(), Some(v2_hash), &member, WRITE_TIMEOUT)?;
+    let s_del2 = node_a
+        .db
+        .stored_stamp_for_test(b"k")
+        .ok_or("missing del2 stamp")?;
     assert_eq!(node_a.db.get(b"k")?, None, "key is deleted again");
     assert_eq!(node_a.db.stored_is_tombstone_for_test(b"k"), Some(true));
-    assert_eq!(node_b.db.get(b"k")?, None, "peer also reads None after final delete");
+    assert_eq!(
+        node_b.db.get(b"k")?,
+        None,
+        "peer also reads None after final delete"
+    );
 
-    assert!(s_del1 < s_recreate, "recreate stamp exceeds first delete: {s_recreate:?} > {s_del1:?}");
-    assert!(s_recreate < s_del2, "second delete stamp exceeds recreate: {s_del2:?} > {s_recreate:?}");
+    assert!(
+        s_del1 < s_recreate,
+        "recreate stamp exceeds first delete: {s_recreate:?} > {s_del1:?}"
+    );
+    assert!(
+        s_recreate < s_del2,
+        "second delete stamp exceeds recreate: {s_del2:?} > {s_recreate:?}"
+    );
     Ok(())
 }

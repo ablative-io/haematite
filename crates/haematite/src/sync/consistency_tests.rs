@@ -294,10 +294,8 @@ fn cas_accept_majority_commits() -> Result<(), ConsistencyError> {
 fn cas_minority_no_votes_times_out() {
     // 5-node cluster (quorum 3): only the local ack, no remote votes → timeout.
     let timeout = Duration::from_millis(2);
-    let result = wait_for_cas_quorum::<&str, _>(
-        StrongConsistency::new(5, timeout),
-        std::iter::empty(),
-    );
+    let result =
+        wait_for_cas_quorum::<&str, _>(StrongConsistency::new(5, timeout), std::iter::empty());
 
     assert_eq!(
         result,
