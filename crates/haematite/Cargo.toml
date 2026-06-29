@@ -4,7 +4,7 @@ version = "0.3.0"
 edition = "2024"
 license = "Apache-2.0"
 description = "Content-addressed, branchable, actor-native storage engine"
-repository = "https://github.com/tomWhiting/haematite"
+repository = "https://github.com/ablative-io/haematite"
 authors = ["Tom Whiting <tom@ablative.com.au>"]
 
 [lib]
