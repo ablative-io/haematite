@@ -234,3 +234,7 @@ fn store_empty_leaf<S: NodeStore + ?Sized>(store: &mut S) -> Result<Hash, Handof
 #[cfg(test)]
 #[path = "handoff_merge_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "handoff_merge_proptest.rs"]
+mod proptest_tests;

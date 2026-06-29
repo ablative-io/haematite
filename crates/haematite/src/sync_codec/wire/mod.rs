@@ -14,6 +14,9 @@ mod cursor;
 mod decode;
 mod encode;
 
+#[cfg(test)]
+mod decode_proptest;
+
 pub use decode::{decode_beamr_sync_frame, decode_sync_message};
 pub use encode::{encode_beamr_sync_frame, encode_sync_message};
 
