@@ -340,6 +340,61 @@ fn recovered_owner_epoch_cannot_restamp_without_reacquire() -> TestResult {
     Ok(())
 }
 
+/// `is_current_owner` reflects the IN-MEMORY live serve-authority (R-LE), not the
+/// disk-recovered `owner_epoch`:
+///
+/// * false at `Ballot::bottom()` before any election;
+/// * true once `acquire_shard` records the win this lifetime;
+/// * false again after a CRASH + reopen that recovered `owner_epoch` from disk but
+///   did NOT re-acquire (the R-LE crash gate — the same `live_epoch == bottom`
+///   condition that fences a stale write);
+/// * true once more after a live re-acquire.
+#[test]
+fn is_current_owner_tracks_live_epoch_across_acquire_and_crash() -> TestResult {
+    let dir_a = tempfile::tempdir()?;
+    let dir_b = tempfile::tempdir()?;
+    let node_a = Node::create(NODE_A, dir_a.path().join("db"))?;
+    let node_b = Node::create(NODE_B, dir_b.path().join("db"))?;
+    link_both(&node_a, &node_b)?;
+
+    // Before any election: not the owner, and the advisory epoch is bottom.
+    assert!(!node_a.db.is_current_owner(SHARD), "no election yet -> not owner");
+    assert_eq!(node_a.db.current_owner_epoch(SHARD), Ballot::bottom());
+
+    // Win the shard this lifetime -> owner.
+    let owner = node_a
+        .db
+        .acquire_shard(SHARD, &membership(2, &[NODE_B]), WRITE_TIMEOUT)?;
+    let e_prime = owner.ballot;
+    assert!(node_a.db.is_current_owner(SHARD), "after record_won -> owner");
+    assert_eq!(
+        node_a.db.current_owner_epoch(SHARD),
+        e_prime,
+        "current_owner_epoch reports the live (in-memory) won epoch"
+    );
+
+    // CRASH + reopen: owner_epoch = e' is recovered from DISK, but live_epoch is
+    // bottom because there was no re-acquire this lifetime. The R-LE crash gate:
+    // is_current_owner MUST report false even though disk remembers the epoch.
+    let node_a = node_a.crash_and_reopen()?;
+    link_both(&node_a, &node_b)?;
+    assert_eq!(node_a.db.live_epoch_for_test(SHARD), Ballot::bottom());
+    assert!(
+        !node_a.db.is_current_owner(SHARD),
+        "recovered owner_epoch from disk but did NOT re-acquire -> is_current_owner == false"
+    );
+    assert_eq!(node_a.db.current_owner_epoch(SHARD), Ballot::bottom());
+
+    // A live re-acquire mints a strictly-higher epoch -> owner again.
+    let reacquired = node_a
+        .db
+        .acquire_shard(SHARD, &membership(2, &[NODE_B]), WRITE_TIMEOUT)?;
+    assert!(reacquired.ballot > e_prime, "re-acquire mints a higher ballot");
+    assert!(node_a.db.is_current_owner(SHARD), "after re-acquire -> owner again");
+    assert_eq!(node_a.db.current_owner_epoch(SHARD), reacquired.ballot);
+    Ok(())
+}
+
 // ===========================================================================
 // AA-3-4b — deletes as stamped tombstones through the one fenced/quorum path.
 // ===========================================================================

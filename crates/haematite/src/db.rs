@@ -357,6 +357,35 @@ impl Database {
         self.owner_stamps.live_epoch(shard_id)
     }
 
+    /// The epoch this node is currently authorized to SERVE (stamp) writes under for
+    /// `shard_id` (R-LE). This is the IN-MEMORY `live_epoch` — the same serve
+    /// authority that stamps every committed write — set ONLY by a successful
+    /// `acquire_shard` in THIS process lifetime. It is deliberately NOT the
+    /// disk-recovered `owner_epoch`: a node that recovered `owner_epoch = e'` from
+    /// disk after a crash but did NOT re-acquire this lifetime reports
+    /// [`crate::sync::Ballot::bottom`] here, never `e'` (the R-LE crash gate).
+    #[must_use]
+    pub fn current_owner_epoch(&self, shard_id: usize) -> crate::sync::Ballot {
+        self.owner_stamps.live_epoch(shard_id)
+    }
+
+    /// Whether this node currently holds live serve-authority for `shard_id`, i.e.
+    /// it has won an election THIS lifetime and not been superseded in-process.
+    ///
+    /// Defined as `current_owner_epoch(shard_id) != Ballot::bottom()`: it reads the
+    /// SAME in-memory `live_epoch` that authorizes every stamped write, so a `true`
+    /// answer is consistent with the write-time fence at the instant it is read.
+    ///
+    /// This is a POINT-IN-TIME ADVISORY: ownership can be lost concurrently (a peer
+    /// may depose this node a moment later), so callers must NOT treat a `true`
+    /// result as a durable lock — the authoritative gate remains the per-write CAS
+    /// fence on the replication path. A node that recovered `owner_epoch` from DISK
+    /// but did not re-acquire this lifetime correctly reports `false`.
+    #[must_use]
+    pub fn is_current_owner(&self, shard_id: usize) -> bool {
+        self.current_owner_epoch(shard_id) != crate::sync::Ballot::bottom()
+    }
+
     /// Test-support: the commit stamp the NEXT write to `shard_id` would draw,
     /// WITHOUT advancing the counter (R-LE / R-SEQ peek). Used by the crash gate
     /// to prove a recovered owner would stamp `bottom`, never the recovered `e'`.

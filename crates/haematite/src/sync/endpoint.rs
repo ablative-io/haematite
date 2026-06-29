@@ -51,7 +51,7 @@ use crate::branch::ShardId;
 use crate::sync::SyncNodeId;
 use crate::sync::ballot::{Ballot, Stamp};
 use crate::sync::consistency::{
-    CasVote, ConsistencyError, QuorumOutcome, StrongConsistency, quorum_size,
+    CasVote, ConsistencyError, QuorumOutcome, RejectKind, StrongConsistency, quorum_size,
     wait_for_cas_quorum_from_receiver,
 };
 use crate::sync::membership::WriteMembership;
@@ -1265,10 +1265,16 @@ fn route_ack_outcome(
         AckOutcome::Applied => CasVote::Accept(acker.clone()),
         // A CAS mismatch AND an epoch fence are both vote-AGAINSTs: the replica
         // refused on purpose (it is ahead / it promised a higher ballot), so each
-        // erodes possible-accepts toward ConsistencyError::Fenced. Only a genuine
-        // apply fault is a (retryable) transport-style Fault.
-        AckOutcome::Rejected(RejectReason::CasMismatch | RejectReason::Fenced) => {
-            CasVote::Reject(acker.clone())
+        // erodes possible-accepts. They are CLASSIFIED distinctly, though — an epoch
+        // fence means we were deposed (the stronger ConsistencyError::Fenced signal)
+        // while a value-CAS mismatch is a benign race (ConsistencyError::CasConflict).
+        // This is the one place the wire RejectReason was being discarded. Only a
+        // genuine apply fault is a (retryable) transport-style Fault.
+        AckOutcome::Rejected(RejectReason::Fenced) => {
+            CasVote::Reject(acker.clone(), RejectKind::EpochFence)
+        }
+        AckOutcome::Rejected(RejectReason::CasMismatch) => {
+            CasVote::Reject(acker.clone(), RejectKind::CasMismatch)
         }
         AckOutcome::Rejected(RejectReason::ApplyError) => CasVote::Fault(acker.clone()),
     };
@@ -1277,3 +1283,7 @@ fn route_ack_outcome(
     // -> drop quietly.
     let _ = sender.send(vote);
 }
+
+#[cfg(test)]
+#[path = "endpoint_route_ack_tests.rs"]
+mod route_ack_tests;

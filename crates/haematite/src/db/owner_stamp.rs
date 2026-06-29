@@ -89,8 +89,11 @@ impl OwnerStamps {
         Stamp::new(entry.live_epoch.clone(), seq)
     }
 
-    /// Test-support: read a shard's current in-memory `live_epoch`.
-    #[doc(hidden)]
+    /// Read a shard's current in-memory `live_epoch` (R-LE): the epoch this node
+    /// is authorized to serve (stamp) writes under, set ONLY by a successful
+    /// `acquire_shard` in THIS process lifetime. `Ballot::bottom()` means "no live
+    /// election this lifetime" — NEVER seeded from the disk-recovered `owner_epoch`.
+    /// This is the in-memory serve authority that gates every stamped write.
     pub fn live_epoch(&self, shard: ShardId) -> Ballot {
         self.shards
             .get(&shard)

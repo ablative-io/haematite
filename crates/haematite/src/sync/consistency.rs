@@ -166,6 +166,18 @@ pub enum ConsistencyError {
         required: usize,
         possible_accepts: usize,
     },
+    /// A replicated CAS write was deterministically out-voted by *value-CAS
+    /// mismatches alone* (no epoch fence in the loss set): we are still the live
+    /// owner, but enough replicas refused the precondition that a quorum of accepts
+    /// is no longer reachable. Distinct from [`Self::Fenced`] (a conflicting owner
+    /// with a higher ballot deposed us — the stronger signal) and from
+    /// [`Self::AckFailed`] (a retryable transport failure). A caller can retry a
+    /// `CasConflict` by re-reading and re-CAS-ing; a `Fenced` caller must instead
+    /// re-resolve ownership.
+    CasConflict {
+        required: usize,
+        possible_accepts: usize,
+    },
 }
 
 impl fmt::Display for ConsistencyError {
@@ -194,6 +206,13 @@ impl fmt::Display for ConsistencyError {
             } => write!(
                 formatter,
                 "fenced by CAS rejects: required {required} accepts, only {possible_accepts} still possible"
+            ),
+            Self::CasConflict {
+                required,
+                possible_accepts,
+            } => write!(
+                formatter,
+                "lost CAS by value mismatch: required {required} accepts, only {possible_accepts} still possible"
             ),
         }
     }
@@ -367,6 +386,28 @@ where
     }
 }
 
+/// Why a replica deterministically voted AGAINST a CAS proposal.
+///
+/// Both kinds are legitimate vote-againsts (never transport faults), but they carry
+/// different strength when a write is provably lost: an [`RejectKind::EpochFence`]
+/// means a conflicting owner with a strictly-higher ballot deposed us (the §2.3
+/// fence — the stronger signal), whereas an [`RejectKind::CasMismatch`] is a benign
+/// value-CAS race (we are still the owner, the precondition merely lost a write
+/// ordering). The tally keeps them distinct so a deposed survivor is never confused
+/// with a value-CAS loser.
+///
+/// This enum lives HERE (not in `sync_codec`) on purpose: the wire-level
+/// [`crate::sync_codec::message::write::RejectReason`] is mapped onto it at the
+/// endpoint boundary, so the consistency layer never takes a dependency on the
+/// codec (avoiding a cycle).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RejectKind {
+    /// A conflicting owner promised a strictly-higher ballot: we are fenced.
+    EpochFence,
+    /// A value-CAS precondition mismatch: a benign race, not a deposition.
+    CasMismatch,
+}
+
 /// A single vote in a CAS-aware quorum tally.
 ///
 /// CAS writes need a third signal beyond the accept/fault distinction of [`Ack`]:
@@ -375,14 +416,15 @@ where
 /// collapsed:
 ///
 /// * [`CasVote::Accept`] — the replica conditionally + durably applied the write.
-/// * [`CasVote::Reject`] — the replica says *no* (e.g. a CAS-precondition
-///   mismatch): a legitimate deterministic vote-against, NOT a transport fault.
+/// * [`CasVote::Reject`] — the replica says *no* (carrying a [`RejectKind`]): a
+///   legitimate deterministic vote-against, NOT a transport fault. The kind
+///   distinguishes an epoch fence (we were deposed) from a value-CAS mismatch.
 /// * [`CasVote::Fault`] — the replica could not be reached / failed to apply for a
 ///   transport reason; this poisons the tally exactly like [`Ack::Failed`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CasVote<NodeId> {
     Accept(NodeId),
-    Reject(NodeId),
+    Reject(NodeId, RejectKind),
     Fault(NodeId),
 }
 
@@ -391,8 +433,16 @@ impl<NodeId> CasVote<NodeId> {
         Self::Accept(node_id)
     }
 
+    /// Construct an epoch-fence reject. Kept as the single-arg `reject` so the
+    /// stronger fence signal is the default vote-against (the historical
+    /// behaviour: a bare reject fences).
     pub const fn reject(node_id: NodeId) -> Self {
-        Self::Reject(node_id)
+        Self::Reject(node_id, RejectKind::EpochFence)
+    }
+
+    /// Construct a reject carrying an explicit [`RejectKind`].
+    pub const fn reject_kind(node_id: NodeId, kind: RejectKind) -> Self {
+        Self::Reject(node_id, kind)
     }
 
     pub const fn fault(node_id: NodeId) -> Self {
@@ -400,17 +450,31 @@ impl<NodeId> CasVote<NodeId> {
     }
 }
 
-/// Classify a CAS write that can no longer reach a quorum of accepts. A prior
-/// CAS reject means a conflicting owner deterministically out-voted us
-/// ([`ConsistencyError::Fenced`]); a loss to faults alone is an infrastructure
-/// failure ([`ConsistencyError::AckFailed`], retryable) — not a fence.
+/// Classify a CAS write that can no longer reach a quorum of accepts, by WHY the
+/// accepts dried up. The three reasons form a strict precedence:
+///
+/// 1. An epoch fence anywhere in the loss set ⇒ [`ConsistencyError::Fenced`] — a
+///    conflicting owner with a strictly-higher ballot deposed us. This is the
+///    STRONGEST signal and WINS even if value-CAS mismatches are also present (a
+///    deposed survivor must re-resolve ownership, not merely retry the CAS).
+/// 2. Value-CAS mismatches but no fence ⇒ [`ConsistencyError::CasConflict`] — we
+///    are still the live owner; the precondition simply lost a write ordering and
+///    the caller can re-read and retry.
+/// 3. Faults alone (no deterministic vote-against at all) ⇒
+///    [`ConsistencyError::AckFailed`] — a retryable infrastructure failure.
 const fn decline_outcome(
-    had_reject: bool,
+    had_epoch_fence: bool,
+    had_cas_mismatch: bool,
     required: usize,
     possible_accepts: usize,
 ) -> ConsistencyError {
-    if had_reject {
+    if had_epoch_fence {
         ConsistencyError::Fenced {
+            required,
+            possible_accepts,
+        }
+    } else if had_cas_mismatch {
+        ConsistencyError::CasConflict {
             required,
             possible_accepts,
         }
@@ -435,12 +499,12 @@ const fn decline_outcome(
 ///   accept ceiling `possible_accepts = possible - declined`. A single fault does
 ///   NOT abort a write the rest of the cluster can still carry; the tally only
 ///   gives up when `possible_accepts < required`.
-/// * When `possible_accepts < required`, the verdict depends on WHY: if any CAS
-///   **reject** occurred, a conflicting owner deterministically out-voted us →
-///   [`ConsistencyError::Fenced`]; if the loss is to **faults alone**, it is an
-///   infrastructure failure → [`ConsistencyError::AckFailed`] (retryable), not a
-///   fence.
-/// * If neither a quorum of accepts nor a fenced verdict is reached before the
+/// * When `possible_accepts < required`, the verdict depends on WHY (see
+///   [`decline_outcome`]): an [`RejectKind::EpochFence`] anywhere wins →
+///   [`ConsistencyError::Fenced`]; value-CAS mismatches with no fence →
+///   [`ConsistencyError::CasConflict`]; **faults alone** → an infrastructure
+///   failure [`ConsistencyError::AckFailed`] (retryable), not a fence.
+/// * If neither a quorum of accepts nor a declined verdict is reached before the
 ///   deadline, return [`ConsistencyError::QuorumTimeout`].
 pub fn wait_for_cas_quorum<NodeId, Votes>(
     strong: StrongConsistency,
@@ -464,7 +528,8 @@ where
     // Nodes that will not contribute an accept — CAS rejects AND faults unioned,
     // so a node that both rejects and faults erodes the accept ceiling once.
     let mut declined = HashSet::new();
-    let mut had_reject = false;
+    let mut had_epoch_fence = false;
+    let mut had_cas_mismatch = false;
     let mut acknowledged = local_ack_count;
 
     if acknowledged >= required {
@@ -498,15 +563,20 @@ where
                     }
                 }
             }
-            CasVote::Reject(node_id) => {
-                had_reject = true;
+            CasVote::Reject(node_id, kind) => {
+                match kind {
+                    RejectKind::EpochFence => had_epoch_fence = true,
+                    RejectKind::CasMismatch => had_cas_mismatch = true,
+                }
                 if declined.insert(node_id) {
                     let possible_accepts = possible.saturating_sub(declined.len());
                     if possible_accepts < required {
-                        return Err(ConsistencyError::Fenced {
+                        return Err(decline_outcome(
+                            had_epoch_fence,
+                            had_cas_mismatch,
                             required,
                             possible_accepts,
-                        });
+                        ));
                     }
                 }
             }
@@ -514,7 +584,12 @@ where
                 if declined.insert(node_id) {
                     let possible_accepts = possible.saturating_sub(declined.len());
                     if possible_accepts < required {
-                        return Err(decline_outcome(had_reject, required, possible_accepts));
+                        return Err(decline_outcome(
+                            had_epoch_fence,
+                            had_cas_mismatch,
+                            required,
+                            possible_accepts,
+                        ));
                     }
                 }
             }
@@ -555,7 +630,8 @@ where
     // Nodes that will not contribute an accept — CAS rejects AND faults unioned,
     // so a node that both rejects and faults erodes the accept ceiling once.
     let mut declined = HashSet::new();
-    let mut had_reject = false;
+    let mut had_epoch_fence = false;
+    let mut had_cas_mismatch = false;
     let mut acknowledged = local_ack_count;
 
     if acknowledged >= required {
@@ -589,15 +665,20 @@ where
                     }
                 }
             }
-            Ok(CasVote::Reject(node_id)) => {
-                had_reject = true;
+            Ok(CasVote::Reject(node_id, kind)) => {
+                match kind {
+                    RejectKind::EpochFence => had_epoch_fence = true,
+                    RejectKind::CasMismatch => had_cas_mismatch = true,
+                }
                 if declined.insert(node_id) {
                     let possible_accepts = possible.saturating_sub(declined.len());
                     if possible_accepts < required {
-                        return Err(ConsistencyError::Fenced {
+                        return Err(decline_outcome(
+                            had_epoch_fence,
+                            had_cas_mismatch,
                             required,
                             possible_accepts,
-                        });
+                        ));
                     }
                 }
             }
@@ -605,7 +686,12 @@ where
                 if declined.insert(node_id) {
                     let possible_accepts = possible.saturating_sub(declined.len());
                     if possible_accepts < required {
-                        return Err(decline_outcome(had_reject, required, possible_accepts));
+                        return Err(decline_outcome(
+                            had_epoch_fence,
+                            had_cas_mismatch,
+                            required,
+                            possible_accepts,
+                        ));
                     }
                 }
             }

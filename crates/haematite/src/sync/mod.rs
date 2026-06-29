@@ -14,7 +14,7 @@ pub use crate::sync_codec::ballot;
 pub use crate::sync_codec::ballot::{Ballot, Stamp};
 pub use consistency::{
     Ack, CasVote, ConsistencyError, ConsistencyMode, EventualConsistency, QuorumOutcome,
-    StrongConsistency, execute_with_consistency, quorum_size, wait_for_cas_quorum,
+    RejectKind, StrongConsistency, execute_with_consistency, quorum_size, wait_for_cas_quorum,
     wait_for_cas_quorum_from_receiver, wait_for_quorum, wait_for_quorum_from_receiver,
 };
 pub use endpoint::{
