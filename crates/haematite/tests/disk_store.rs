@@ -3,6 +3,8 @@ use std::io;
 use std::thread;
 use std::time::Duration;
 
+use haematite::tree::batch_mutate;
+use haematite::wal::{DurableWal, FsyncPolicy, WalError, WalRecovery};
 use haematite::{DeleteNode, DiskStore, Hash, LeafNode, Node, NodeError, NodeStore, StoreError};
 
 const ZSTD_MAGIC_BYTES: [u8; 4] = [0x28, 0xb5, 0x2f, 0xfd];
@@ -249,5 +251,122 @@ fn corrupt_files_return_compression_or_deserialisation_errors() -> TestResult {
     let deserialise_error = require_get_error(store.get(&deserialise_hash))?;
     assert!(matches!(deserialise_error, StoreError::Deserialise(_)));
 
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Directory-fsync durability window (HIGH, durability).
+//
+// `DiskStore::write_compressed_node` fsyncs each node file's DATA before the
+// atomic rename that publishes it, but the rename's DIRECTORY ENTRY is only made
+// durable by the batched `sync_dirty_dirs` barrier the commit path runs STRICTLY
+// BEFORE the WAL committed-root marker. These tests exercise that window at the
+// public `DiskStore` + `WalRecovery` boundary (complementing the actor-internal
+// wrapper tests in `shard::actor::node_dir_fsync_tests`): if a committed-root
+// marker is published over node directory entries that were NOT barriered and are
+// then lost on power loss, recovery MUST fail closed (`MissingCommittedRoot`)
+// rather than silently serve a tree with an unreachable node.
+// ---------------------------------------------------------------------------
+
+type TestResult2<T> = Result<T, Box<dyn std::error::Error>>;
+
+/// Build a committed tree in `store` from `entries`, returning its committed root.
+fn commit_tree(store: &mut DiskStore, entries: &[(&[u8], &[u8])]) -> TestResult2<Hash> {
+    let empty = store.put(&Node::Leaf(LeafNode::new(Vec::new())?))?;
+    let mutations: Vec<(Vec<u8>, Option<Vec<u8>>)> = entries
+        .iter()
+        .map(|(k, v)| (k.to_vec(), Some(v.to_vec())))
+        .collect();
+    Ok(batch_mutate(store, empty, mutations.as_slice())?)
+}
+
+/// THE DURABILITY WINDOW (falsifier): a committed-root marker published over a
+/// node whose directory entry was lost (the rename never reached disk because the
+/// barrier had not run) MUST make cold recovery reject with `MissingCommittedRoot`
+/// — never silently accept an unreachable committed root.
+///
+/// We model the precise lost-rename window by DELETING the committed root's node
+/// file after the marker is written: that is exactly the on-disk state after a
+/// power loss that dropped an un-barriered directory entry. Cold recovery reads
+/// the marker, fails to load the root node, and must fail closed.
+#[test]
+fn lost_node_dir_entry_makes_recovery_reject_missing_root() -> TestResult {
+    let dir = tempfile::tempdir()?;
+    let nodes_dir = dir.path().join("nodes");
+    let wal_path = dir.path().join("shard.wal");
+
+    // Persist a committed tree (node DATA is fsynced by `put`).
+    let mut store = DiskStore::new(&nodes_dir)?;
+    let root = commit_tree(&mut store, &[(b"durable-key", b"durable-value")])?;
+
+    // Publish the committed-root MARKER into the WAL, as the commit path does
+    // AFTER persisting nodes. (In production the dir barrier runs between these;
+    // here we deliberately do NOT make the directory entry durable.)
+    let mut wal = DurableWal::new(&wal_path, FsyncPolicy::CommitOnly)?;
+    wal.commit(root)?;
+    drop(wal);
+
+    // Simulate the lost rename: the root node's directory entry never reached disk.
+    fs::remove_file(node_path(&nodes_dir, &root))?;
+
+    // Cold recovery over a FRESH store (a restarted process reads only disk, never
+    // a warm cache) MUST reject: the marker names a root that is not present.
+    let cold = DiskStore::new(&nodes_dir)?;
+    match WalRecovery::recover_path(&wal_path, &cold) {
+        Err(WalError::MissingCommittedRoot { root: named }) => {
+            assert_eq!(
+                named, root,
+                "recovery must name the marker's now-unreachable committed root"
+            );
+            Ok(())
+        }
+        Err(other) => Err(Box::new(other)),
+        Ok(_recovered) => Err(boxed_error(
+            "expected MissingCommittedRoot when the committed root's dir entry is lost, \
+             but recovery succeeded",
+        )),
+    }
+}
+
+/// THE FIX (positive control): when the node files survive the crash (the barrier
+/// made their directory entries durable), cold recovery from the SAME marker
+/// succeeds and the committed value is readable FROM DISK.
+///
+/// This is the falsifiable counterpart: it shares the entire setup with the lost-
+/// entry test EXCEPT it does not delete the node file, so it proves the rejection
+/// above is caused specifically by the lost directory entry, not by an unrelated
+/// recovery fault.
+#[test]
+fn surviving_node_dir_entry_lets_recovery_read_committed_value() -> TestResult {
+    let dir = tempfile::tempdir()?;
+    let nodes_dir = dir.path().join("nodes");
+    let wal_path = dir.path().join("shard.wal");
+
+    let mut store = DiskStore::new(&nodes_dir)?;
+    let root = commit_tree(&mut store, &[(b"durable-key", b"durable-value")])?;
+    // The real barrier: make the just-written directory entries durable, exactly
+    // as the commit path does before the marker.
+    store.sync_dirty_dirs()?;
+
+    let mut wal = DurableWal::new(&wal_path, FsyncPolicy::CommitOnly)?;
+    wal.commit(root)?;
+    drop(wal);
+
+    // The node files survive (we delete nothing). Cold recovery succeeds.
+    let cold = DiskStore::new(&nodes_dir)?;
+    let recovered = WalRecovery::recover_path(&wal_path, &cold)?;
+    assert_eq!(
+        recovered.committed_root(),
+        Some(root),
+        "recovery must adopt the durable committed root"
+    );
+
+    // The committed value is reachable from the committed tree alone (cold store).
+    let cursor = haematite::Cursor::new(&cold, root);
+    assert_eq!(
+        cursor.get(b"durable-key")?,
+        Some(b"durable-value".to_vec()),
+        "the committed value must be readable from disk after recovery"
+    );
     Ok(())
 }

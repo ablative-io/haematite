@@ -10,10 +10,10 @@ use beamr::scheduler::{Scheduler, SchedulerConfig};
 
 use super::recover::{collect_tree, recover_view};
 use super::{SweepError, SweepHandle, SweepStats};
-use crate::shard::actor::ShardHandle;
+use crate::shard::actor::{ShardActor, ShardHandle};
 use crate::store::DiskStore;
 use crate::tree::{LeafNode, Node};
-use crate::wal::Mutation;
+use crate::wal::{DurableWal, FsyncPolicy, Mutation};
 
 const TIMEOUT: Duration = Duration::from_secs(5);
 
@@ -132,5 +132,117 @@ fn periodic_tick_physically_deletes_expired_entry() -> Result<(), Box<dyn std::e
 
     assert!(sweep.shutdown(TIMEOUT).is_ok());
     scheduler.shutdown();
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Sweep crash-recovery: a crash before a sweep delete is committed must leave NO
+// TTL entry half-deleted. `recover_view` (the FIRST thing `run_sweep` does) must
+// reconstruct a consistent durable view — every key is fully present or fully
+// absent, never torn.
+// ---------------------------------------------------------------------------
+
+/// Reconstruct the merged physical state (committed tree + uncommitted WAL
+/// buffer) exactly as `run_sweep` does, returning the live `(key -> value)` map.
+fn merged_view(
+    store_dir: &Path,
+    wal_path: &Path,
+) -> Result<BTreeMap<Vec<u8>, Vec<u8>>, Box<dyn std::error::Error>> {
+    let (store, root, buffer) = recover_view(store_dir, wal_path)?;
+    let mut merged = BTreeMap::new();
+    if let Some(root) = root {
+        collect_tree(&store, root, &mut merged)?;
+    }
+    for mutation in &buffer {
+        match mutation {
+            Mutation::Put { key, value } => {
+                merged.insert(key.clone(), value.clone());
+            }
+            Mutation::Delete { key } => {
+                merged.remove(key);
+            }
+        }
+    }
+    Ok(merged)
+}
+
+/// CRASH BEFORE ANY SWEEP DELETE: durably commit a live entry and an expired
+/// entry, then "crash" (drop the actor) WITHOUT running a sweep. `recover_view`
+/// must reconstruct BOTH entries intact — a crash before the sweep commits leaves
+/// nothing half-deleted, so the next sweep starts from the complete durable set.
+#[test]
+fn recover_view_after_crash_before_sweep_is_intact() -> Result<(), Box<dyn std::error::Error>> {
+    let dir = tempfile::tempdir()?;
+    let store_dir = dir.path().join("sweep.store");
+    let wal_path = dir.path().join("sweep.wal");
+
+    // Seed durable committed state: one live entry and one already-expired entry.
+    let mut store = DiskStore::new(&store_dir)?;
+    let wal = DurableWal::new(&wal_path, FsyncPolicy::CommitOnly)?;
+    let mut actor = ShardActor::new(wal);
+    actor.put_with_ttl(b"live".to_vec(), b"keep".to_vec(), None)?;
+    // A 1ns TTL is already expired by the time the sweep runs.
+    actor.put_with_ttl(
+        b"doomed".to_vec(),
+        b"gone".to_vec(),
+        Some(Duration::from_nanos(1)),
+    )?;
+    let _root = actor.commit(&mut store)?;
+    drop(actor); // crash: close the WAL with NO sweep delete issued.
+
+    // recover_view (the start of run_sweep) reconstructs BOTH keys physically —
+    // the expired one is NOT half-deleted just because a sweep was pending.
+    let merged = merged_view(&store_dir, &wal_path)?;
+    assert!(
+        merged.contains_key(b"live".as_slice()),
+        "the live entry must survive the crash"
+    );
+    assert!(
+        merged.contains_key(b"doomed".as_slice()),
+        "an expired entry not yet swept must be fully present after a crash, never torn"
+    );
+    Ok(())
+}
+
+/// CRASH AFTER A SWEEP DELETE WAS STAGED BUT BEFORE THE NEXT COMMIT: the sweep's
+/// `delete_if_expired` appends a bare-removal to the WAL (durable) and buffers it,
+/// but the physical tree commit has not happened. On recovery the WAL Delete is
+/// replayed over the committed root, so the swept key is consistently ABSENT and
+/// the live key is fully intact — never a torn half-state.
+#[test]
+fn recover_view_after_staged_sweep_delete_is_consistent() -> Result<(), Box<dyn std::error::Error>>
+{
+    let dir = tempfile::tempdir()?;
+    let store_dir = dir.path().join("sweep.store");
+    let wal_path = dir.path().join("sweep.wal");
+
+    let mut store = DiskStore::new(&store_dir)?;
+    let wal = DurableWal::new(&wal_path, FsyncPolicy::CommitOnly)?;
+    let mut actor = ShardActor::new(wal);
+    actor.put_with_ttl(b"live".to_vec(), b"keep".to_vec(), None)?;
+    actor.put_with_ttl(
+        b"doomed".to_vec(),
+        b"gone".to_vec(),
+        Some(Duration::from_nanos(1)),
+    )?;
+    actor.commit(&mut store)?;
+
+    // The sweep stages the expired delete (WAL append + buffer) but the process
+    // crashes BEFORE the next commit folds it into the tree.
+    let removed = actor.delete_if_expired(b"doomed", &store)?;
+    assert!(removed, "the expired key must be a sweep candidate");
+    drop(actor); // crash with the delete staged in the WAL, not yet committed.
+
+    // Recovery replays the staged WAL Delete: the swept key is consistently gone,
+    // the live key is fully present. No entry is half-deleted.
+    let merged = merged_view(&store_dir, &wal_path)?;
+    assert!(
+        merged.contains_key(b"live".as_slice()),
+        "the live entry must remain fully intact"
+    );
+    assert!(
+        !merged.contains_key(b"doomed".as_slice()),
+        "a staged sweep delete must recover as fully absent, never torn"
+    );
     Ok(())
 }
