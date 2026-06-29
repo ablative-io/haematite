@@ -66,6 +66,16 @@ pub enum DatabaseError {
         required: usize,
         possible_accepts: usize,
     },
+    /// A replicated CAS write was deterministically out-voted by *value-CAS
+    /// mismatches alone* — the writer is still the live owner, but enough replicas
+    /// refused the precondition that a quorum of accepts became unreachable (the
+    /// typed twin of [`crate::ConsistencyError::CasConflict`]). Distinct from
+    /// [`Self::Fenced`] (a higher-ballot owner deposed us, requiring ownership
+    /// re-resolution): a `CasConflict` caller may simply re-read and re-CAS.
+    CasConflict {
+        required: usize,
+        possible_accepts: usize,
+    },
 }
 
 impl fmt::Display for DatabaseError {
@@ -140,6 +150,13 @@ impl fmt::Display for DatabaseError {
                 formatter,
                 "fenced by CAS rejects: required {required} accepts, only {possible_accepts} still possible"
             ),
+            Self::CasConflict {
+                required,
+                possible_accepts,
+            } => write!(
+                formatter,
+                "lost CAS by value mismatch: required {required} accepts, only {possible_accepts} still possible"
+            ),
         }
     }
 }
@@ -170,7 +187,8 @@ impl std::error::Error for DatabaseError {
             | Self::LocalCommitFailed(_)
             | Self::ElectionLost { .. }
             | Self::ElectionTimeout { .. }
-            | Self::Fenced { .. } => None,
+            | Self::Fenced { .. }
+            | Self::CasConflict { .. } => None,
         }
     }
 }
@@ -191,6 +209,13 @@ impl From<crate::sync::ConsistencyError> for DatabaseError {
                 required,
                 possible_accepts,
             } => Self::Fenced {
+                required,
+                possible_accepts,
+            },
+            crate::sync::ConsistencyError::CasConflict {
+                required,
+                possible_accepts,
+            } => Self::CasConflict {
                 required,
                 possible_accepts,
             },
@@ -219,6 +244,27 @@ mod tests {
                 }
             ),
             "the deterministic CAS fence must survive as the typed DatabaseError::Fenced"
+        );
+    }
+
+    #[test]
+    fn consistency_cas_conflict_maps_to_typed_cas_conflict() {
+        // The value-CAS loss must survive as the typed DatabaseError::CasConflict
+        // (preserving required/possible_accepts), distinct from the typed Fenced and
+        // from the stringified fallback.
+        let mapped = DatabaseError::from(ConsistencyError::CasConflict {
+            required: 3,
+            possible_accepts: 1,
+        });
+        assert!(
+            matches!(
+                mapped,
+                DatabaseError::CasConflict {
+                    required: 3,
+                    possible_accepts: 1
+                }
+            ),
+            "the value-CAS loss must survive as the typed DatabaseError::CasConflict"
         );
     }
 

@@ -9,9 +9,9 @@ use crate::tree::{Cursor, Hash, LeafNode, Node, NodeError, batch_mutate};
 use crate::sync::{SyncMergeRoots, merge_synced_roots, pull_from_source};
 
 use super::{
-    Ack, CasVote, ConsistencyError, ConsistencyMode, EventualConsistency, StrongConsistency,
-    execute_with_consistency, quorum_size, wait_for_cas_quorum, wait_for_quorum,
-    wait_for_quorum_from_receiver,
+    Ack, CasVote, ConsistencyError, ConsistencyMode, EventualConsistency, RejectKind,
+    StrongConsistency, execute_with_consistency, quorum_size, wait_for_cas_quorum,
+    wait_for_cas_quorum_from_receiver, wait_for_quorum, wait_for_quorum_from_receiver,
 };
 
 #[test]
@@ -470,4 +470,230 @@ fn cas_accept_dedup_does_not_double_count() {
         outcome,
         Ok(out) if out.acknowledged == 3 && out.acknowledged_nodes == vec!["node-b", "node-c"]
     ));
+}
+
+// ---------------------------------------------------------------------------
+// Typed-reject classification (RejectKind): the iterator tally
+// `wait_for_cas_quorum`. The pre-existing `CasVote::reject` (EpochFence) tests
+// above remain unchanged and continue to fence; these exercise the NEW split.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn cas_pure_cas_mismatch_rejects_is_cas_conflict_not_fenced() {
+    // 5-node cluster (quorum 3, possible 5). Three DISTINCT value-CAS mismatches
+    // (no epoch fence) drop possible_accepts to 2 < 3. Because there is no fence in
+    // the loss set, the verdict is the weaker, retryable CasConflict — NOT Fenced
+    // and NOT AckFailed.
+    let result = wait_for_cas_quorum(
+        StrongConsistency::new(5, Duration::from_secs(1)),
+        vec![
+            CasVote::reject_kind("node-b", RejectKind::CasMismatch),
+            CasVote::reject_kind("node-c", RejectKind::CasMismatch),
+            CasVote::reject_kind("node-d", RejectKind::CasMismatch),
+        ],
+    );
+
+    assert_eq!(
+        result,
+        Err(ConsistencyError::CasConflict {
+            required: 3,
+            possible_accepts: 2,
+        })
+    );
+}
+
+#[test]
+fn cas_pure_epoch_fence_rejects_is_fenced() {
+    // 5-node cluster (quorum 3, possible 5). Three DISTINCT epoch fences drop
+    // possible_accepts to 2 < 3 → Fenced (a conflicting higher-ballot owner deposed
+    // us). Explicit RejectKind::EpochFence, equivalent to the bare `reject` default.
+    let result = wait_for_cas_quorum(
+        StrongConsistency::new(5, Duration::from_secs(1)),
+        vec![
+            CasVote::reject_kind("node-b", RejectKind::EpochFence),
+            CasVote::reject_kind("node-c", RejectKind::EpochFence),
+            CasVote::reject_kind("node-d", RejectKind::EpochFence),
+        ],
+    );
+
+    assert_eq!(
+        result,
+        Err(ConsistencyError::Fenced {
+            required: 3,
+            possible_accepts: 2,
+        })
+    );
+}
+
+#[test]
+fn cas_mixed_fence_and_mismatch_fences_fence_wins() {
+    // 5-node cluster (quorum 3, possible 5). One epoch fence plus two value-CAS
+    // mismatches drop possible_accepts to 2 < 3. The STRONGER epoch-fence signal
+    // wins even though a cas-mismatch is also present → Fenced, not CasConflict.
+    let result = wait_for_cas_quorum(
+        StrongConsistency::new(5, Duration::from_secs(1)),
+        vec![
+            CasVote::reject_kind("node-b", RejectKind::CasMismatch),
+            CasVote::reject_kind("node-c", RejectKind::EpochFence),
+            CasVote::reject_kind("node-d", RejectKind::CasMismatch),
+        ],
+    );
+
+    assert_eq!(
+        result,
+        Err(ConsistencyError::Fenced {
+            required: 3,
+            possible_accepts: 2,
+        })
+    );
+}
+
+#[test]
+fn cas_mismatch_alongside_faults_is_cas_conflict() {
+    // 5-node cluster (quorum 3, possible 5). One value-CAS mismatch plus two faults
+    // erode possible_accepts to 2 < 3. No epoch fence → the deterministic
+    // vote-against (cas-mismatch) outranks the faults → CasConflict, not AckFailed.
+    let result = wait_for_cas_quorum::<&str, _>(
+        StrongConsistency::new(5, Duration::from_secs(1)),
+        vec![
+            CasVote::reject_kind("node-b", RejectKind::CasMismatch),
+            CasVote::fault("node-c"),
+            CasVote::fault("node-d"),
+        ],
+    );
+
+    assert_eq!(
+        result,
+        Err(ConsistencyError::CasConflict {
+            required: 3,
+            possible_accepts: 2,
+        })
+    );
+}
+
+#[test]
+fn cas_faults_only_is_ack_failed_not_cas_conflict() {
+    // 3-node cluster, quorum 2, possible 3. Two DISTINCT faults with NO reject of
+    // any kind → AckFailed (retryable infra failure), neither Fenced nor CasConflict.
+    let result = wait_for_cas_quorum::<&str, _>(
+        StrongConsistency::new(3, Duration::from_secs(1)),
+        vec![CasVote::fault("node-b"), CasVote::fault("node-c")],
+    );
+
+    assert_eq!(result, Err(ConsistencyError::AckFailed));
+}
+
+// ---------------------------------------------------------------------------
+// Typed-reject classification: the LIVE receiver tally
+// `wait_for_cas_quorum_from_receiver`. This path previously INLINED
+// reject->Fenced and bypassed `decline_outcome`; it MUST classify identically.
+// ---------------------------------------------------------------------------
+
+fn drain_cas_votes<NodeId>(
+    strong: StrongConsistency,
+    votes: Vec<CasVote<NodeId>>,
+) -> Result<super::QuorumOutcome<NodeId>, ConsistencyError>
+where
+    NodeId: Clone + Eq + std::hash::Hash,
+{
+    let (sender, receiver) = std::sync::mpsc::channel();
+    for vote in votes {
+        let _ = sender.send(vote);
+    }
+    drop(sender);
+    wait_for_cas_quorum_from_receiver(strong, &receiver)
+}
+
+#[test]
+fn receiver_cas_pure_cas_mismatch_is_cas_conflict() {
+    let result = drain_cas_votes(
+        StrongConsistency::new(5, Duration::from_secs(1)),
+        vec![
+            CasVote::reject_kind("node-b", RejectKind::CasMismatch),
+            CasVote::reject_kind("node-c", RejectKind::CasMismatch),
+            CasVote::reject_kind("node-d", RejectKind::CasMismatch),
+        ],
+    );
+
+    assert_eq!(
+        result,
+        Err(ConsistencyError::CasConflict {
+            required: 3,
+            possible_accepts: 2,
+        })
+    );
+}
+
+#[test]
+fn receiver_cas_pure_epoch_fence_is_fenced() {
+    let result = drain_cas_votes(
+        StrongConsistency::new(5, Duration::from_secs(1)),
+        vec![
+            CasVote::reject_kind("node-b", RejectKind::EpochFence),
+            CasVote::reject_kind("node-c", RejectKind::EpochFence),
+            CasVote::reject_kind("node-d", RejectKind::EpochFence),
+        ],
+    );
+
+    assert_eq!(
+        result,
+        Err(ConsistencyError::Fenced {
+            required: 3,
+            possible_accepts: 2,
+        })
+    );
+}
+
+#[test]
+fn receiver_cas_mixed_any_fence_is_fenced() {
+    // The fence wins even when a value-CAS mismatch is also present, on the live
+    // receiver path that previously inlined the verdict.
+    let result = drain_cas_votes(
+        StrongConsistency::new(5, Duration::from_secs(1)),
+        vec![
+            CasVote::reject_kind("node-b", RejectKind::CasMismatch),
+            CasVote::reject_kind("node-c", RejectKind::CasMismatch),
+            CasVote::reject_kind("node-d", RejectKind::EpochFence),
+        ],
+    );
+
+    assert_eq!(
+        result,
+        Err(ConsistencyError::Fenced {
+            required: 3,
+            possible_accepts: 2,
+        })
+    );
+}
+
+#[test]
+fn receiver_cas_faults_only_is_ack_failed() {
+    let result = drain_cas_votes::<&str>(
+        StrongConsistency::new(3, Duration::from_secs(1)),
+        vec![CasVote::fault("node-b"), CasVote::fault("node-c")],
+    );
+
+    assert_eq!(result, Err(ConsistencyError::AckFailed));
+}
+
+#[test]
+fn receiver_cas_bare_reject_default_is_epoch_fence() {
+    // The single-arg `CasVote::reject` constructor defaults to EpochFence on the
+    // live receiver path too (historical behaviour preserved).
+    let result = drain_cas_votes(
+        StrongConsistency::new(5, Duration::from_secs(1)),
+        vec![
+            CasVote::reject("node-b"),
+            CasVote::reject("node-c"),
+            CasVote::reject("node-d"),
+        ],
+    );
+
+    assert_eq!(
+        result,
+        Err(ConsistencyError::Fenced {
+            required: 3,
+            possible_accepts: 2,
+        })
+    );
 }

@@ -183,23 +183,29 @@ fn membership(total_nodes: usize, send_targets: &[&str]) -> WriteMembership {
     }
 }
 
-/// Post-heal, assert node C is FENCED when it re-proposes a stale CAS create to
+/// Post-heal, assert node C is OUT-VOTED when it re-proposes a stale CAS create to
 /// {A,B} (which already hold the winning value) — both structurally and via the
 /// production path.
 ///
-/// 1. A direct `propose_write` to `[A,B]` must return `ConsistencyError::Fenced`
-///    (CAS rejects from A and B drop possible accepts below quorum) — proving C is
-///    out-voted by CAS MISMATCH, not merely timed out.
-/// 2. The production `replicate_write` to `[A,B]` must surface that fence as a
-///    `DatabaseError::ConsistencyError` whose message reflects the CAS fence AND,
-///    because it applies locally only on quorum success, must apply NOTHING on C.
+/// Because C is NOT epoch-deposed here (it lost a *value* race: A/B's current hash
+/// no longer matches C's expected `None`), the peers reject with
+/// `RejectReason::CasMismatch`, which the typed-fence split classifies as the
+/// weaker, retryable `CasConflict` — distinct from an epoch `Fenced`. Either way C
+/// is deterministically out-voted (a quorum of accepts is unreachable), NOT merely
+/// timed out, and applies NOTHING.
+///
+/// 1. A direct `propose_write` to `[A,B]` must return `ConsistencyError::CasConflict`
+///    (CAS-mismatch rejects from A and B drop possible accepts below quorum).
+/// 2. The production `replicate_write` to `[A,B]` must surface that as the typed
+///    `DatabaseError::CasConflict` AND, because it applies locally only on quorum
+///    success, must apply NOTHING on C.
 ///
 /// Both proposals reject idempotently (A,B still hold the winning value), so
 /// neither mutates any node.
 fn assert_post_heal_c_fenced(node_c: &Node, key: &[u8], value_c: &[u8]) -> TestResult {
     let endpoint = node_c.db.distribution().ok_or("C has no endpoint")?;
 
-    // (1) Structured proof: fenced specifically by CAS rejects.
+    // (1) Structured proof: out-voted specifically by CAS-mismatch rejects.
     let structured = endpoint.propose_write(
         ProposeWrite {
             key: key.to_vec(),
@@ -213,25 +219,26 @@ fn assert_post_heal_c_fenced(node_c: &Node, key: &[u8], value_c: &[u8]) -> TestR
         QUORUM_TIMEOUT,
     );
     match structured {
-        Err(ConsistencyError::Fenced {
+        Err(ConsistencyError::CasConflict {
             required,
             possible_accepts,
         }) => {
             assert_eq!(required, 2, "quorum over 3 is 2");
             assert!(
                 possible_accepts < 2,
-                "CAS rejects from A and B must drop possible accepts below quorum, got {possible_accepts}"
+                "CAS-mismatch rejects from A and B must drop possible accepts below quorum, got {possible_accepts}"
             );
         }
         other => {
             return Err(format!(
-                "post-heal C must be CAS-REJECTED -> Fenced (NOT timeout, NOT commit), got {other:?}"
+                "post-heal C must be CAS-REJECTED -> CasConflict (NOT timeout, NOT commit, NOT epoch Fenced), got {other:?}"
             )
             .into());
         }
     }
 
-    // (2) Production path: replicate_write reports the fence and applies nothing.
+    // (2) Production path: replicate_write reports the value-CAS loss and applies
+    // nothing.
     let production = node_c.db.replicate_write(
         key.to_vec(),
         None,
@@ -241,17 +248,17 @@ fn assert_post_heal_c_fenced(node_c: &Node, key: &[u8], value_c: &[u8]) -> TestR
         QUORUM_TIMEOUT,
     );
     match production {
-        Err(DatabaseError::Fenced {
+        Err(DatabaseError::CasConflict {
             required,
             possible_accepts,
         }) => assert!(
             possible_accepts < required,
-            "production replicate_write must report C fenced by CAS rejects (a quorum of \
+            "production replicate_write must report C out-voted by CAS-mismatch rejects (a quorum of \
              accepts no longer reachable), got required={required} possible_accepts={possible_accepts}"
         ),
         other => {
             return Err(format!(
-                "post-heal C replicate_write must fail with the typed Fenced, got {other:?}"
+                "post-heal C replicate_write must fail with the typed CasConflict, got {other:?}"
             )
             .into());
         }
@@ -440,14 +447,16 @@ fn minority_is_fenced_without_reachable_peers() -> TestResult {
 ///  * HEAL: link C <-> {A,B}. C RE-proposes CAS `None -> "from-C"` with
 ///    `send_targets=[A,B]`. A and B already hold `k = "from-AB"` (current hash is
 ///    no longer the expected `None`) -> their conditional apply REJECTS with
-///    `CasMismatch` -> they ack `Rejected` -> C's tally sees 2 distinct rejects ->
-///    C is deterministically `Fenced` (NOT a timeout, NOT a commit).
+///    `CasMismatch` -> they ack `Rejected` -> C's tally sees 2 distinct CAS-mismatch
+///    rejects -> C is deterministically `CasConflict` (NOT a timeout, NOT a commit,
+///    and NOT an epoch `Fenced` — C lost a value race, it was not deposed).
 ///
 /// Assertions prove exactly-one-acquirer:
 ///  * the majority write committed (A reached quorum on "from-AB");
 ///  * B durably holds `k = "from-AB"` (the winning value);
-///  * C's post-heal re-proposal returns `ConsistencyError::Fenced` — i.e. it was
-///    CAS-REJECTED by the peers, not merely timed out and not allowed to overwrite;
+///  * C's post-heal re-proposal returns `ConsistencyError::CasConflict` — i.e. it
+///    was CAS-REJECTED by the peers, not merely timed out and not allowed to
+///    overwrite;
 ///  * B STILL holds `k = "from-AB"` afterwards (C did not overwrite anyone).
 #[test]
 fn heal_mid_write_exactly_one_side_acquires() -> TestResult {
@@ -536,9 +545,10 @@ fn heal_mid_write_exactly_one_side_acquires() -> TestResult {
 
     // --- C RE-proposes the SAME create now that it can reach A and B. --------
     // A and B already hold k = "from-AB", so their CAS compare MISMATCHES -> both
-    // ack Rejected(CasMismatch) -> C is deterministically Fenced (out-voted, not
-    // allowed to overwrite). Proven both structurally (`Fenced`) and via the real
-    // production replicate_write (errors AND applies nothing locally).
+    // ack Rejected(CasMismatch) -> C is deterministically out-voted (a value-CAS
+    // loss, not an epoch deposition) -> CasConflict, not allowed to overwrite.
+    // Proven both structurally (`CasConflict`) and via the real production
+    // replicate_write (errors AND applies nothing locally).
     assert_post_heal_c_fenced(&node_c, &key, &value_c)?;
 
     // --- EXACTLY ONE ACQUIRER: the majority value won; C overwrote no one. ----
