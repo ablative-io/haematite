@@ -1,3 +1,4 @@
+pub mod cluster_members;
 pub mod consistency;
 pub mod endpoint;
 pub mod handoff_merge;
@@ -12,6 +13,9 @@ pub mod transport_glue;
 
 pub use crate::sync_codec::ballot;
 pub use crate::sync_codec::ballot::{Ballot, Stamp};
+pub use cluster_members::{
+    CLUSTER_MEMBERS_KEY, ClusterMember, ClusterMembers, ClusterMembersError, MemberStatus,
+};
 pub use consistency::{
     Ack, CasVote, ConsistencyError, ConsistencyMode, EventualConsistency, QuorumOutcome,
     RejectKind, StrongConsistency, execute_with_consistency, quorum_size, wait_for_cas_quorum,
@@ -21,7 +25,7 @@ pub use endpoint::{
     DistributionEndpoint, ElectionError, ElectionOutcome, ElectionVote, InboundSync, ProposeWrite,
 };
 pub use handoff_merge::{HandoffMergeError, merge_committed_union};
-pub use membership::{WriteMembership, resolve_membership};
+pub use membership::{WriteMembership, resolve_membership, resolve_membership_with_record};
 pub use merge::{SyncMergeError, SyncMergeResult, SyncMergeRoots, merge_synced_roots};
 pub use protocol::{
     AckOutcome, BatchWriteAck, BatchWriteEntry, BatchWriteProposal, MissingNodes, Nack,

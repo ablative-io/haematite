@@ -76,6 +76,11 @@ pub enum DatabaseError {
         required: usize,
         possible_accepts: usize,
     },
+    /// The durable `cluster/members` record (CSOT-1, task #146) could not be
+    /// encoded or a stored record could not be decoded/validated. Carries the
+    /// underlying [`crate::sync::ClusterMembersError`] as a string so this variant
+    /// stays dependency-light and matches the existing stringified-cause style.
+    ClusterMembers(String),
 }
 
 impl fmt::Display for DatabaseError {
@@ -157,6 +162,9 @@ impl fmt::Display for DatabaseError {
                 formatter,
                 "lost CAS by value mismatch: required {required} accepts, only {possible_accepts} still possible"
             ),
+            Self::ClusterMembers(message) => {
+                write!(formatter, "cluster/members record error: {message}")
+            }
         }
     }
 }
@@ -188,8 +196,15 @@ impl std::error::Error for DatabaseError {
             | Self::ElectionLost { .. }
             | Self::ElectionTimeout { .. }
             | Self::Fenced { .. }
-            | Self::CasConflict { .. } => None,
+            | Self::CasConflict { .. }
+            | Self::ClusterMembers(_) => None,
         }
+    }
+}
+
+impl From<crate::sync::ClusterMembersError> for DatabaseError {
+    fn from(error: crate::sync::ClusterMembersError) -> Self {
+        Self::ClusterMembers(error.to_string())
     }
 }
 
