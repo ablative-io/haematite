@@ -12,8 +12,12 @@
 //! `config.nodes`; when absent, behaviour falls back to `config.nodes.len()` and is
 //! byte-identical to the pre-CSOT-1 path. See [`super::membership`].
 //!
-//! Placement: the design co-locates this on a fixed coordination shard (shard 0)
-//! under the reserved key [`CLUSTER_MEMBERS_KEY`]. The persistence round-trip
+//! Placement: the reserved key [`CLUSTER_MEMBERS_KEY`] routes like any key through
+//! `handle_for`, i.e. to the DETERMINISTIC shard for that key — the same shard on
+//! every node given the cluster-uniform `shard_count`, so a cross-node reader finds
+//! the record under the same key with no directory lookup. (It is NOT literally
+//! shard 0; a well-known fixed index would be a CSOT-2 refinement if ever needed.)
+//! The persistence round-trip
 //! ([`crate::db::Database::write_genesis_cluster_members`] /
 //! [`crate::db::Database::read_cluster_members`]) uses the existing durable
 //! append/read primitive — no new storage engine.
@@ -87,6 +91,9 @@ impl ClusterMember {
 /// Errors that can arise decoding or validating a durable `cluster/members` record.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ClusterMembersError {
+    /// Serialising the owned, validated record to JSON failed. Not expected in
+    /// practice; kept distinct from `Decode` so an encode fault is never mislabelled.
+    Encode(String),
     /// The stored bytes were not valid record JSON.
     Decode(String),
     /// The record named zero members: a denominator of 0 is never valid (it would
@@ -101,6 +108,7 @@ pub enum ClusterMembersError {
 impl std::fmt::Display for ClusterMembersError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            Self::Encode(reason) => write!(formatter, "cluster/members encode failed: {reason}"),
             Self::Decode(reason) => write!(formatter, "cluster/members decode failed: {reason}"),
             Self::EmptyMemberSet => formatter.write_str("cluster/members has an empty member set"),
             Self::DuplicateMember(node) => {
@@ -187,10 +195,10 @@ impl ClusterMembers {
 
     /// Serialise the record to durable bytes (canonical JSON).
     ///
-    /// Returns [`ClusterMembersError::Decode`] only if serialisation fails, which
+    /// Returns [`ClusterMembersError::Encode`] only if serialisation fails, which
     /// for this owned, already-validated struct is not expected in practice.
     pub fn encode(&self) -> Result<Vec<u8>, ClusterMembersError> {
-        serde_json::to_vec(self).map_err(|error| ClusterMembersError::Decode(error.to_string()))
+        serde_json::to_vec(self).map_err(|error| ClusterMembersError::Encode(error.to_string()))
     }
 
     /// Decode durable bytes back into a validated record.
