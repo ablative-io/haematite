@@ -193,6 +193,48 @@ impl Database {
             .map_err(map_shard_error)
     }
 
+    /// Write the single-node GENESIS `cluster/members` record (CSOT-1, task #146).
+    ///
+    /// A lone node writes its own denominator-1, self-quorum member set at config
+    /// epoch 0 (#146 §4.2 step 2) and can immediately read it back with
+    /// [`Self::read_cluster_members`]. The record is persisted under the reserved
+    /// [`crate::sync::CLUSTER_MEMBERS_KEY`] via the existing durable append
+    /// primitive; genesis is the append at sequence 0, so a second genesis attempt
+    /// on an already-formed cluster fails with a sequence conflict rather than
+    /// silently overwriting the durable record.
+    ///
+    /// This is INERT: it does not change any quorum/send behaviour by itself.
+    /// `resolve_membership` only consults the record once a caller reads it and
+    /// passes it to [`crate::sync::resolve_membership_with_record`]. CSOT-1 writes
+    /// no deltas (join/leave/evict are later phases).
+    pub fn write_genesis_cluster_members(
+        &self,
+        record: &crate::sync::ClusterMembers,
+    ) -> Result<(), DatabaseError> {
+        let bytes = record.encode()?;
+        self.append(crate::sync::CLUSTER_MEMBERS_KEY.to_vec(), vec![bytes], 0)?;
+        Ok(())
+    }
+
+    /// Read the durable `cluster/members` record, or `None` if no record exists yet
+    /// (a fresh, never-formed cluster) (CSOT-1, task #146).
+    ///
+    /// `None` is the load-bearing FALLBACK signal: with no durable record,
+    /// `resolve_membership_with_record(config, None, ..)` sizes quorum from static
+    /// `config.nodes`, byte-identical to the pre-CSOT-1 path. When a record IS
+    /// present, the LATEST stored version is returned (later deltas append newer
+    /// versions; the newest wins) and its denominator takes precedence.
+    pub fn read_cluster_members(
+        &self,
+    ) -> Result<Option<crate::sync::ClusterMembers>, DatabaseError> {
+        let versions = self.read_events(crate::sync::CLUSTER_MEMBERS_KEY)?;
+        let Some(latest) = versions.last() else {
+            return Ok(None);
+        };
+        let record = crate::sync::ClusterMembers::decode(latest)?;
+        Ok(Some(record))
+    }
+
     /// Attach a live beamr distribution endpoint to this database.
     ///
     /// This is the active-active "2a-0" substrate: it installs the inbound-drain

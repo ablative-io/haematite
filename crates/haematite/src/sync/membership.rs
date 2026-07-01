@@ -19,6 +19,7 @@
 use std::collections::BTreeSet;
 
 use crate::db::DistributedDatabaseConfig;
+use crate::sync::cluster_members::ClusterMembers;
 use crate::sync::topology::SyncNodeId;
 
 /// The membership inputs for one Strong CAS write.
@@ -50,12 +51,43 @@ pub struct WriteMembership {
 ///
 /// `send_targets` is returned in the configured `nodes` order with duplicates in
 /// the configured list collapsed, so the result is deterministic.
+///
+/// This is the STATIC-CONFIG path (no durable record). It is retained
+/// byte-for-byte and delegates to [`resolve_membership_with_record`] with `None`,
+/// so every existing caller and test is unchanged. CSOT-1 introduces the durable
+/// override via [`resolve_membership_with_record`].
 #[must_use]
 pub fn resolve_membership(
     config: &DistributedDatabaseConfig,
     reachable: &BTreeSet<SyncNodeId>,
 ) -> WriteMembership {
-    let total_nodes = config.nodes.len();
+    resolve_membership_with_record(config, None, reachable)
+}
+
+/// Resolve `(total_nodes, send_targets)` with an OPTIONAL durable `cluster/members`
+/// record taking PRECEDENCE over static config (CSOT-1, task #146).
+///
+/// Denominator precedence, exactly:
+///
+/// * `record = Some(r)` ⇒ `total_nodes = r.denominator()` — the durable record
+///   WINS. This is the load-bearing #146 cutover: membership becomes durable state.
+/// * `record = None` ⇒ `total_nodes = config.nodes.len()` — the fallback is
+///   BYTE-IDENTICAL to the pre-CSOT-1 behaviour, so single-node and static-config
+///   deployments are unaffected until a record exists.
+///
+/// `send_targets` is UNCHANGED by the record in CSOT-1: it is still the reachable
+/// subset of `config.nodes` (excluding the local node), in configured order with
+/// duplicates collapsed. Deriving send targets from the durable record is a later
+/// phase (it needs the discovery/address fields CSOT-1 deliberately omits); wiring
+/// it now would change send behaviour, which CSOT-1 forbids. The denominator is the
+/// only quorum-load-bearing value, and it is the only thing the record overrides.
+#[must_use]
+pub fn resolve_membership_with_record(
+    config: &DistributedDatabaseConfig,
+    record: Option<&ClusterMembers>,
+    reachable: &BTreeSet<SyncNodeId>,
+) -> WriteMembership {
+    let total_nodes = record.map_or_else(|| config.nodes.len(), ClusterMembers::denominator);
 
     let mut emitted = BTreeSet::new();
     let mut send_targets = Vec::new();
@@ -151,4 +183,125 @@ mod tests {
             "minority must be fenced, got {outcome:?}"
         );
     }
+
+    // --- CSOT-1: durable record precedence (task #146) ---------------------
+
+    use crate::sync::cluster_members::{ClusterMember, ClusterMembers, MemberStatus};
+
+    fn record(cn: &str, epoch: u64, members: &[&str]) -> ClusterMembers {
+        ClusterMembers {
+            cluster_identity: cn.to_owned(),
+            config_epoch: epoch,
+            members: members
+                .iter()
+                .map(|name| ClusterMember::active(SyncNodeId::from(*name)))
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn no_record_denominator_is_byte_identical_to_static_config() {
+        // GATE (b): with NO durable record, the resolved membership is IDENTICAL to
+        // the historical static-config result for the same inputs.
+        let config = config("a", &["a", "b", "c"]);
+        let reach = reachable(&["a", "b", "c"]);
+
+        let static_only = resolve_membership(&config, &reach);
+        let explicit_none = resolve_membership_with_record(&config, None, &reach);
+
+        assert_eq!(
+            static_only, explicit_none,
+            "None path == static config path"
+        );
+        assert_eq!(
+            static_only.total_nodes, 3,
+            "denominator = config.nodes.len()"
+        );
+    }
+
+    #[test]
+    fn present_record_denominator_wins_over_config_nodes_len() {
+        // GATE (a): with a record present, the per-write denominator equals the
+        // RECORD's value, NOT config.nodes.len(). Here config says 3 but the durable
+        // record names 5 members, so quorum must size against 5.
+        let config = config("a", &["a", "b", "c"]);
+        let rec = record("prod", 4, &["a", "b", "c", "d", "e"]);
+
+        let membership =
+            resolve_membership_with_record(&config, Some(&rec), &reachable(&["a", "b", "c"]));
+
+        assert_eq!(
+            membership.total_nodes, 5,
+            "record denominator (5) wins over config.nodes.len() (3)"
+        );
+        assert_ne!(
+            membership.total_nodes,
+            config.nodes.len(),
+            "must NOT fall back to static config when a record exists"
+        );
+    }
+
+    #[test]
+    fn single_node_genesis_record_yields_denominator_one()
+    -> Result<(), crate::sync::cluster_members::ClusterMembersError> {
+        // GATE (c) unit half: a lone genesis record produces a denominator of 1
+        // (self-quorum), regardless of a larger static config.
+        let config = config("solo", &["solo", "ghost-b", "ghost-c"]);
+        let genesis = ClusterMembers::genesis("cluster-solo", SyncNodeId::from("solo"))?;
+
+        let membership =
+            resolve_membership_with_record(&config, Some(&genesis), &reachable(&["solo"]));
+
+        assert_eq!(membership.total_nodes, 1, "lone genesis denominator = 1");
+        assert_eq!(
+            quorum_size(membership.total_nodes),
+            Ok(1),
+            "self-quorum: one node satisfies its own quorum"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn record_does_not_change_send_targets_in_csot1() {
+        // Inertness: the record overrides the DENOMINATOR only; send_targets stay
+        // the reachable subset of config.nodes in CSOT-1.
+        let config = config("a", &["a", "b", "c"]);
+        let rec = record("prod", 1, &["a", "b", "c", "d"]);
+
+        let with_record =
+            resolve_membership_with_record(&config, Some(&rec), &reachable(&["a", "b", "c"]));
+
+        assert_eq!(
+            with_record.send_targets,
+            vec![SyncNodeId::from("b"), SyncNodeId::from("c")],
+            "send_targets unchanged by the record"
+        );
+    }
+
+    #[test]
+    fn down_and_joining_members_still_count_in_csot1_denominator() {
+        // CSOT-1 is total: every stored member counts, so the denominator equals
+        // the static count exactly. (Status-aware exclusion is a CSOT-2 concern.)
+        let config = config("a", &["a", "b", "c"]);
+        let rec = ClusterMembers {
+            cluster_identity: "prod".to_owned(),
+            config_epoch: 2,
+            members: vec![
+                ClusterMember::active(SyncNodeId::from("a")),
+                ClusterMember {
+                    node_id: SyncNodeId::from("b"),
+                    status: MemberStatus::Joining,
+                },
+                ClusterMember {
+                    node_id: SyncNodeId::from("c"),
+                    status: MemberStatus::Down,
+                },
+            ],
+        };
+
+        let membership = resolve_membership_with_record(&config, Some(&rec), &reachable(&["a"]));
+        assert_eq!(membership.total_nodes, 3, "all statuses count in CSOT-1");
+    }
+
+    use crate::sync::consistency::quorum_size;
 }

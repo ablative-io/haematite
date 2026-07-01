@@ -356,6 +356,86 @@ fn append_read_events_and_sequence_conflicts_work() -> Result<(), Box<dyn Error>
     Ok(())
 }
 
+// --- CSOT-1: durable cluster/members genesis round-trip (task #146) ---------
+
+#[test]
+fn read_cluster_members_is_none_before_any_genesis_write() -> Result<(), Box<dyn Error>> {
+    // GATE (b) storage half: a fresh cluster has NO durable record, so
+    // read_cluster_members returns None — the signal that resolve_membership must
+    // fall back to static config (byte-identical to pre-CSOT-1).
+    let dir = tempfile::tempdir()?;
+    let db = Database::create(config_for(&dir.path().join("db"), 4))?;
+    assert!(
+        db.read_cluster_members()?.is_none(),
+        "no record exists on a never-formed cluster"
+    );
+    drop(db);
+    Ok(())
+}
+
+#[test]
+fn single_node_genesis_cluster_members_round_trips() -> Result<(), Box<dyn Error>> {
+    use crate::sync::ClusterMembers;
+
+    // GATE (c) storage half: a lone node writes its own denominator-1 record and
+    // reads back the IDENTICAL record (self-quorum, safe today).
+    let dir = tempfile::tempdir()?;
+    let db = Database::create(config_for(&dir.path().join("db"), 4))?;
+
+    let genesis = ClusterMembers::genesis("cluster-solo", SyncNodeId::from("solo"))?;
+    db.write_genesis_cluster_members(&genesis)?;
+
+    let read_back = db.read_cluster_members()?;
+    assert_eq!(
+        read_back.as_ref(),
+        Some(&genesis),
+        "genesis record round-trips byte-for-byte"
+    );
+    let read_back = read_back.ok_or("record present after genesis write")?;
+    assert_eq!(
+        read_back.denominator(),
+        1,
+        "lone node self-quorum denominator"
+    );
+    assert_eq!(read_back.config_epoch, 0, "genesis is config epoch 0");
+
+    drop(db);
+    Ok(())
+}
+
+#[test]
+fn genesis_write_is_exactly_once_and_survives_reopen() -> Result<(), Box<dyn Error>> {
+    use crate::sync::ClusterMembers;
+
+    // A second genesis attempt must NOT silently clobber the durable record: it
+    // conflicts on the sequence-0 append. And the record must survive a DB reopen
+    // (real durability, not just in-memory).
+    let dir = tempfile::tempdir()?;
+    let data_dir = dir.path().join("db");
+    let genesis = ClusterMembers::genesis("cluster-solo", SyncNodeId::from("solo"))?;
+
+    {
+        let db = Database::create(config_for(&data_dir, 4))?;
+        db.write_genesis_cluster_members(&genesis)?;
+        assert!(
+            matches!(
+                db.write_genesis_cluster_members(&genesis),
+                Err(DatabaseError::SequenceConflict { .. })
+            ),
+            "a second genesis write must conflict, never silently overwrite"
+        );
+    }
+
+    let reopened = Database::open(&data_dir)?;
+    assert_eq!(
+        reopened.read_cluster_members()?.as_ref(),
+        Some(&genesis),
+        "durable record survives reopen"
+    );
+    drop(reopened);
+    Ok(())
+}
+
 #[test]
 fn scan_sequence_keys_for_shards_scopes_to_named_shards() -> Result<(), Box<dyn Error>> {
     use std::collections::{BTreeMap, BTreeSet};
