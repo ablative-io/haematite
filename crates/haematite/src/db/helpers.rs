@@ -1,21 +1,12 @@
-//! Internal helpers for [`crate::db::Database`]: shard-error mapping, ordered
-//! commit-hash collection, single-shard range collection, and event-key range
-//! bounds. Kept separate to keep `db.rs` focused on the public surface.
+//! Internal helpers for [`crate::db::Database`]: shard-error mapping, single-
+//! shard range collection, and event-key range bounds. Kept separate to keep
+//! `db.rs` focused on the public surface.
 
 use std::time::Duration;
 
 use crate::shard::actor::{RangeItem, ShardError, ShardHandle};
-use crate::tree::Hash;
 
-use super::{DatabaseError, DbRange, ShardCommitResult};
-
-/// Map a spawn-time shard error, preserving the spawn variant.
-pub(super) fn map_spawn_error(error: ShardError) -> DatabaseError {
-    match error {
-        ShardError::Spawn(message) => DatabaseError::ShardSpawn(message),
-        other => map_shard_error(other),
-    }
-}
+use super::{DatabaseError, DbRange};
 
 /// Map a runtime shard error into the public [`DatabaseError`], preserving the
 /// optimistic-concurrency variants so callers can match them precisely.
@@ -30,34 +21,6 @@ pub fn map_shard_error(error: ShardError) -> DatabaseError {
         ShardError::Spawn(message) => DatabaseError::ShardSpawn(message),
         other => DatabaseError::ShardError(other.to_string()),
     }
-}
-
-/// Reassemble per-shard commit results into a shard-ordered hash vector.
-pub fn ordered_hashes(
-    results: Vec<ShardCommitResult>,
-    shard_count: usize,
-) -> Result<Vec<Hash>, DatabaseError> {
-    let mut ordered = vec![None; shard_count];
-    for (index, result) in results {
-        match result {
-            Ok(hash) => {
-                if let Some(slot) = ordered.get_mut(index) {
-                    *slot = Some(hash);
-                }
-            }
-            Err(error) => return Err(map_shard_error(error)),
-        }
-    }
-    let mut hashes = Vec::with_capacity(shard_count);
-    for hash in ordered {
-        let Some(hash) = hash else {
-            return Err(DatabaseError::ShardError(
-                "missing shard commit result".to_owned(),
-            ));
-        };
-        hashes.push(hash);
-    }
-    Ok(hashes)
 }
 
 /// Run a `[from, to)` range against one shard handle and collect its entries.

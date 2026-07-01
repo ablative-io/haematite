@@ -87,15 +87,34 @@ fn create_rejects_zero_shards() -> Result<(), Box<dyn Error>> {
 }
 
 #[test]
-fn create_writes_config_and_shard_directories() -> Result<(), Box<dyn Error>> {
+fn create_writes_config_and_materialises_shards_lazily() -> Result<(), Box<dyn Error>> {
     let dir = tempfile::tempdir()?;
     let data_dir = dir.path().join("db");
     let db = Database::create(config_for(&data_dir, 4))?;
 
+    // The database root + config are written eagerly...
     assert!(data_dir.is_dir());
     assert_config_json(&data_dir, 4)?;
+
+    // ...but LAZY materialisation means NO per-shard directory exists until a
+    // shard is first touched (the O(used)-not-O(count) boot property).
     for index in 0..4 {
-        assert!(data_dir.join(format!("shard-{index}")).is_dir());
+        assert!(
+            !data_dir.join(format!("shard-{index}")).exists(),
+            "shard-{index} must not be pre-created under lazy materialisation"
+        );
+    }
+
+    // Touching a key materialises exactly its shard's directory, and no other.
+    let touched = db.shard_for(b"key");
+    db.put(b"key".to_vec(), b"value".to_vec())?;
+    for index in 0..4 {
+        let exists = data_dir.join(format!("shard-{index}")).is_dir();
+        assert_eq!(
+            exists,
+            index == touched,
+            "only the touched shard-{touched} directory should be materialised"
+        );
     }
 
     drop(db);
@@ -230,10 +249,22 @@ fn end_to_end_create_commit_range_drop_open_read_cycle() -> Result<(), Box<dyn E
     drop(db);
 
     let reopened = Database::open(&data_dir)?;
-    assert_eq!(reopened.router.handles_in_order().len(), 4);
+    // LAZY: reopening materialises NO shard up front — the modulus base is still
+    // 4, but nothing is spawned until a key touches a shard.
+    assert_eq!(reopened.shard_count(), 4);
+    assert_eq!(reopened.router.materialised_shard_ids().len(), 0);
     for (key, value) in &expected {
         assert_eq!(reopened.get(key)?, Some(value.clone()));
     }
+    // After reading every key back, exactly the shards those keys hash to are
+    // materialised (and every key round-tripped, proving WAL recovery on first
+    // touch), never more than the 4-shard base.
+    let touched: std::collections::BTreeSet<usize> =
+        keys.iter().map(|key| reopened.shard_for(key)).collect();
+    assert_eq!(
+        reopened.router.materialised_shard_ids(),
+        touched.into_iter().collect::<Vec<_>>()
+    );
     drop(reopened);
     Ok(())
 }
@@ -430,7 +461,8 @@ fn drop_shutdowns_shards_without_panicking_after_a_crash() -> Result<(), Box<dyn
     let data_dir = dir.path().join("db");
     let db = Database::create(config_for(&data_dir, 2))?;
     db.put(b"key".to_vec(), b"value".to_vec())?;
-    let handles = db.router.handles_in_order().to_vec();
+    // LAZY: the single put materialised exactly the one shard `key` hashes to.
+    let handles = db.router.materialised_handles();
     if let Some(first) = handles.first() {
         db.scheduler.exit_signal(0, first.pid(), ExitReason::Kill)?;
     }

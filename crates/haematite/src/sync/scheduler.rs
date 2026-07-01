@@ -57,6 +57,32 @@ impl SyncPullTrigger for NoopSyncPullTrigger {
     }
 }
 
+/// The set of shards a sync pass should visit on each tick.
+///
+/// LAZY SHARD MATERIALISATION: an un-materialised shard holds no data, so
+/// triggering a pull for it is pure waste. The scheduler queries this each tick
+/// instead of blindly fanning across `0..shard_count`, so a very high shard count
+/// costs nothing to sync until shards are actually materialised. The default
+/// [`DenseShardSource`] preserves the old dense behaviour for callers that have
+/// no lazy router (e.g. the scheduler's own unit tests).
+pub trait SyncShardSource: Send + Sync + 'static {
+    /// Shard ids to sync on this tick, ascending. MUST be a subset of
+    /// `0..shard_count`.
+    fn shards_to_sync(&self) -> Vec<ShardId>;
+}
+
+/// Dense source: every shard id `0..shard_count` (the pre-lazy behaviour).
+#[derive(Debug, Clone, Copy)]
+pub struct DenseShardSource {
+    pub shard_count: usize,
+}
+
+impl SyncShardSource for DenseShardSource {
+    fn shards_to_sync(&self) -> Vec<ShardId> {
+        (0..self.shard_count).collect()
+    }
+}
+
 /// Configuration for one local sync scheduler.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SyncSchedulerConfig {
@@ -154,11 +180,29 @@ impl fmt::Debug for SyncSchedulerHandle {
 }
 
 impl SyncSchedulerHandle {
-    /// Spawn a supervised sync scheduler on the provided beamr scheduler.
+    /// Spawn a supervised sync scheduler that fans across every shard id
+    /// `0..shard_count` on each tick (the dense, pre-lazy behaviour).
     pub fn spawn(
         scheduler: Arc<Scheduler>,
         config: SyncSchedulerConfig,
         trigger: Arc<dyn SyncPullTrigger>,
+        command_timeout: Duration,
+    ) -> Result<Self, SyncSchedulerError> {
+        let shard_source = Arc::new(DenseShardSource {
+            shard_count: config.shard_count,
+        });
+        Self::spawn_with_shard_source(scheduler, config, trigger, shard_source, command_timeout)
+    }
+
+    /// Spawn a supervised sync scheduler that queries `shard_source` each tick for
+    /// the shards to sync — the lazy-materialisation seam: a router-backed source
+    /// syncs ONLY materialised shards, so an un-materialised shard (which holds no
+    /// data) is never pulled.
+    pub fn spawn_with_shard_source(
+        scheduler: Arc<Scheduler>,
+        config: SyncSchedulerConfig,
+        trigger: Arc<dyn SyncPullTrigger>,
+        shard_source: Arc<dyn SyncShardSource>,
         command_timeout: Duration,
     ) -> Result<Self, SyncSchedulerError> {
         config.validate()?;
@@ -168,6 +212,7 @@ impl SyncSchedulerHandle {
         let spec = Arc::new(SyncSchedulerSpec {
             config,
             trigger,
+            shard_source,
             commands: Arc::clone(&commands),
             atoms,
         });
@@ -280,6 +325,7 @@ impl SyncSchedulerAtoms {
 struct SyncSchedulerSpec {
     config: SyncSchedulerConfig,
     trigger: Arc<dyn SyncPullTrigger>,
+    shard_source: Arc<dyn SyncShardSource>,
     commands: CommandQueue,
     atoms: SyncSchedulerAtoms,
 }
@@ -363,14 +409,19 @@ impl SyncSchedulerNativeHandler {
 
     fn run_scheduled_syncs(&self) -> Result<SyncSchedulerStats, SyncSchedulerError> {
         let partners = self.spec.config.partners()?;
+        // LAZY: only shards the source reports (materialised shards, under the
+        // router-backed source) are pulled — an un-materialised shard holds no
+        // data, so syncing it is pure waste. The dense source reproduces the old
+        // `0..shard_count` fan-out exactly.
+        let shards = self.spec.shard_source.shards_to_sync();
         let mut stats = SyncSchedulerStats {
             partners: partners.len(),
-            shards: self.spec.config.shard_count,
+            shards: shards.len(),
             operations_triggered: 0,
         };
 
         for partner in partners {
-            for shard_id in 0..self.spec.config.shard_count {
+            for &shard_id in &shards {
                 self.spec
                     .trigger
                     .trigger_pull(&partner, shard_id)
