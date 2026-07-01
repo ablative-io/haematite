@@ -15,7 +15,7 @@
 use std::collections::BTreeMap;
 use std::time::Duration;
 
-use crate::db::helpers::{map_shard_error, ordered_hashes, range_on_handle};
+use crate::db::helpers::{map_shard_error, range_on_handle};
 use crate::db::{Database, DatabaseError, run_indexed_parallel};
 use crate::shard::actor::ShardHandle;
 use crate::sync::{
@@ -131,7 +131,8 @@ impl Database {
         if from >= to {
             return Ok(Vec::new());
         }
-        range_on_handle(self.handle_for(from)?, from, to, self.timeout())
+        let handle = self.handle_for(from)?;
+        range_on_handle(&handle, from, to, self.timeout())
     }
 
     /// Read a `[from, to)` range from the shard at `shard_id` (by index), in
@@ -147,7 +148,8 @@ impl Database {
         if from >= to {
             return Ok(Vec::new());
         }
-        range_on_handle(self.handle_for_shard(shard_id)?, from, to, self.timeout())
+        let handle = self.handle_for_shard(shard_id)?;
+        range_on_handle(&handle, from, to, self.timeout())
     }
 
     /// Append a routed single-key put, co-located by `route_key` (AA-4-1).
@@ -231,22 +233,43 @@ impl Database {
         if from >= to {
             return Ok(Vec::new());
         }
-        range_on_handle(self.handle_for(route_key)?, from, to, self.timeout())
+        let handle = self.handle_for(route_key)?;
+        range_on_handle(&handle, from, to, self.timeout())
     }
 
     /// Flush every shard's WAL buffer to its prolly tree and return roots by
     /// shard id.
     ///
-    /// Exactly one `Commit` command is sent to each shard actor. The shard actor
-    /// applies its entire buffer as one `batch_mutate` call, persists the new
-    /// root marker, clears the buffer, and replies with the current root. A call
-    /// with no buffered writes still returns the current root for every shard.
+    /// LAZY MATERIALISATION / GATE 1 — empty-root synthesis. Exactly one `Commit`
+    /// command is sent to each MATERIALISED shard actor (which applies its buffer
+    /// as one `batch_mutate`, persists the new root marker, clears the buffer, and
+    /// replies with its current root). Every shard id in `0..shard_count` that has
+    /// NOT been materialised holds no data — it would commit to the canonical
+    /// empty-tree root — so its slot is filled with the store-free
+    /// [`crate::tree::empty_root_hash`] constant WITHOUT spawning its actor. The
+    /// returned `ShardRoots` is therefore byte-identical to the eager case (proven
+    /// by the S0 spike `global_root_identical_eager_vs_synthesised`): a call with
+    /// no buffered writes still returns one root for every shard.
     pub fn commit(&self) -> Result<ShardRoots, DatabaseError> {
-        let handles = self.shard_handles_in_order().to_vec();
+        let (materialised_ids, handles) = self.materialised_shards();
         let timeout = self.timeout();
         let results = run_indexed_parallel(handles, |handle: ShardHandle| handle.commit(timeout))?;
-        let hashes = ordered_hashes(results, self.shard_count())?;
-        Ok(hashes.into_iter().enumerate().collect())
+
+        // Committed roots for the shards that were live, keyed by their real id.
+        let mut committed: BTreeMap<usize, Hash> = BTreeMap::new();
+        for (position, result) in results {
+            let shard_id = materialised_ids[position];
+            let hash = result.map_err(map_shard_error)?;
+            committed.insert(shard_id, hash);
+        }
+
+        // Fill the full `0..shard_count` slot vector: real root where committed,
+        // synthesised empty root everywhere else (GATE 1).
+        let empty = crate::tree::empty_root_hash();
+        let roots = (0..self.shard_count())
+            .map(|shard_id| (shard_id, committed.get(&shard_id).copied().unwrap_or(empty)))
+            .collect();
+        Ok(roots)
     }
 }
 

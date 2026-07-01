@@ -8,13 +8,11 @@ use beamr::scheduler::Scheduler;
 
 use beamr::atom::Atom;
 
-use crate::shard::actor::{ShardError, ShardHandle};
-use crate::shard::router::ShardRouter;
+use crate::shard::actor::ShardHandle;
+use crate::shard::router::{MaterialiseError, ShardRouter};
 use crate::sync::endpoint::{DistributionEndpoint, InboundSync};
 use crate::sync::protocol::SyncMessage;
 use crate::sync::scheduler::SyncSchedulerHandle;
-use crate::tree::Hash;
-use crate::ttl::sweep::SweepHandle;
 
 mod config;
 mod error;
@@ -39,14 +37,12 @@ const CONFIG_FILE: &str = "config.json";
 
 pub(crate) type DbEntry = (Vec<u8>, Vec<u8>);
 pub(crate) type DbRange = Vec<DbEntry>;
-pub(crate) type ShardCommitResult = (usize, Result<Hash, ShardError>);
 
 /// Top-level database handle. Callers use this API instead of shard actors.
 pub struct Database {
     config: DatabaseConfig,
     scheduler: Arc<Scheduler>,
     router: ShardRouter,
-    sweeps: Vec<SweepHandle>,
     sync_schedulers: Vec<SyncSchedulerHandle>,
     /// Live beamr distribution endpoint, present once `with_distribution` runs.
     ///
@@ -139,7 +135,8 @@ impl Database {
     ) -> Result<Vec<Vec<u8>>, DatabaseError> {
         let from = event_range_start(key, from_seq);
         let to = event_range_end(key);
-        let entries = range_on_handle(self.handle_for(key)?, &from, &to, self.timeout)?;
+        let handle = self.handle_for(key)?;
+        let entries = range_on_handle(&handle, &from, &to, self.timeout)?;
         Ok(entries.into_iter().map(|(_, value)| value).collect())
     }
 
@@ -156,7 +153,8 @@ impl Database {
     ) -> Result<DbRange, DatabaseError> {
         let from = event_range_start(key, from_seq);
         let to = event_range_end(key);
-        range_on_handle(self.handle_for(key)?, &from, &to, self.timeout)
+        let handle = self.handle_for(key)?;
+        range_on_handle(&handle, &from, &to, self.timeout)
     }
 
     /// Read the next sequence metadata for an event stream, if the stream exists.
@@ -172,7 +170,8 @@ impl Database {
 
     /// Return true if a stream has at least one non-expired event visible now.
     pub fn stream_has_live_events(&self, key: &[u8]) -> Result<bool, DatabaseError> {
-        has_live_events_on_handle(self.handle_for(key)?, key, self.timeout)
+        let handle = self.handle_for(key)?;
+        has_live_events_on_handle(&handle, key, self.timeout)
     }
 
     /// Read the scalar `u64` value at `key`, or `None` if it is unset.
@@ -278,7 +277,7 @@ impl Database {
     /// it surfaces as `Rejected(ApplyError)`. Not part of the production API.
     #[doc(hidden)]
     pub fn shutdown_shards_for_test(&self) {
-        for handle in self.router.handles_in_order() {
+        for handle in self.router.materialised_handles() {
             drop(handle.shutdown(self.timeout));
         }
     }
@@ -291,7 +290,7 @@ impl Database {
     #[doc(hidden)]
     #[must_use]
     pub fn promised_ballot_for_test(&self, shard_id: usize) -> Option<crate::sync::Ballot> {
-        let handle = self.router.handle_for_shard(shard_id)?;
+        let handle = self.router.handle_for_shard(shard_id).ok()?;
         handle
             .read_promise_state(self.timeout)
             .ok()
@@ -307,7 +306,7 @@ impl Database {
     /// the production API.
     #[doc(hidden)]
     pub fn record_promise_for_test(&self, shard_id: usize, ballot: crate::sync::Ballot) -> bool {
-        let Some(handle) = self.router.handle_for_shard(shard_id) else {
+        let Ok(handle) = self.router.handle_for_shard(shard_id) else {
             return false;
         };
         matches!(
@@ -324,7 +323,7 @@ impl Database {
     #[doc(hidden)]
     #[must_use]
     pub fn stored_stamp_for_test(&self, key: &[u8]) -> Option<crate::sync::Stamp> {
-        let handle = self.router.handle_for(key)?;
+        let handle = self.router.handle_for(key).ok()?;
         let raw = handle.get_raw(key.to_vec(), self.timeout).ok()??;
         crate::ttl::entry::StampedEntry::decode(&raw)
             .ok()
@@ -340,7 +339,7 @@ impl Database {
     #[doc(hidden)]
     #[must_use]
     pub fn stored_is_tombstone_for_test(&self, key: &[u8]) -> Option<bool> {
-        let handle = self.router.handle_for(key)?;
+        let handle = self.router.handle_for(key).ok()?;
         let raw = handle.get_raw(key.to_vec(), self.timeout).ok()??;
         crate::ttl::entry::StampedEntry::decode(&raw)
             .ok()
@@ -414,7 +413,10 @@ impl Database {
     /// per-stream sequence-metadata keys and decoding each one. It is the
     /// O(total entries) traversal that backs the `EventStore` `scan` predicate.
     pub fn scan_sequence_keys(&self) -> Result<Vec<(Vec<u8>, u64)>, DatabaseError> {
-        let handles = self.router.handles_in_order().to_vec();
+        // Only MATERIALISED shards can hold streams: an un-materialised shard has
+        // never had a write, so it contributes no sequence keys. Scanning the
+        // materialised set (not `0..shard_count`) is both correct and O(used).
+        let handles = self.router.materialised_handles();
         let timeout = self.timeout;
         let results = run_indexed_parallel(handles, |handle: ShardHandle| {
             handle.scan_sequences(timeout)
@@ -437,14 +439,13 @@ impl Database {
         &self,
         shard_ids: &[usize],
     ) -> Result<Vec<(Vec<u8>, u64)>, DatabaseError> {
-        let all = self.router.handles_in_order();
+        // Materialise each requested shard on demand: a node recovering exactly
+        // the streams for shards it adopts must open (and WAL-recover) those
+        // shards even if they were never touched this lifetime. An out-of-range id
+        // is still rejected as `InvalidShardCount`.
         let mut handles = Vec::with_capacity(shard_ids.len());
         for &shard_id in shard_ids {
-            handles.push(
-                all.get(shard_id)
-                    .ok_or(DatabaseError::InvalidShardCount)?
-                    .clone(),
-            );
+            handles.push(self.handle_for_shard(shard_id)?);
         }
         let timeout = self.timeout;
         let results = run_indexed_parallel(handles, |handle: ShardHandle| {
@@ -461,26 +462,46 @@ impl Database {
         self.config.shard_count
     }
 
+    /// Map a lazy-materialisation failure into the public [`DatabaseError`].
+    ///
+    /// A first-touch spawn failure (bad directory, scheduler refusal) surfaces as
+    /// a [`DatabaseError::ShardSpawn`]; an out-of-range shard id surfaces as
+    /// [`DatabaseError::InvalidShardCount`] to preserve the old routing contract.
+    fn map_materialise_error(&self, error: MaterialiseError) -> DatabaseError {
+        if error.shard_id >= self.config.shard_count {
+            DatabaseError::InvalidShardCount
+        } else {
+            DatabaseError::ShardSpawn(error.message)
+        }
+    }
+
     pub(crate) const fn timeout(&self) -> Duration {
         self.timeout
     }
 
-    pub(crate) fn shard_handles_in_order(&self) -> &[ShardHandle] {
-        self.router.handles_in_order()
+    /// A single consistent snapshot of the materialised shards: their ids and
+    /// their handles, index-aligned (`ids[i]` owns `handles[i]`). Used by the
+    /// commit path to map each parallel result back to its real shard id before
+    /// synthesising the empty root for the un-materialised slots (GATE 1).
+    pub(crate) fn materialised_shards(&self) -> (Vec<usize>, Vec<ShardHandle>) {
+        self.router.materialised_snapshot()
     }
 
-    pub(crate) fn handle_for(&self, key: &[u8]) -> Result<&ShardHandle, DatabaseError> {
+    /// Materialise-on-miss the shard owning `key` and return a handle clone.
+    pub(crate) fn handle_for(&self, key: &[u8]) -> Result<ShardHandle, DatabaseError> {
         self.router
             .handle_for(key)
-            .ok_or(DatabaseError::InvalidShardCount)
+            .map_err(|error| self.map_materialise_error(error))
     }
 
     /// Route to a shard by its index (AA-3-2 election routing). A `Prepare`/
     /// `acquire_shard` names the shard directly, so it bypasses key-hash routing.
-    pub(crate) fn handle_for_shard(&self, shard_id: usize) -> Result<&ShardHandle, DatabaseError> {
+    /// Materialisation runs the shard's normal boot (store open + durable WAL/
+    /// promise recovery) before the handle serves — GATE 3.
+    pub(crate) fn handle_for_shard(&self, shard_id: usize) -> Result<ShardHandle, DatabaseError> {
         self.router
             .handle_for_shard(shard_id)
-            .ok_or(DatabaseError::InvalidShardCount)
+            .map_err(|error| self.map_materialise_error(error))
     }
 
     pub(crate) const fn validate_ttl_write(
@@ -504,22 +525,9 @@ impl Drop for Database {
                 );
             }
         }
-        for handle in &self.sweeps {
-            if let Err(error) = handle.shutdown(self.timeout) {
-                log::debug!(
-                    "database sweep shutdown skipped for supervisor pid {}: {error}",
-                    handle.supervisor_pid()
-                );
-            }
-        }
-        for handle in self.router.handles_in_order() {
-            if let Err(error) = handle.shutdown(self.timeout) {
-                log::debug!(
-                    "database shard shutdown skipped for pid {}: {error}",
-                    handle.pid()
-                );
-            }
-        }
+        // Sweeps and shard actors both live in the router now (materialised
+        // together, torn down together).
+        self.router.shutdown_all(self.timeout);
         self.scheduler.shutdown();
     }
 }
@@ -527,3 +535,7 @@ impl Drop for Database {
 #[cfg(test)]
 #[path = "db_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "db/lazy_root_spike_tests.rs"]
+mod lazy_root_spike_tests;

@@ -182,8 +182,15 @@ fn apply_error_when_shard_unavailable() -> TestResult {
     let db = Database::create(config_for(&data_dir, 1))?;
     let key = b"unreachable-key".to_vec();
 
-    // Stop every shard actor so a subsequent apply cannot be served. The reply
-    // channel disconnects / times out -> a non-CAS ShardError -> ApplyError.
+    // Under LAZY materialisation a shard is not spawned until first touch, so
+    // materialise the owning shard (a read is enough) BEFORE shutting it down —
+    // otherwise `shutdown_shards_for_test` finds nothing and the subsequent apply
+    // would simply re-materialise a fresh, working shard.
+    db.get(&key)?;
+
+    // Stop every materialised shard actor so a subsequent apply cannot be served.
+    // The reply channel disconnects / times out -> a non-CAS ShardError ->
+    // ApplyError.
     db.shutdown_shards_for_test();
 
     let ack = db.apply_write_proposal(&proposal(&key, None, b"value"));

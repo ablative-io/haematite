@@ -227,6 +227,28 @@ impl Node {
     }
 }
 
+/// The canonical root hash of an EMPTY prolly tree: `hash(Node::Leaf([]))`.
+///
+/// This is the byte-identical value a shard actor reports on `commit` when it
+/// has never had a write (its `commit` seeds `store_empty_root`, an empty leaf,
+/// as the baseline — see `shard::actor::store_empty_root`). It is a pure
+/// function of the empty-leaf serialisation and depends on NO store, so an
+/// UN-materialised (lazily-deferred) shard can contribute this constant to the
+/// global commit root without spawning its actor — the load-bearing GATE-1
+/// invariant for lazy shard materialisation.
+///
+/// Computed from the empty-leaf serialisation directly (an empty entry list is
+/// trivially sorted-and-unique, so there is no fallible construction to unwrap):
+/// it is byte-identical to `LeafNode::new(Vec::new())?.hash()`, asserted by the
+/// `empty_root_hash_matches_leaf_node` test.
+#[must_use]
+pub fn empty_root_hash() -> Hash {
+    let mut bytes = Vec::with_capacity(leaf_serialised_len(&[]));
+    bytes.push(LEAF_TAG);
+    append_len(&mut bytes, 0);
+    hash_serialised(&bytes)
+}
+
 fn validate_sorted_unique<T>(entries: &[(Vec<u8>, T)]) -> Result<(), NodeError> {
     let Some((first, rest)) = entries.split_first() else {
         return Ok(());
@@ -372,7 +394,17 @@ impl<'a> ByteCursor<'a> {
 
 #[cfg(test)]
 mod tests {
-    use super::{Hash, InternalNode, LeafNode, Node, NodeError};
+    use super::{Hash, InternalNode, LeafNode, Node, NodeError, empty_root_hash};
+
+    #[test]
+    fn empty_root_hash_matches_leaf_node() -> Result<(), NodeError> {
+        // The store-free `empty_root_hash()` constant an un-materialised shard
+        // contributes MUST be byte-identical to the hash a genuine empty leaf
+        // node produces (the baseline a real shard's first commit seeds).
+        let via_node = Node::Leaf(LeafNode::new(Vec::new())?).hash();
+        assert_eq!(empty_root_hash(), via_node);
+        Ok(())
+    }
 
     fn leaf_entries() -> Vec<(Vec<u8>, Vec<u8>)> {
         vec![

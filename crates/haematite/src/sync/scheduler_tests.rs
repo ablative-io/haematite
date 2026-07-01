@@ -78,6 +78,65 @@ fn run_once_uses_topology_targets_for_every_shard() -> Result<(), Box<dyn Error>
     Ok(())
 }
 
+/// A fixed shard source returning a chosen subset — models the router's
+/// materialised-shard membership under lazy materialisation.
+#[derive(Clone)]
+struct FixedShardSource {
+    shards: Vec<ShardId>,
+}
+
+impl SyncShardSource for FixedShardSource {
+    fn shards_to_sync(&self) -> Vec<ShardId> {
+        self.shards.clone()
+    }
+}
+
+/// LAZY: with a shard source that reports only the MATERIALISED shards, the
+/// scheduler triggers pulls ONLY for those shards — an un-materialised shard
+/// (which holds no data) is never touched, even though `shard_count` is large.
+#[test]
+fn run_once_syncs_only_shards_reported_by_the_source() -> Result<(), Box<dyn Error>> {
+    let scheduler = beamr_scheduler()?;
+    let trigger = RecordingTrigger::default();
+    // shard_count is 4096, but only shards {5, 9} are materialised.
+    let config = SyncSchedulerConfig::new(
+        1,
+        nodes(4),
+        SyncTopology::Ring,
+        4096,
+        Duration::from_secs(60),
+    );
+    let source = Arc::new(FixedShardSource { shards: vec![5, 9] });
+    let handle = SyncSchedulerHandle::spawn_with_shard_source(
+        Arc::clone(&scheduler),
+        config,
+        Arc::new(trigger.clone()),
+        source,
+        TIMEOUT,
+    )?;
+
+    let stats = handle.run_once(TIMEOUT)?;
+
+    // Two partners (Ring over 4 nodes) times two materialised shards — NOT 4096.
+    assert_eq!(stats.partners, 2);
+    assert_eq!(stats.shards, 2);
+    assert_eq!(stats.operations_triggered, 4);
+    assert_eq!(
+        trigger.calls(),
+        vec![
+            (SyncNodeId::from(0), 5),
+            (SyncNodeId::from(0), 9),
+            (SyncNodeId::from(2), 5),
+            (SyncNodeId::from(2), 9),
+        ],
+        "the scheduler must never trigger a pull for an un-materialised shard"
+    );
+
+    handle.shutdown(TIMEOUT)?;
+    scheduler.shutdown();
+    Ok(())
+}
+
 #[test]
 fn periodic_tick_fires_sync_operations_at_configured_interval() -> Result<(), Box<dyn Error>> {
     let scheduler = beamr_scheduler()?;
