@@ -487,6 +487,14 @@ impl Database {
         self.router.materialised_snapshot()
     }
 
+    /// The shard ids materialised so far, ascending. Test-only projection used by
+    /// the lazy-root spike to assert exactly which shards a lazy workload touched
+    /// (and that a force-materialised DB touched every shard).
+    #[cfg(test)]
+    pub(crate) fn materialised_shard_ids(&self) -> Vec<usize> {
+        self.router.materialised_shard_ids()
+    }
+
     /// Materialise-on-miss the shard owning `key` and return a handle clone.
     pub(crate) fn handle_for(&self, key: &[u8]) -> Result<ShardHandle, DatabaseError> {
         self.router
